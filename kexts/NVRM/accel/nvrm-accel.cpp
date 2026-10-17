@@ -1418,6 +1418,7 @@ static SInt64 gCntIopDirect, gCntIopCopyUs;
 // pages in RAM (NMIntelFB intelfb-0017, debug.nmintelfb_ram=1), so no CPU copy is left. Same layout as NMIntelFB's.
 #define NMINTELFB_RAM_VERSION 1u
 #define NMINTELFB_FN_RAM      "nmIntelFBRamPages"
+#define NMINTELFB_FN_RAM_FLIP "nmIntelFBRamFlip"   // stage 4b: after the copy, p1 = the pages written (NMIntelFB flips to them)
 struct NMIntelFBRamPages { unsigned int version, pitch; const unsigned long long *pages; unsigned long long count, length; volatile void *kva; };
 static SInt64 gCntIopRam;
 static void nvIopCopyRows(void *dst, unsigned dpitch, const void *src, unsigned spitch, unsigned rowBytes, unsigned h)
@@ -2834,6 +2835,13 @@ static bool nvAccelIopDirect(NVAccel *a, IOService *fb, unsigned head, IOSurface
     }
     if (cache) ((OSObject *)cache)->release();
     nvFamUnlock(a);
+    if (done && ram) {
+        // outside the locks: the framebuffer writes PLANE_SURF; it ignores this unless it flips (debug.nmintelfb_ram=2)
+        if (const OSSymbol *fsym = OSSymbol::withCStringNoCopy(NMINTELFB_FN_RAM_FLIP)) {
+            fb->callPlatformFunction(fsym, false, (void *)rp.pages, nullptr, nullptr, nullptr);
+            fsym->release();
+        }
+    }
     static unsigned logged, ramLogged;   // the RAM path gets its own first lines: direct=1 has used the others by then
     unsigned &nl = ram ? ramLogged : logged;
     if (nl < 4) { nl++; ALOG("iop direct: surface 0x%x %llux%llu pitch %llu -> %s", id, W, H, P, !done ? "usual path" : ram ? "copy engine into the panel's RAM" : "on the panel from staging"); }
