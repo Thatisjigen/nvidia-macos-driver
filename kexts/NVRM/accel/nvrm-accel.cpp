@@ -12,6 +12,7 @@
 #endif
 #include <IOKit/IOService.h>
 #include <IOKit/IOLib.h>
+#include <string.h>
 // IOPCIDevice (with its setBusMasterEnable) is marked deprecated in favour of PCIDriverKit, which runs in user space and
 // cannot replace a kernel extension's PCI access; that deprecation is ignored from here on in this kext's sources.
 #pragma clang diagnostic ignored "-Wdeprecated-declarations"
@@ -1407,6 +1408,29 @@ public:
 static int    gNvIop = 0;
 static SInt64 gCntIopOk, gCntIopFail, gCntIopEmpty, gCntIopSrcRes, gCntIopSrcSurf, gCntIopBlank;
 static SInt64 gCntIopOkHead[kNvMaxFB];
+// nmx-accel (bridge stage 2/3, docs/knowledge/bridge-optimization.md in nmx-intel): a frame copied to a CPU-only
+// scanout (the Intel panel) cost two full CPU copies. debug.nvaccel_iop_memcpy=1 copies rows with memcpy instead of
+// the volatile word loop; debug.nvaccel_iop_direct=1 lands the copy engine's staging copy straight on the panel and
+// leaves the IOSurface's system pages alone (its pending mark stays, so a CPU reader still pages it off).
+static int    gIopMemcpy = 0, gIopDirect = 0;
+static SInt64 gCntIopDirect, gCntIopCopyUs;
+static void nvIopCopyRows(void *dst, unsigned dpitch, const void *src, unsigned spitch, unsigned rowBytes, unsigned h)
+{
+    if (gIopMemcpy) {
+        if (dpitch == spitch && rowBytes == spitch) { memcpy(dst, src, (size_t)spitch * h); return; }
+        for (unsigned y = 0; y < h; y++)
+            memcpy((unsigned char *)dst + (size_t)y * dpitch, (const unsigned char *)src + (size_t)y * spitch, rowBytes);
+        return;
+    }
+    const unsigned words = rowBytes / 4, spr = spitch / 4, dpr = dpitch / 4;
+    const volatile unsigned int *sv = (const volatile unsigned int *)src;
+    volatile unsigned int *dv = (volatile unsigned int *)dst;
+    for (unsigned y = 0; y < h; y++) {
+        const volatile unsigned int *sp = sv + (unsigned long)y * spr;
+        volatile unsigned int *dp = dv + (unsigned long)y * dpr;
+        for (unsigned x = 0; x < words; x++) dp[x] = sp[x];
+    }
+}
 static SInt64 gCntIop30, gCntIopHalf;       // frames written to a 30-bit scanout; frames converted from half-float RGhA
 static SInt64 gCntIopL10r;                 // frames narrowed from 10-bit l10r (login window, lock screen)
 // hybrid laptops (nm_hybrid.h)
@@ -1463,6 +1487,7 @@ bool NVDisplayPipe::isTransactionComplete(IOAccelDisplayPipeTransaction2 *)
 
 static void nvAccelSurfScanoutSync(IOSurface *s);
 static bool nvAccelSurfCopyReady(IOSurface *s, unsigned head);
+static bool nvAccelIopDirect(NVAccel *a, IOService *fb, unsigned head, IOSurface *s, const struct NVRMVramRequest *q);
 static bool nvAccelIopFlip(IOService *fb, unsigned head, IOSurface *s, void *pipe);
 static bool nvSurfWaitReady(unsigned int id);
 static bool nvAccelHybridImport(IOService *fb, unsigned head, IOSurface *s, NVVidMemory *vram);
@@ -1488,6 +1513,7 @@ IOReturn NVDisplayPipe::performTransaction(IOAccelDisplayPipeTransaction2 *txn)
 
     const volatile unsigned int *src = nullptr; unsigned w = 0, h = 0, pitch = 0; bool fromRes = false, from10 = false;
     unsigned srcFmt = NV_IOP_FMT_BGRA;   // the pixel layout of what is copied (nv_iop_pixel.h)
+    uint64_t t0 = 0;
     NVResource *res = OSDynamicCast(NVResource, ro);
     NVVidMemory *vm = res ? nvres_vidmem(res) : nullptr;
     static SInt32 gIopK6Logs;
@@ -1530,6 +1556,19 @@ IOReturn NVDisplayPipe::performTransaction(IOAccelDisplayPipeTransaction2 *txn)
         // (1.13-1.14.1), nvaccel_iop_blank about half of every copied frame, never on machines whose frames all flip.
         // Such a frame now keeps the previous picture on the panel instead.
         nvSurfWaitReady(s->getSurfaceID());   // a copied frame is read here, so its GPU work must be done first
+        t0 = mach_absolute_time();
+        if (gIopDirect) {
+            struct NVRMVramRequest dq;
+            for (unsigned i = 0; i < sizeof dq; i++) ((volatile unsigned char *)&dq)[i] = 0;
+            dq.version = NVRM_VRAM_ABI_VERSION;
+            if (a->askFramebufferForScanout(&dq, fb) == kIOReturnSuccess && nvAccelIopDirect(a, fb, head, s, &dq)) {
+                uint64_t ns; absolutetime_to_nanoseconds(mach_absolute_time() - t0, &ns);
+                OSAddAtomic64((SInt64)(ns / 1000), &gCntIopCopyUs);
+                OSAddAtomic64(1, &gCntIopDirect); OSAddAtomic64(1, &gCntIopSrcSurf);
+                OSAddAtomic64(1, &gCntIopOk); OSAddAtomic64(1, &gCntIopOkHead[head]);
+                return kIOReturnSuccess;
+            }
+        }
         if (!nvAccelSurfCopyReady(s, head)) return kIOReturnSuccess;
         const unsigned fmt = s->getPixelFormat();
         from10 = (fmt == NV_IOP_FMT_L10R);   // nv_iop_pixel.h: narrowed to the 8-bit scanout (or swapped into a 30-bit one) while copying
@@ -1583,6 +1622,8 @@ IOReturn NVDisplayPipe::performTransaction(IOAccelDisplayPipeTransaction2 *txn)
         OSAddAtomic64(st.words, &gCntHyWords);
         OSAddAtomic64((SInt64)(w < spr ? w : spr) * h - st.words, &gCntHyWordsSkipped);
         if (nf == 0) ALOG("hybrid: first frame presented by copy (%u rows, %u pixels, head %u)", st.rows, st.words, head);
+    } else if (gIopMemcpy && srcFmt == NV_IOP_FMT_BGRA && !dst30) {
+        nvIopCopyRows(q.kva, q.pitch, (const void *)src, pitch, ((pitch < q.pitch) ? pitch : q.pitch) & ~3u, h);
     } else {
     for (unsigned y = 0; y < h; y++) {
         const volatile unsigned int *sp = src + (unsigned long)y * spr;
@@ -1594,6 +1635,7 @@ IOReturn NVDisplayPipe::performTransaction(IOAccelDisplayPipeTransaction2 *txn)
     if (dst30) OSAddAtomic64(1, &gCntIop30);
     if (srcFmt == NV_IOP_FMT_RGHA) OSAddAtomic64(1, &gCntIopHalf);
     if (from10) OSAddAtomic64(1, &gCntIopL10r);
+    if (t0) { uint64_t ns; absolutetime_to_nanoseconds(mach_absolute_time() - t0, &ns); OSAddAtomic64((SInt64)(ns / 1000), &gCntIopCopyUs); }
     OSAddAtomic64(1, fromRes ? &gCntIopSrcRes : &gCntIopSrcSurf);
     const SInt64 n = OSAddAtomic64(1, &gCntIopOk);
     const SInt64 nh = OSAddAtomic64(1, &gCntIopOkHead[head]);
@@ -1831,6 +1873,10 @@ SYSCTL_INT(_debug, OID_AUTO, nvaccel_surface_gpu_wait_max_us, CTLFLAG_RD | CTLFL
 static SInt64 gCntIopAsync, gCntIopAsyncRefused, gCntIopAsyncDrop;
 SYSCTL_INT(_debug, OID_AUTO, nvaccel_iop_async, CTLFLAG_RW | CTLFLAG_LOCKED, &gIopAsync, 0, "1 = the swap runs on a thread call and completes through signalTransactionInterrupt (Apple's shape); 0 = the earlier synchronous flip");
 NVACCEL_CNT(nvaccel_iop_async_flips,   gCntIopAsync,        "swaps completed asynchronously");
+SYSCTL_INT(_debug, OID_AUTO, nvaccel_iop_memcpy, CTLFLAG_RW | CTLFLAG_LOCKED, &gIopMemcpy, 0, "nmx-accel: 1 = frames copied to a CPU scanout with memcpy rows, 0 = volatile word loop");
+SYSCTL_INT(_debug, OID_AUTO, nvaccel_iop_direct, CTLFLAG_RW | CTLFLAG_LOCKED, &gIopDirect, 0, "nmx-accel: 1 = copy engine staging -> CPU scanout, skipping the IOSurface's system pages");
+NVACCEL_CNT(nvaccel_iop_direct_frames, gCntIopDirect, "nmx-accel: frames put on a CPU scanout straight from the staging buffer");
+NVACCEL_CNT(nvaccel_iop_copy_us,       gCntIopCopyUs, "nmx-accel: microseconds spent getting copied frames onto a CPU scanout (copy engine + CPU)");
 NVACCEL_CNT(nvaccel_iop_async_refused, gCntIopAsyncRefused, "async swaps NVKMS refused (that frame stayed off the panel)");
 NVACCEL_CNT(nvaccel_iop_async_drop,    gCntIopAsyncDrop,    "frames dropped because a flip was still in flight past a refresh period");
 static SInt64 gCntIopLate;
@@ -1874,6 +1920,8 @@ static void nvaccelInstallSysctl(void)
     sysctl_register_oid(&sysctl__debug_nvaccel_iop_flip_hit);   sysctl_register_oid(&sysctl__debug_nvaccel_iop_flip_miss);
     sysctl_register_oid(&sysctl__debug_nvaccel_iop_async);      sysctl_register_oid(&sysctl__debug_nvaccel_iop_async_flips);
     { extern struct sysctl_oid sysctl__debug_nvaccel_svdiag; sysctl_register_oid(&sysctl__debug_nvaccel_svdiag); }
+    sysctl_register_oid(&sysctl__debug_nvaccel_iop_memcpy);     sysctl_register_oid(&sysctl__debug_nvaccel_iop_direct);
+    sysctl_register_oid(&sysctl__debug_nvaccel_iop_direct_frames); sysctl_register_oid(&sysctl__debug_nvaccel_iop_copy_us);
     sysctl_register_oid(&sysctl__debug_nvaccel_surface_gpu);    sysctl_register_oid(&sysctl__debug_nvaccel_surface_gpu_on);
     sysctl_register_oid(&sysctl__debug_nvaccel_surface_gpu_marks); sysctl_register_oid(&sysctl__debug_nvaccel_surface_gpu_waits);
     sysctl_register_oid(&sysctl__debug_nvaccel_surface_gpu_timeouts); sysctl_register_oid(&sysctl__debug_nvaccel_surface_gpu_wait_max_us);
@@ -2694,6 +2742,64 @@ static bool nvAccelSurfCopyReady(IOSurface *s, unsigned head)
     if (++gIopCopyHeld[head] > 4) { gIopCopyHeld[head] = 0; return true; }
     OSAddAtomic64(1, &gCntIopCopySkip);
     return false;
+}
+
+static unsigned nvIopPageoff(NVAccel *owner, void *kapiDevice, void *mem, const unsigned long long *pages, unsigned long long count, unsigned long long len)
+{
+    struct NVRMSurfPageoff pq; nvSVZero(&pq, sizeof pq);
+    IOService *nvrm = nvAccelNVRM(owner);
+    const OSSymbol *sym = OSSymbol::withCStringNoCopy(NVRM_SS_FN_PAGEOFF);
+    if (nvrm && sym) nvrm->callPlatformFunction(sym, false, &pq, nullptr, nullptr, nullptr);
+    if (sym) sym->release();
+    for (unsigned i = 0; i < 8; i++) for (unsigned j = 0; j < 8; j++) {
+        if (v != first) varied++;
+
+// nmx-accel stage 3: a surface whose newest pixels are only in VRAM goes VRAM -> staging (copy engine, as pageoff) ->
+// the CPU scanout, without writing the IOSurface's system pages. Returns false whenever the usual path should run
+// instead (surface already current in system memory, geometry or locks unavailable, copy engine refused).
+static bool nvAccelIopDirect(NVAccel *a, IOService *fb, unsigned head, IOSurface *s, const struct NVRMVramRequest *q)
+{
+    if (!a || !s || !q->kva || q->pitch < 4) return false;
+    const unsigned id = _ZNK9IOSurface12getSurfaceIDEv((void *)s);
+    if (!nvSVPend(id, 2)) return false;
+    if (s->getPixelFormat() != 0x42475241u) return false;
+    const unsigned long long W = s->getWidth(), H = s->getHeight(), P = s->getBytesPerRow();
+    if (W != q->width || H != q->height || P < 4 * W || (P & 3) || P > 16384ull * 8) return false;
+    const unsigned long long len = H * P, pages = (len + 4095) >> 12;
+    struct NVRMRmHandles hh; nvSVZero(&hh, sizeof hh);
+    if (!nvAccelRmHandles(a, &hh)) return false;
+    nvAccelIopHome(fb, head);   // before the locks: it calls into the framebuffer
+    bool locked = false;
+    for (unsigned i = 0; i < 8 && !(locked = nvFamLock(a, true)); i++) IOSleep(1);
+    if (!locked) return false;
+    void *cache = _ZN22IOGraphicsAccelerator223deviceCacheForIOSurfaceEP9IOSurfacej((void *)a, (void *)s, 0);
+    OSObject *ctx = cache ? *(OSObject *volatile *)((unsigned char *)cache + 0x20) : nullptr;
+    NVResource *res = OSDynamicCast(NVResource, ctx);
+    NVVidMemory *vm = res ? nvres_vidmem(res) : nullptr;
+    volatile unsigned short *valid = res ? *(unsigned short *volatile *)((volatile unsigned char *)res + kNvResValid) : nullptr;
+    IOLock *lk = nvSVStageLock();
+            done = true;
+        IOLockLock(lk);
+        IOBufferMemoryDescriptor *sb = nvSVStage(len);
+        IOByteCount sl = 0;
+        addr64_t sp = sb ? sb->getPhysicalSegment(0, &sl, kIOMemoryMapperNone) : 0;
+        unsigned long long *spa = (sp && sl >= len) ? (unsigned long long *)IOMalloc(pages * sizeof *spa) : nullptr;
+        if (spa) {
+            for (unsigned long long k = 0; k < pages; k++) spa[k] = sp + k * 4096;
+            const unsigned st = nvIopPageoff(a, hh.kapiDevice, vm->fRmHandle, spa, pages, len);
+                const unsigned char *src = (const unsigned char *)sb->getBytesNoCopy();
+                nvIopCopyRows(q->kva, q->pitch, src, (unsigned)P, (unsigned)(((P < q->pitch) ? P : q->pitch) & ~3ull), (unsigned)H);
+                done = true;
+                ALOG("iop direct: CE copy TIMED OUT into the staging buffer -- abandoning it (%llu B)", (unsigned long long)sb->getLength());
+                gNVSVStageBuf = nullptr;
+            }
+            IOFree(spa, pages * sizeof *spa);
+        }
+        IOLockUnlock(lk);
+    }
+    if (cache) ((OSObject *)cache)->release();
+    nvFamUnlock(a);
+    return done;
 }
 
 // nmflatskip: 64 samples of the surface's system-memory copy. Judged only when that copy is the newest one (no page-off
