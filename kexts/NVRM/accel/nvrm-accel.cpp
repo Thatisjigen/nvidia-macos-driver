@@ -1414,6 +1414,12 @@ static SInt64 gCntIopOkHead[kNvMaxFB];
 // leaves the IOSurface's system pages alone (its pending mark stays, so a CPU reader still pages it off).
 static int    gIopMemcpy = 0, gIopDirect = 0;
 static SInt64 gCntIopDirect, gCntIopCopyUs;
+// nmx-accel stage 4a: with debug.nvaccel_iop_direct=2 the copy engine writes the frame straight into the panel's scan-out
+// pages in RAM (NMIntelFB intelfb-0017, debug.nmintelfb_ram=1), so no CPU copy is left. Same layout as NMIntelFB's.
+#define NMINTELFB_RAM_VERSION 1u
+#define NMINTELFB_FN_RAM      "nmIntelFBRamPages"
+struct NMIntelFBRamPages { unsigned int version, pitch; const unsigned long long *pages; unsigned long long count, length; volatile void *kva; };
+static SInt64 gCntIopRam;
 static void nvIopCopyRows(void *dst, unsigned dpitch, const void *src, unsigned spitch, unsigned rowBytes, unsigned h)
 {
     if (gIopMemcpy) {
@@ -1874,8 +1880,9 @@ static SInt64 gCntIopAsync, gCntIopAsyncRefused, gCntIopAsyncDrop;
 SYSCTL_INT(_debug, OID_AUTO, nvaccel_iop_async, CTLFLAG_RW | CTLFLAG_LOCKED, &gIopAsync, 0, "1 = the swap runs on a thread call and completes through signalTransactionInterrupt (Apple's shape); 0 = the earlier synchronous flip");
 NVACCEL_CNT(nvaccel_iop_async_flips,   gCntIopAsync,        "swaps completed asynchronously");
 SYSCTL_INT(_debug, OID_AUTO, nvaccel_iop_memcpy, CTLFLAG_RW | CTLFLAG_LOCKED, &gIopMemcpy, 0, "nmx-accel: 1 = frames copied to a CPU scanout with memcpy rows, 0 = volatile word loop");
-SYSCTL_INT(_debug, OID_AUTO, nvaccel_iop_direct, CTLFLAG_RW | CTLFLAG_LOCKED, &gIopDirect, 0, "nmx-accel: 1 = copy engine staging -> CPU scanout, skipping the IOSurface's system pages");
+SYSCTL_INT(_debug, OID_AUTO, nvaccel_iop_direct, CTLFLAG_RW | CTLFLAG_LOCKED, &gIopDirect, 0, "nmx-accel: 1 = copy engine staging -> CPU scanout, skipping the IOSurface's system pages; 2 = copy engine straight into the scanout's RAM pages when the framebuffer offers them");
 NVACCEL_CNT(nvaccel_iop_direct_frames, gCntIopDirect, "nmx-accel: frames put on a CPU scanout straight from the staging buffer");
+NVACCEL_CNT(nvaccel_iop_ram_frames,    gCntIopRam,    "nmx-accel: frames the copy engine wrote straight into the panel's scan-out pages in RAM");
 NVACCEL_CNT(nvaccel_iop_copy_us,       gCntIopCopyUs, "nmx-accel: microseconds spent getting copied frames onto a CPU scanout (copy engine + CPU)");
 NVACCEL_CNT(nvaccel_iop_async_refused, gCntIopAsyncRefused, "async swaps NVKMS refused (that frame stayed off the panel)");
 NVACCEL_CNT(nvaccel_iop_async_drop,    gCntIopAsyncDrop,    "frames dropped because a flip was still in flight past a refresh period");
@@ -1922,6 +1929,7 @@ static void nvaccelInstallSysctl(void)
     { extern struct sysctl_oid sysctl__debug_nvaccel_svdiag; sysctl_register_oid(&sysctl__debug_nvaccel_svdiag); }
     sysctl_register_oid(&sysctl__debug_nvaccel_iop_memcpy);     sysctl_register_oid(&sysctl__debug_nvaccel_iop_direct);
     sysctl_register_oid(&sysctl__debug_nvaccel_iop_direct_frames); sysctl_register_oid(&sysctl__debug_nvaccel_iop_copy_us);
+    sysctl_register_oid(&sysctl__debug_nvaccel_iop_ram_frames);
     sysctl_register_oid(&sysctl__debug_nvaccel_surface_gpu);    sysctl_register_oid(&sysctl__debug_nvaccel_surface_gpu_on);
     sysctl_register_oid(&sysctl__debug_nvaccel_surface_gpu_marks); sysctl_register_oid(&sysctl__debug_nvaccel_surface_gpu_waits);
     sysctl_register_oid(&sysctl__debug_nvaccel_surface_gpu_timeouts); sysctl_register_oid(&sysctl__debug_nvaccel_surface_gpu_wait_max_us);
@@ -2744,15 +2752,28 @@ static bool nvAccelSurfCopyReady(IOSurface *s, unsigned head)
     return false;
 }
 
+// one copy-engine copy of the surface's VRAM into a list of system pages (NVRM's page-off); 0 = done, 0x65 = timed out
 static unsigned nvIopPageoff(NVAccel *owner, void *kapiDevice, void *mem, const unsigned long long *pages, unsigned long long count, unsigned long long len)
 {
     struct NVRMSurfPageoff pq; nvSVZero(&pq, sizeof pq);
+    pq.version = NVRM_SS_RM_VERSION; pq.status = NVRM_SS_OFF; pq.kapiDevice = kapiDevice; pq.kapiMemory = mem;
+    pq.pages = pages; pq.pageCount = count; pq.length = len;
     IOService *nvrm = nvAccelNVRM(owner);
     const OSSymbol *sym = OSSymbol::withCStringNoCopy(NVRM_SS_FN_PAGEOFF);
     if (nvrm && sym) nvrm->callPlatformFunction(sym, false, &pq, nullptr, nullptr, nullptr);
     if (sym) sym->release();
+    return pq.status;
+}
+// how many of 64 sampled pixels differ from the first (0 = a one-colour frame, counted in nvaccel_iop_blank)
+static unsigned nvIopVaried(const volatile unsigned char *src, unsigned long long W, unsigned long long H, unsigned long long P)
+{
+    unsigned varied = 0; const unsigned first = *(const volatile unsigned *)src & 0xffffffu;
     for (unsigned i = 0; i < 8; i++) for (unsigned j = 0; j < 8; j++) {
+        const unsigned v = *(const volatile unsigned *)(src + ((H * (2 * i + 1)) / 16) * P + ((W * (2 * j + 1)) / 16) * 4) & 0xffffffu;
         if (v != first) varied++;
+    }
+    return varied;
+}
 
 // nmx-accel stage 3: a surface whose newest pixels are only in VRAM goes VRAM -> staging (copy engine, as pageoff) ->
 // the CPU scanout, without writing the IOSurface's system pages. Returns false whenever the usual path should run
@@ -2769,6 +2790,13 @@ static bool nvAccelIopDirect(NVAccel *a, IOService *fb, unsigned head, IOSurface
     struct NVRMRmHandles hh; nvSVZero(&hh, sizeof hh);
     if (!nvAccelRmHandles(a, &hh)) return false;
     nvAccelIopHome(fb, head);   // before the locks: it calls into the framebuffer
+    // stage 4a: the panel's own pages, when they take the surface as it is (same pitch, room for every row)
+    struct NMIntelFBRamPages rp; nvSVZero(&rp, sizeof rp);
+    rp.version = NMINTELFB_RAM_VERSION;
+    const OSSymbol *rsym = gIopDirect == 2 ? OSSymbol::withCStringNoCopy(NMINTELFB_FN_RAM) : nullptr;
+    const bool ram = rsym && fb->callPlatformFunction(rsym, false, &rp, nullptr, nullptr, nullptr) == kIOReturnSuccess
+                     && rp.pages && rp.kva && rp.pitch == P && rp.length >= len && rp.count >= pages;
+    if (rsym) rsym->release();
     bool locked = false;
     for (unsigned i = 0; i < 8 && !(locked = nvFamLock(a, true)); i++) IOSleep(1);
     if (!locked) return false;
@@ -2778,7 +2806,11 @@ static bool nvAccelIopDirect(NVAccel *a, IOService *fb, unsigned head, IOSurface
     NVVidMemory *vm = res ? nvres_vidmem(res) : nullptr;
     volatile unsigned short *valid = res ? *(unsigned short *volatile *)((volatile unsigned char *)res + kNvResValid) : nullptr;
     IOLock *lk = nvSVStageLock();
+        const unsigned st = nvIopPageoff(a, hh.kapiDevice, vm->fRmHandle, rp.pages, pages, len);
+        if (st == 0) {
+            OSAddAtomic64(1, &gCntIopRam);
             done = true;
+        } else if (st == 0x65u) ALOG("iop direct: CE copy TIMED OUT into the panel's RAM pages");
         IOLockLock(lk);
         IOBufferMemoryDescriptor *sb = nvSVStage(len);
         IOByteCount sl = 0;
@@ -2787,9 +2819,12 @@ static bool nvAccelIopDirect(NVAccel *a, IOService *fb, unsigned head, IOSurface
         if (spa) {
             for (unsigned long long k = 0; k < pages; k++) spa[k] = sp + k * 4096;
             const unsigned st = nvIopPageoff(a, hh.kapiDevice, vm->fRmHandle, spa, pages, len);
+            if (st == 0) {
                 const unsigned char *src = (const unsigned char *)sb->getBytesNoCopy();
                 nvIopCopyRows(q->kva, q->pitch, src, (unsigned)P, (unsigned)(((P < q->pitch) ? P : q->pitch) & ~3ull), (unsigned)H);
+                if (!nvIopVaried(src, W, H, P)) OSAddAtomic64(1, &gCntIopBlank);
                 done = true;
+            } else if (st == 0x65u) {
                 ALOG("iop direct: CE copy TIMED OUT into the staging buffer -- abandoning it (%llu B)", (unsigned long long)sb->getLength());
                 gNVSVStageBuf = nullptr;
             }
@@ -2799,6 +2834,9 @@ static bool nvAccelIopDirect(NVAccel *a, IOService *fb, unsigned head, IOSurface
     }
     if (cache) ((OSObject *)cache)->release();
     nvFamUnlock(a);
+    static unsigned logged, ramLogged;   // the RAM path gets its own first lines: direct=1 has used the others by then
+    unsigned &nl = ram ? ramLogged : logged;
+    if (nl < 4) { nl++; ALOG("iop direct: surface 0x%x %llux%llu pitch %llu -> %s", id, W, H, P, !done ? "usual path" : ram ? "copy engine into the panel's RAM" : "on the panel from staging"); }
     return done;
 }
 
