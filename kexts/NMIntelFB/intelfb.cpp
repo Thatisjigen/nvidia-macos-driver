@@ -21,6 +21,7 @@ extern "C" {
 #include "nvkms-kapi.h"
 }
 #include "AppleGraphicsDeviceControl_re.h"   // nullmoth's reconstructed header (kexts/NVRMAGDC), intelfb-0014
+#include "nvrm-agdc-k5.h"                     // nullmoth's AGDC link/plane-scaler answers (kexts/NVRMAGDC), intelfb-0015
 #define NVRM_GPUVA_ABI_VERSION 1u
 #define NVRM_GPUVA_FN_HANDLES  "nvRmHandles"
 struct NVRMRmHandles { unsigned int version; void *kapiDevice; unsigned int hClient, hDevice, hSubDevice; };
@@ -408,6 +409,7 @@ SYSCTL_PROC(_debug, OID_AUTO, nmintelfb_sample, CTLTYPE_STRING | CTLFLAG_RD | CT
 // intelfb-0013: the Intel GPU whose panel this driver shows, kept by NMIntelFBClaim when the framebuffer sits under NVRM
 static IOPCIDevice *gIfbPCI = nullptr;
 static IOService *gIfbNubFB = nullptr;   // intelfb-0014: the framebuffer on the nub, which the AGDC reports
+static uint32_t gIfbK5[NVK5_TIMING_WORDS];   // intelfb-0015: the panel's timing in NVRMFB's NVRMTiming layout
 static void ifb_agdc_register(bool on);
 static bool ifb_pci_ok(IOPCIDevice *pci, uint8_t *ver);
 
@@ -599,7 +601,17 @@ bool NMIntelFB::startReal(IOService *provider)
         registerPowerDriver(this, kPowerStates, 2);
         ifb_trail("power");
     } else ifb_trail("no-pm");
-    if (gIfbNubFB == this) ifb_agdc_register(true);
+    if (gIfbNubFB == this) {
+        // intelfb-0015: the timing NVRMFB publishes as NVRMTiming (refresh in mHz, positive syncs as eDP panels use)
+        const uint32_t k5[NVK5_TIMING_WORDS] = { NVK5_TIMING_TAG, (uint32_t)fPclk, fWidth, fHSS, fHSE, fHT, fHeight, fVSS, fVSE, fVT,
+                                                 (uint32_t)(((uint64_t)fRefresh16 * 1000) >> 16), 1, 1 };
+        memcpy(gIfbK5, k5, sizeof k5);
+        if (OSData *d = OSData::withBytes(k5, sizeof k5)) { setProperty("NVRMTiming", d); d->release(); }
+        int bad = nvk5_timing_bad(gIfbK5, sizeof gIfbK5);
+        IFBLOG("K5 timing: pclk %u %ux%u h %u-%u/%u v %u-%u/%u %u mHz%s", k5[1], fWidth, fHeight, fHSS, fHSE, fHT, fVSS, fVSE, fVT,
+               k5[10], bad ? " - REJECTED by nvk5_timing_bad" : "");
+        ifb_agdc_register(true);
+    }
     IFBLOG("built-in panel published (%ux%u)", fWidth, fHeight);
     return true;
 }
@@ -937,6 +949,19 @@ IOReturn NMIntelFBAGDC::vendor_doDeviceAttribute(unsigned int cmd, unsigned long
         c->maxFramebuffers = 1; c->pciDevice = fPci; c->framebuffer[0] = fFB;
         IFB_ONCE("agdc-980");
         return kIOReturnSuccess;
+    }
+    // intelfb-0015: kAGDCLinkConfig (0x921) and the plane-scaler capability (0x711), which NVRMAGDC answers once NVRM's
+    // auto-go sets debug.nvrmfb_agdc_k5; unanswered, CoreDisplay logged "Attempting to get capabilities ... with no
+    // devices" and "No plane indices", and WindowServer sent no frame (RTX-13)
+    if (cmd == NVK5_CMD_LINKCONFIG || cmd == NVK5_CMD_FBCAPEX) {
+        int why = 0;
+        int r = nvk5_answer(cmd, in, inSize, out, outSize ? *outSize : 0, gIfbK5, sizeof gIfbK5, &why);
+        if (r == NVK5_R_LINK) { IFB_ONCE("k5-link"); return kIOReturnSuccess; }
+        if (r == NVK5_R_CAPS) { IFB_ONCE("k5-caps"); return kIOReturnSuccess; }
+        if (r != NVK5_R_UNSUPPORTED) {
+            if (gIfbAgdcLogged < 20) { gIfbAgdcLogged++; IFBLOG("AGDC K5: command %#x not answered (why %#x)", cmd, why); }
+            return r == NVK5_R_BADARG ? kIOReturnBadArgument : kIOReturnNotFound;
+        }
     }
     if (gIfbAgdcLogged < 20) { gIfbAgdcLogged++; IFBLOG("AGDC: command %#x (in %lu bytes) -> Unsupported", cmd, inSize); }
     return kIOReturnUnsupported;
