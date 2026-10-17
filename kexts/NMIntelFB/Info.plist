@@ -43,5 +43,6 @@
     <key>com.apple.kpi.mach</key><string>8.0</string>
     <key>com.apple.iokit.IOPCIFamily</key><string>1.0.0</string>
     <key>com.apple.iokit.IOGraphicsFamily</key><string>1.0.0</string>
+    <key>com.apple.AppleGraphicsDeviceControl</key><string>1.0.0</string>
   </dict>
 </dict></plist>
