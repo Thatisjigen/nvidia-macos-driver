@@ -4054,6 +4054,7 @@ static BOOL nvmtl_pixel_sampler_update(NSMutableDictionary *states, NSString *in
         }
         _svFor=_ps; _svKey=key; _svSel=selected;
     }
+    _svSel=selected;
     return selected;
 }
 - (void)setVertexAmplificationCount:(NSUInteger)count viewMappings:(const MTLVertexAmplificationViewMapping *)m {
@@ -4650,6 +4651,7 @@ static NVMTLBuffer *nvmtl_bytes_ring(NVMTLCommandBuffer *cb, NSUInteger len, siz
     [self nvmtlBeginVisibility];
 }
 - (void)endEncoding {
+    _svFor=nil; _svKey=nil; _svSel=nil;   // nothing of this encoder outlives it
     _cb->_nEnd++;
     _svFor=nil; _svKey=nil; _svSel=nil;   // nothing of this encoder's sampler choice outlives it
     if (_dumpPso) { _dumpPso = NO; [self nvmtlDumpBoundFragmentBuffers]; }
