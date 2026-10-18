@@ -3393,10 +3393,14 @@ static BOOL nvmtl_pixel_sampler_update(NSMutableDictionary *states, NSString *in
             }
         }
         NSData *key=_pixelSamplerKey;
+        // same pipeline, same sampler values as this encoder's last draw: its choice stands (no lock, no lookup; ANGLE
+        // binds every draw)
+        if (_svSel && _svFor==_ps && _svKey==key) return _svSel==[NSNull null] ? nil : _svSel;
+        _svFor=_ps; _svKey=key; _svSel=nil;
         @synchronized(_ps) {
             if(!_ps->_samplerVariants) _ps->_samplerVariants=[NSMutableDictionary new];
             id cached=_ps->_samplerVariants[key];
-            if(cached==[NSNull null]) return nil;
+            if(cached==[NSNull null]) { _svSel=cached; return nil; }
             selected=cached;
             if(!selected) {
                 // Reusing the key across pipelines still performs each pipeline's own variant lookup.
@@ -3417,12 +3421,13 @@ static BOOL nvmtl_pixel_sampler_update(NSMutableDictionary *states, NSString *in
                     if(!selected)why=error.description;
                     else nvmtl_sampvar_put(gk,selected,vf,ff);
                 }
-                if(!selected){nvlog("pixel sampler specialization REFUSED %s: %s",_ps->_fname.UTF8String,why.UTF8String);_ps->_samplerVariants[key]=[NSNull null];return nil;}
+                if(!selected){nvlog("pixel sampler specialization REFUSED %s: %s",_ps->_fname.UTF8String,why.UTF8String);_ps->_samplerVariants[key]=[NSNull null];_svSel=[NSNull null];return nil;}
                 _ps->_samplerVariants[key]=selected;
                 nvlog("pixel sampler variant built: %s / %s",_ps->_vname.UTF8String,_ps->_fname.UTF8String);
             }
         }
     }
+    _svSel=selected;
     return selected;
 }
 - (BOOL)nvmtlBindSamplerPipeline {
@@ -3942,6 +3947,7 @@ static NVMTLBuffer *nvmtl_bytes_ring(NVMTLCommandBuffer *cb, NSUInteger len, siz
     [self nvmtlBeginVisibility];
 }
 - (void)endEncoding {
+    _svFor=nil; _svKey=nil; _svSel=nil;   // nothing of this encoder outlives it
     _cb->_nEnd++;
     if (_dumpPso) { _dumpPso = NO; [self nvmtlDumpBoundFragmentBuffers]; }
     [self nvmtlCloseVisibility];
