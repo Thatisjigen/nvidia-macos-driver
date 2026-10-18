@@ -3608,6 +3608,8 @@ static BOOL nvmtl_pixel_sampler_update(NSMutableDictionary *states, NSString *in
     if (ps && (NVMTLRenderPipelineState *)ps == _ps && _begun && !(_cb->_c.pt_open && _cb->_c.pt_pool)) return;
     // NVMTL_DUMP_PSO=<text>: the first encoder that sets a pipeline whose label contains it has the fragment buffers bound
     // at its end dumped, as NVMTL_DUMP_GROUP does, for apps that label pipelines but push no debug groups (diagnostic)
+    // The same pipeline again inside a begun pass (Apple's GL renderer sets it before every draw) changes nothing.
+    if (ps && (NVMTLRenderPipelineState *)ps == _ps && _begun && !(_cb->_c.pt_open && _cb->_c.pt_pool)) return;
     // Only asked for when the switch is set: this runs on every pipeline bind, and an unconditional `ps.label` was a message
     // send plus a string retain/release per draw call in profiles of a game that never sets NVMTL_DUMP_PSO.
     { static const char *want; static int once; static _Atomic int armed; if (!once) { once = 1; want = getenv("NVMTL_DUMP_PSO"); }
