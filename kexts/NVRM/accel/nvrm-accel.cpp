@@ -1256,6 +1256,10 @@ static SInt64 gCntIopDirect, gCntIopCopyUs;
 #define NMINTELFB_FN_RAM_FLIP "nmIntelFBRamFlip"   // stage 4b: after the copy, p1 = the pages written (NMIntelFB flips to them)
 struct NMIntelFBRamPages { unsigned int version, pitch; const unsigned long long *pages; unsigned long long count, length; volatile void *kva; };
 static SInt64 gCntIopRam;
+// nmx-accel 0004: on nullmoth 2.5.x some composites are copied while still one colour although their GPU wait said
+// ready (UPG-3: black blinks); in flip mode they land in the buffer not on screen, so skipping the flip hides them
+static int gIopBlankHold = 3, gIopBlankRun;
+static SInt64 gCntIopBlankHeld;
 static void nvIopCopyRows(void *dst, unsigned dpitch, const void *src, unsigned spitch, unsigned rowBytes, unsigned h)
 {
     if (gIopMemcpy) {
@@ -1617,6 +1621,8 @@ SYSCTL_INT(_debug, OID_AUTO, nvaccel_iop_memcpy, CTLFLAG_RW | CTLFLAG_LOCKED, &g
 SYSCTL_INT(_debug, OID_AUTO, nvaccel_iop_direct, CTLFLAG_RW | CTLFLAG_LOCKED, &gIopDirect, 0, "nmx-accel: 1 = copy engine staging -> CPU scanout, skipping the IOSurface's system pages; 2 = copy engine straight into the scanout's RAM pages when the framebuffer offers them");
 NVACCEL_CNT(nvaccel_iop_direct_frames, gCntIopDirect, "nmx-accel: frames put on a CPU scanout straight from the staging buffer");
 NVACCEL_CNT(nvaccel_iop_ram_frames,    gCntIopRam,    "nmx-accel: frames the copy engine wrote straight into the panel's scan-out pages in RAM");
+SYSCTL_INT(_debug, OID_AUTO, nvaccel_iop_blank_hold, CTLFLAG_RW | CTLFLAG_LOCKED, &gIopBlankHold, 0, "nmx-accel: with the panel flipping RAM buffers, up to this many one-colour frames in a row stay off the panel (0 = show them all)");
+NVACCEL_CNT(nvaccel_iop_blank_held,    gCntIopBlankHeld, "nmx-accel: one-colour frames kept off the panel (the last picture stayed)");
 NVACCEL_CNT(nvaccel_iop_copy_us,       gCntIopCopyUs, "nmx-accel: microseconds spent getting copied frames onto a CPU scanout (copy engine + CPU)");
 NVACCEL_CNT(nvaccel_iop_async_refused, gCntIopAsyncRefused, "async swaps NVKMS refused (that frame stayed off the panel)");
 NVACCEL_CNT(nvaccel_iop_async_drop,    gCntIopAsyncDrop,    "frames dropped because a flip was still in flight past a refresh period");
@@ -1664,6 +1670,7 @@ static void nvaccelInstallSysctl(void)
     sysctl_register_oid(&sysctl__debug_nvaccel_iop_memcpy);     sysctl_register_oid(&sysctl__debug_nvaccel_iop_direct);
     sysctl_register_oid(&sysctl__debug_nvaccel_iop_direct_frames); sysctl_register_oid(&sysctl__debug_nvaccel_iop_copy_us);
     sysctl_register_oid(&sysctl__debug_nvaccel_iop_ram_frames);
+    sysctl_register_oid(&sysctl__debug_nvaccel_iop_blank_hold); sysctl_register_oid(&sysctl__debug_nvaccel_iop_blank_held);
     sysctl_register_oid(&sysctl__debug_nvaccel_surface_gpu);    sysctl_register_oid(&sysctl__debug_nvaccel_surface_gpu_on);
     sysctl_register_oid(&sysctl__debug_nvaccel_surface_gpu_marks); sysctl_register_oid(&sysctl__debug_nvaccel_surface_gpu_waits);
     sysctl_register_oid(&sysctl__debug_nvaccel_surface_gpu_timeouts); sysctl_register_oid(&sysctl__debug_nvaccel_surface_gpu_wait_max_us);
@@ -2449,7 +2456,7 @@ static bool nvAccelIopDirect(NVAccel *a, IOService *fb, unsigned head, IOSurface
     bool locked = false;
     for (unsigned i = 0; i < 8 && !(locked = nvFamLock(a, true)); i++) IOSleep(1);
     if (!locked) return false;
-    bool done = false;
+    bool done = false, blank = false;
     void *cache = _ZN22IOGraphicsAccelerator223deviceCacheForIOSurfaceEP9IOSurfacej((void *)a, (void *)s, 0);
     OSObject *ctx = cache ? *(OSObject *volatile *)((unsigned char *)cache + 0x20) : nullptr;
     NVResource *res = OSDynamicCast(NVResource, ctx);
@@ -2459,7 +2466,7 @@ static bool nvAccelIopDirect(NVAccel *a, IOService *fb, unsigned head, IOSurface
     if (vm && vm->fRmHandle && !vm->fScanout && vm->fBytes >= len && valid && !(valid[0] & 1u) && ram) {
         const unsigned st = nvIopPageoff(hh.kapiDevice, vm->fRmHandle, rp.pages, pages, len);
         if (st == 0) {
-            if (!nvIopVaried((const volatile unsigned char *)rp.kva, W, H, P)) OSAddAtomic64(1, &gCntIopBlank);
+            if (!nvIopVaried((const volatile unsigned char *)rp.kva, W, H, P)) { OSAddAtomic64(1, &gCntIopBlank); blank = true; }
             OSAddAtomic64(1, &gCntIopRam);
             done = true;
         } else if (st == 0x65u) ALOG("iop direct: CE copy TIMED OUT into the panel's RAM pages");
@@ -2487,7 +2494,12 @@ static bool nvAccelIopDirect(NVAccel *a, IOService *fb, unsigned head, IOSurface
     }
     if (cache) ((OSObject *)cache)->release();
     nvFamUnlock(a);
-    if (done && ram) {
+    // a short run of one-colour frames keeps the last picture (no flip; the next frame rewrites the same buffer); a
+    // longer run is a real one-colour screen and is shown. Without flipping (nmintelfb_ram=1) the frame is already on.
+    const bool hold = done && ram && blank && gIopBlankRun < gIopBlankHold;
+    if (done && ram) gIopBlankRun = !blank ? 0 : gIopBlankRun < gIopBlankHold ? gIopBlankRun + 1 : gIopBlankRun;
+    if (hold) OSAddAtomic64(1, &gCntIopBlankHeld);
+    if (done && ram && !hold) {
         // outside the locks: the framebuffer writes PLANE_SURF; it ignores this unless it flips (debug.nmintelfb_ram=2)
         if (const OSSymbol *fsym = OSSymbol::withCStringNoCopy(NMINTELFB_FN_RAM_FLIP)) {
             fb->callPlatformFunction(fsym, false, (void *)rp.pages, nullptr, nullptr, nullptr);
