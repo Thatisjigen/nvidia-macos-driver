@@ -14,6 +14,7 @@
 #include <IOKit/pci/IOPCIDevice.h>
 #include <IOKit/graphics/IOFramebuffer.h>
 #include <IOKit/graphics/IODisplay.h>
+#include <IOKit/graphics/IOAccelerator.h>
 #include <IOKit/ndrvsupport/IOMacOSVideo.h>
 #include <libkern/OSAtomic.h>
 #include "nvrm_vram_abi.h"
@@ -224,6 +225,9 @@ constexpr uint32_t fmtOf(uint32_t ctl)  { return (ctl >> 23) & 0x1F; }
 constexpr uint32_t tileOf(uint32_t ctl) { return (ctl >> 10) & 0x7; }
 }
 
+static bool gIfbDepNvrm = false;   // the panel sits in NVRM's group (dep=2, or dep=3 with a head 0)
+static unsigned ifb_nvrm_heads(void);
+
 class NMIntelFB : public IOFramebuffer {
     OSDeclareDefaultStructors(NMIntelFB)
     IOPCIDevice *fPCI = nullptr;
@@ -376,6 +380,10 @@ public:
     // now, so the panel becomes index 0 of its own controller here.
     IOReturn open() override {
         if (fOwnGroup) { setProperty("IOFBDependentIndex", 0ull, 32); IFB_ONCE("open-idx0"); }
+        // in NVRM's group the same walk stopped at the empty slot after NVRMFB's heads, so the panel at 4 was
+        // never in it and WindowServer found no pipe for it (pipe 1 active, "Unable to find display pipe").
+        // It takes the slot right after the NVIDIA heads, which is also the pipe number NVAccel gave it.
+        else if (gIfbDepNvrm) { setProperty("IOFBDependentIndex", (unsigned long long)ifb_nvrm_heads(), 32); IFB_ONCE("open-idxn"); }
         return IOFramebuffer::open();
     }
     bool isConsoleDevice() override { IFB_ONCE("con"); return true; }
@@ -596,11 +604,22 @@ SYSCTL_PROC(_debug, OID_AUTO, nmintelfb_sample, CTLTYPE_STRING | CTLFLAG_RD | CT
 
 // intelfb-0013: the Intel GPU whose panel this driver shows, kept by NMIntelFBClaim when the framebuffer sits under NVRM
 static IOPCIDevice *gIfbPCI = nullptr;
+static IOService *gIfbClaim;   // NMIntelFBClaim, parent of the GPUWrangler accelerator
+static void ifb_gwready(bool panel);
+static bool gIfbAutopipeOn;   // the autopipe thread runs, and publishes the Intel GPU when done
+static bool gIfbBootMonitor;  // a monitor on the NVIDIA port at boot (NVRMFB head 0 when start() ran)
 static IOService *gIfbNubFB = nullptr;   // intelfb-0014: the framebuffer on the nub, which the AGDC reports
 static uint32_t gIfbK5[NVK5_TIMING_WORDS];   // intelfb-0015: the panel's timing in NVRMFB's NVRMTiming layout
+// the panel beside a monitor on NVRMFB's head 0. In NVRM's group the panel is
+// NVAccel's head 4, whose pipe comes after head 0's, and WindowServer builds one pipe per entry of the AGDC 0x980
+// table, in order: the AGDC lists head 0 first, then the panel (listing the panel alone left it without one)
+static IOService *gIfbAgdcHead0 = nullptr;    // NVRMFB's head 0 listed by the AGDC, kept until reboot
+static IOService *ifb_nvrm_head0(void);
+static void ifb_autopipe_start(void);
 static void ifb_agdc_register(bool on);
 static void ifb_ram_register(NMIntelFB *fb);
 static NMIntelFB *volatile gIfbRamFB;   // intelfb-0017: the panel debug.nmintelfb_ram acts on
+static volatile SInt32 gIfbScanAsks;    // NVAccel's scanout questions, one per frame it copies to the panel
 static bool ifb_pci_ok(IOPCIDevice *pci, uint8_t *ver);
 
 IOService *NMIntelFB::probe(IOService *provider, SInt32 *score)
@@ -728,7 +747,15 @@ bool NMIntelFB::start(IOService *provider)
     ifb_trail("start");
     // intelfb-0008: nullmoth-intelfb-delay=<s> waits before taking the panel, so the boot log reaches the disk and the
     // NVIDIA stack (NVRM auto-go, NVAccel) has started before this framebuffer exists. The firmware screen stays meanwhile
-    if (uint32_t w = ifb_knob("nullmoth-intelfb-delay", 0)) {
+    // the short delay and the early GPUWrangler publish were tested only with a monitor on the NVIDIA
+    // port at boot (NVRM's group, autopipe). Without one (no NVRMFB head 0 when this nub is published, which NVRM does
+    // after nub 0's framebuffer started) the Mac hung about 10 s after start() with WindowServer already on the panel
+    //: there the panel waits nullmoth-intelfb-delay-own (default 45 s, as before) and the Intel
+    // GPU is not published, so WindowServer waits GPUWrangler's 60 s as it always did in that mode.
+    IOService *h0 = ifb_nvrm_head0();
+    gIfbBootMonitor = h0 != nullptr;
+    OSSafeReleaseNULL(h0);
+    if (uint32_t w = gIfbBootMonitor ? ifb_knob("nullmoth-intelfb-delay", 0) : ifb_knob("nullmoth-intelfb-delay-own", 45)) {
         if (w > 120) w = 120;
         IFBLOG("waiting %u s before taking the panel (nullmoth-intelfb-delay)", w);
         ifb_trail("wait");
@@ -737,6 +764,13 @@ bool NMIntelFB::start(IOService *provider)
     }
     bool ok = startReal(provider);
     ifb_trail(ok ? "ok" : "declined");
+    // WindowServer's wait may end only when the panel is ready for it. With the autopipe that is after
+    // the autopipe (ifb_autopipe), which must finish before WindowServer opens its framebuffers: published right here,
+    // WindowServer opened the panel 0.2 s after start() and the Mac hung (both times).
+    // In its own group (no monitor at boot) nothing is published: the 60 s wait, as before (see the delay above);
+    // nullmoth-intelfb-gwready-own=1 publishes there too, untested.
+    if (!ok) ifb_gwready(false);
+    else if (!gIfbAutopipeOn && ifb_knob("nullmoth-intelfb-gwready-own", 0)) ifb_gwready(true);
     // intelfb-0005: RTX-3 froze after start() returned, so the boot guard stays armed until the Mac has lived two
     // minutes with this framebuffer; a freeze before that leaves the panel to the firmware on the next boot
     if (ok) {
@@ -776,8 +810,17 @@ bool NMIntelFB::startReal(IOService *provider)
     // open()); dep=2 keeps NVRM's group as before. Index 4 at publish is what makes NVAccel treat it as head 4.
     publishBacklight();   // intelfb-0020: before IOFramebuffer::start(), whose open() looks for "backlight"
     uint32_t dep = fSurfMap ? ifb_knob("nullmoth-intelfb-dep", 1) : 0;
+    // dep=3 chooses at each boot, after the delay: NVRM's group when NVRMFB started a head 0 (a monitor on the
+    // NVIDIA port at boot), its own group otherwise. Never two head 0s (WindowServer crashes)
+    if (dep == 3) {
+        IOService *h0 = ifb_nvrm_head0();
+        dep = h0 ? 2 : 1;
+        OSSafeReleaseNULL(h0);
+        ifb_trail(dep == 2 ? "auto-nvrm" : "auto-own");
+    }
     if (dep) {
         fOwnGroup = dep != 2;
+        gIfbDepNvrm = !fOwnGroup;
         setProperty("IOFBDependentID", fOwnGroup ? 0x4E4D494E00000001ull : 0x4E56524D00000001ull, 64);
         // intelfb-0010: NVAccel makes only head 0 its primary framebuffer (fFB), and registers pipes (debug.nvaccelfb)
         // only once fFB is set; NVRMFB head 0 never starts here, so as head 4 the panel was never registered and the
@@ -795,7 +838,9 @@ bool NMIntelFB::startReal(IOService *provider)
     fVblAlways = ifb_knob("nullmoth-intelfb-vbl", 1) != 0;
     armVbl();
     ifb_trail(fVblAlways ? "vbl-always" : "vbl");
-    if (fOwnGroup && ifb_knob("nullmoth-intelfb-head", 0) != 4) kapiInit();
+    // in NVRM's group too. Without fDev the panel's pipe has no scanout resource (intelfb-0016) and stays
+    // inactive: a boot without it had pipe 1 "active 0", "Unable to find display pipe" and iop_ok_h4 0
+    if ((fOwnGroup && ifb_knob("nullmoth-intelfb-head", 0) != 4) || gIfbDepNvrm) kapiInit();
     // nmx-intel: nullmoth-intelfb-pm=0 leaves power management out (RTX-2 hung inside this call)
     if (ifb_knob("nullmoth-intelfb-pm", 1)) {
         ifb_trail("pm");
@@ -812,6 +857,9 @@ bool NMIntelFB::startReal(IOService *provider)
         IFBLOG("K5 timing: pclk %u %ux%u h %u-%u/%u v %u-%u/%u %u mHz%s", k5[1], fWidth, fHeight, fHSS, fHSE, fHT, fVSS, fVSE, fVT,
                k5[10], bad ? " - REJECTED by nvk5_timing_bad" : "");
         ifb_agdc_register(true);
+        // in NVRM's group NVRM's auto-go has armed head 0 long before this panel exists, and nmx-intel's
+        // auto.sh leaves an armed accelerator alone; nullmoth-intelfb-autopipe=0 leaves it to debug.* by hand
+        if (gIfbDepNvrm && ifb_knob("nullmoth-intelfb-autopipe", 1)) ifb_autopipe_start();
     }
     ifb_ram_register(this);
     IFBLOG("built-in panel published (%ux%u)", fWidth, fHeight);
@@ -1016,6 +1064,7 @@ IOReturn NMIntelFB::callPlatformFunction(const OSSymbol *fn, bool wait, void *p1
 {
     if (fn && fn->isEqualTo(NVRM_VRAM_FN_SCANOUT)) {
         IFB_ONCE("scan");
+        OSIncrementAtomic(&gIfbScanAsks);
         NVRMVramRequest *r = (NVRMVramRequest *)p1;
         if (!r || r->version != NVRM_VRAM_ABI_VERSION) return kIOReturnBadArgument;
         if (!fSurfMap) return kIOReturnNotReady;
@@ -1092,6 +1141,33 @@ public:
 };
 OSDefineMetaClassAndStructors(NMIntelFBClaim, IOService)
 
+// AppleGPUWrangler makes a GPU of every display-class PCI device and holds WindowServer's
+// GPUWranglerWaitForPublish (60 s, from CoreDisplay) until each GPU has an accelerator, an AGDC or a framebuffer under
+// it. The panel's framebuffer and AGDC sit under the NVIDIA GPU, so the Intel GPU never published and every boot waited
+// the full 60 s. WindowServer lists the framebuffers once, when the wait ends, and does not add one
+// that comes later (the NVIDIA GPU published at +20 s, the panel at +31.6 s). So an
+// empty accelerator goes under the claim when the panel is ready for WindowServer (after the autopipe, see
+// NMIntelFB::start): the Intel GPU publishes then, and the wait ends with the panel there. No IOAccelIndex, no Metal
+// plugin: nothing renders on it.
+// nullmoth-intelfb-gwready=0: not published (the 60 s wait comes back).
+class NMIntelFBGPUReady : public IOAccelerator {
+    OSDeclareDefaultStructors(NMIntelFBGPUReady)
+};
+OSDefineMetaClassAndStructors(NMIntelFBGPUReady, IOAccelerator)
+
+static void ifb_gwready(bool panel)
+{
+    static SInt32 done;
+    if (!gIfbClaim || !OSCompareAndSwap(0, 1, &done)) return;
+    if (!ifb_knob("nullmoth-intelfb-gwready", 1)) { ifb_trail("gwready-off"); return; }
+    NMIntelFBGPUReady *a = OSTypeAlloc(NMIntelFBGPUReady);
+    bool up = a && a->init() && a->attach(gIfbClaim);
+    if (up) a->registerService();
+    OSSafeReleaseNULL(a);   // the registry keeps it while attached
+    ifb_trail(up ? "gwready" : "gwready-fail");
+    IFBLOG("GPUWrangler: Intel GPU %s (panel %s)", up ? "published" : "NOT published", panel ? "up" : "declined");
+}
+
 IOService *NMIntelFBClaim::probe(IOService *provider, SInt32 *score)
 {
     IOPCIDevice *pci = OSDynamicCast(IOPCIDevice, provider);
@@ -1106,6 +1182,7 @@ bool NMIntelFBClaim::start(IOService *provider)
     if (!pci || !IOService::start(provider)) return false;
     pci->retain(); gIfbPCI = pci;
     ifb_trail("claim");
+    retain(); gIfbClaim = this;   // NMIntelFB::start() publishes the Intel GPU under it
     thread_t t = nullptr;
     if (kernel_thread_start(publishThread, nullptr, &t) != KERN_SUCCESS) { ifb_trail("claim-nothread"); return true; }
     thread_deallocate(t);
@@ -1190,6 +1267,18 @@ IOReturn NMIntelFBAGDC::vendor_doDeviceAttribute(unsigned int cmd, unsigned long
     if (cmd == 0x980) {
         if (!out || !outSize || *outSize != sizeof(IfbAgdcGPUCapability)) return kIOReturnBadArgument;
         IfbAgdcGPUCapability *c = (IfbAgdcGPUCapability *)out; bzero(c, sizeof *c);
+        // beside NVRMFB's head 0, list it first and the panel second, NVAccel's pipe order
+        if (gIfbDepNvrm && !gIfbAgdcHead0) {
+            IOService *h0 = ifb_nvrm_head0();
+            if (h0 && !OSCompareAndSwapPtr(nullptr, h0, (void *volatile *)&gIfbAgdcHead0)) h0->release();
+        }
+        if (gIfbDepNvrm && gIfbAgdcHead0) {
+            c->portMask = (1ull << 1) | (1ull << 2);
+            c->countA = c->countB = c->countC = c->countD = 2;
+            c->maxFramebuffers = 2; c->pciDevice = fPci; c->framebuffer[0] = gIfbAgdcHead0; c->framebuffer[1] = fFB;
+            IFB_ONCE("agdc-980-2");
+            return kIOReturnSuccess;
+        }
         c->portMask = 1ull << 1;
         c->countA = c->countB = c->countC = c->countD = 1;
         c->maxFramebuffers = 1; c->pciDevice = fPci; c->framebuffer[0] = fFB;
@@ -1200,8 +1289,17 @@ IOReturn NMIntelFBAGDC::vendor_doDeviceAttribute(unsigned int cmd, unsigned long
     // auto-go sets debug.nvrmfb_agdc_k5; unanswered, CoreDisplay logged "Attempting to get capabilities ... with no
     // devices" and "No plane indices", and WindowServer sent no frame (RTX-13)
     if (cmd == NVK5_CMD_LINKCONFIG || cmd == NVK5_CMD_FBCAPEX) {
-        int why = 0;
-        int r = nvk5_answer(cmd, in, inSize, out, outSize ? *outSize : 0, gIfbK5, sizeof gIfbK5, &why);
+        int why = 0, r;
+        if (gIfbDepNvrm && gIfbAgdcHead0) {
+            // entry 0 is head 0, answered from its NVRMTiming as NVRMAGDC does; entry 1 is the panel
+            uint32_t t0[NVK5_TIMING_WORDS] = {}; unsigned long t0Bytes = 0;
+            OSObject *o = gIfbAgdcHead0->copyProperty("NVRMTiming"); OSData *d = OSDynamicCast(OSData, o);
+            if (d) { t0Bytes = d->getLength(); if (t0Bytes == sizeof t0) memcpy(t0, d->getBytesNoCopy(), sizeof t0); }
+            OSSafeReleaseNULL(o);
+            const struct nvk5_head h[2] = { { d ? t0 : nullptr, t0Bytes }, { gIfbK5, sizeof gIfbK5 } };
+            int32_t idx = -1;
+            r = nvk5_answer_heads(cmd, in, inSize, out, outSize ? *outSize : 0, h, 2, &why, &idx);
+        } else r = nvk5_answer(cmd, in, inSize, out, outSize ? *outSize : 0, gIfbK5, sizeof gIfbK5, &why);
         if (r == NVK5_R_LINK) { IFB_ONCE("k5-link"); return kIOReturnSuccess; }
         if (r == NVK5_R_CAPS) { IFB_ONCE("k5-caps"); return kIOReturnSuccess; }
         if (r != NVK5_R_UNSUPPORTED) {
@@ -1232,11 +1330,8 @@ static void ifb_agdc_up(void *, wait_result_t)
     thread_terminate(current_thread());
 }
 
-static int ifb_agdc_sysctl SYSCTL_HANDLER_ARGS
+static int ifb_agdc_start(void)
 {
-    int v = gIfbAgdcState, err = sysctl_handle_int(oidp, &v, 0, req);
-    if (err || !req->newptr) return err;
-    if (v != 1) return EINVAL;
     if (gIfbAgdcState == 1 || gIfbAgdcState == 2) return 0;
     if (!gIfbNubFB) return ENXIO;
     gIfbAgdcState = 2;
@@ -1244,6 +1339,144 @@ static int ifb_agdc_sysctl SYSCTL_HANDLER_ARGS
     if (kernel_thread_start(ifb_agdc_up, nullptr, &t) != KERN_SUCCESS) { gIfbAgdcState = -5; return ENOMEM; }
     thread_deallocate(t);
     return 0;
+}
+
+static int ifb_agdc_sysctl SYSCTL_HANDLER_ARGS
+{
+    int v = gIfbAgdcState, err = sysctl_handle_int(oidp, &v, 0, req);
+    if (err || !req->newptr) return err;
+    if (v != 1) return EINVAL;
+    return ifb_agdc_start();
+}
+
+// NVRMFB's head 0 (an NVRMNVDAFramebuffer published with IOFBDependentIndex 0), retained, or null
+static IOService *ifb_nvrm_head0(void)
+{
+    IOService *found = nullptr;
+    OSDictionary *m = IOService::serviceMatching("NVRMNVDAFramebuffer");
+    OSIterator *it = m ? IOService::getMatchingServices(m) : nullptr;
+    OSSafeReleaseNULL(m);
+    if (!it) return nullptr;
+    while (OSObject *o = it->getNextObject()) {
+        IOService *f = OSDynamicCast(IOService, o);
+        OSNumber *n = f ? OSDynamicCast(OSNumber, f->getProperty("IOFBDependentIndex")) : nullptr;
+        if (n && n->unsigned32BitValue() == 0) { f->retain(); found = f; break; }
+    }
+    it->release();
+    return found;
+}
+
+// how many NVRMFB heads sit at IOFBDependentIndex 0, 1, ... without a gap (NVAccel registers them in that
+// order and the panel after them)
+static unsigned ifb_nvrm_heads(void)
+{
+    unsigned mask = 0, n = 0;
+    OSDictionary *m = IOService::serviceMatching("NVRMNVDAFramebuffer");
+    OSIterator *it = m ? IOService::getMatchingServices(m) : nullptr;
+    OSSafeReleaseNULL(m);
+    if (it) {
+        while (OSObject *o = it->getNextObject()) {
+            IOService *f = OSDynamicCast(IOService, o);
+            OSNumber *i = f ? OSDynamicCast(OSNumber, f->getProperty("IOFBDependentIndex")) : nullptr;
+            if (i && i->unsigned32BitValue() < 4) mask |= 1u << i->unsigned32BitValue();
+        }
+        it->release();
+    }
+    while (n < 4 && (mask >> n) & 1) n++;
+    return n;
+}
+
+// NVAccel's debug.* knobs, from here. The walk does what `sysctl` does for a name: the debug node's children,
+// through the kernel's sysctlbyname (kernel buffers, its own locking and checks; NVRM imports it too). A first
+// version walked sysctl__debug_children itself and never found NVAccel's knobs on Tahoe.
+extern "C" int sysctlbyname(const char *name, void *oldp, size_t *oldlenp, void *newp, size_t newlen);
+// reads debug.<name> into *v and, with set, writes v first; the errno of sysctlbyname (ENOENT: no such knob)
+static int ifb_knob_rw(const char *name, int *v, bool set)
+{
+    char full[64];
+    snprintf(full, sizeof full, "debug.%s", name);
+    int now = 0, want = *v;
+    size_t len = sizeof now;
+    int err = sysctlbyname(full, &now, &len, set ? &want : nullptr, set ? sizeof want : 0);
+    *v = now;
+    return err;
+}
+
+// the panel's fast copy with the HDMI as well, in the steps nmx-intel's auto.sh takes without
+// it and that were checked by hand: NVAccel's direct copy, the RAM scanout (two buffers flipped unless
+// nullmoth-accel-ram says 1 or 0), then the copy engine straight into it. Like auto.sh it starts once WindowServer's
+// frames reach the panel; nullmoth-accel-fast=0 keeps the base copy. The kernel can write NVAccel's two knobs only in
+// a build with the fix for the stale frames of the direct copy; with any other the base copy stays.
+static void ifb_fastcopy(void)
+{
+    if (!ifb_knob("nullmoth-accel-fast", 1)) { ifb_trail("fast-off"); return; }
+    int i = 0;
+    for (; i < 900 && gIfbScanAsks < 10; i++) IOSleep(200);   // up to 3 minutes
+    if (gIfbScanAsks < 10) { ifb_trail("fast-noframes"); IFBLOG("fast copy: only %d copied frames in 3 min, base copy", (int)gIfbScanAsks); return; }
+    IOSleep(5000);
+    int mc = 1, d1 = 1, d2 = 2, e1 = ifb_knob_rw("nvaccel_iop_memcpy", &mc, true), e2 = -2, e3 = -2, e4 = -2;
+    if (!e1) e2 = ifb_knob_rw("nvaccel_iop_direct", &d1, true);
+    if (e1 || e2) {
+        ifb_trail("fast-nokern");
+        IFBLOG("fast copy: NVAccel did not take its knobs from the kernel (memcpy err %d, direct err %d): base copy", e1, e2);
+        return;
+    }
+    IOSleep(2000);
+    uint32_t ram = ifb_knob("nullmoth-accel-ram", 2);
+    int rv = ram > 2 ? 2 : (int)ram;
+    if (rv) e3 = ifb_knob_rw("nmintelfb_ram", &rv, true);
+    if (!e3) e4 = ifb_knob_rw("nvaccel_iop_direct", &d2, true);
+    ifb_trail(!e4 ? "fast-on" : "fast-direct1");
+    IFBLOG("fast copy after %d copied frames: memcpy 1, direct 1; ram scanout %u (err %d); direct 2 (err %d)",
+           (int)gIfbScanAsks, ram > 2 ? 2u : ram, e3, e4);
+}
+
+// the pipe and AGDC setup a script did by hand, now at boot and before WindowServer opens its framebuffers
+// (measured at boot: the panel publishes about 17 s before), so no WindowServer restart is needed
+static void ifb_autopipe(void *, wait_result_t)
+{
+    int pub = 0, igpu = 1, fb = 3, nv = 0, nvst = -9, e0 = -2, e1 = -2, e2 = -2, e3 = -2, i;
+    for (i = 0; i < 100; i++) {   // NVAccel counts the panel as published: bit 4
+        if ((e0 = ifb_knob_rw("nvaccel_heads_published", &pub, false)) == 0 && (pub & 0x10)) break;
+        IOSleep(200);
+    }
+    if (pub & 0x10) {
+        e1 = ifb_knob_rw("nvaccel_igpu", &igpu, true);
+        e2 = ifb_knob_rw("nvaccelfb", &fb, true);
+        // NVRM's auto-go starts NullMoth's AGDC for head 0 at boot, and WindowServer sends its link and plane questions
+        // (0x2001, K5) there: with an AGDC of ours beside it the panel was never configured and showed only the cursor
+        // and NullMoth's cannot be terminated once anything opened it ("terminate -> 0"). NVRMAGDC with
+        // this change lists the panel after the NVIDIA heads, so it is the only AGDC. nullmoth-intelfb-ownagdc=1 brings
+        // back ours (and nullmoth-intelfb-agdcsolo=1 with it tries to terminate NullMoth's first).
+        if (ifb_knob("nullmoth-intelfb-ownagdc", 0)) {
+            if (ifb_knob("nullmoth-intelfb-agdcsolo", 1)) {
+                e3 = ifb_knob_rw("nvrmfb_agdc", &nv, true);
+                for (int j = 0; j < 30; j++) {   // 2 = terminated, 0 = never up
+                    if (ifb_knob_rw("nvrmfb_agdc", &nvst, false) == 0 && nvst != 1) break;
+                    IOSleep(100);
+                }
+            }
+            ifb_agdc_start();
+            for (i = 0; i < 30 && gIfbAgdcState == 2; i++) IOSleep(100);
+        }
+    }
+    // judged by the two writes: debug.nvaccel_heads_piped has no CTLFLAG_KERN, so the kernel cannot read it (it read 0
+    // while it was 0x11); NVAccel logs "index 4 -> pipe N" itself
+    ifb_trail(!e1 && !e2 ? "autopipe" : "autopipe-fail");
+    IFBLOG("autopipe: published %#x (err %d) after %d tries, igpu was %d (err %d), nvaccelfb was %d (err %d), "
+           "NullMoth AGDC was %d now %d (err %d), ours %d", pub, e0, i, igpu, e1, fb, e2, nv, nvst, e3, gIfbAgdcState);
+    // only now may WindowServer open its framebuffers; nullmoth-intelfb-gwdelay (s, default 3) keeps a
+    // margin. ifb_fastcopy waits for WindowServer's frames, so it follows.
+    if (uint32_t m = ifb_knob("nullmoth-intelfb-gwdelay", 3)) IOSleep((m > 30 ? 30 : m) * 1000);
+    ifb_gwready(true);
+    if (!e1 && !e2) ifb_fastcopy();
+    thread_terminate(current_thread());
+}
+static void ifb_autopipe_start(void)
+{
+    thread_t t = nullptr;
+    if (kernel_thread_start(ifb_autopipe, nullptr, &t) == KERN_SUCCESS) { gIfbAutopipeOn = true; thread_deallocate(t); }
+    else ifb_trail("autopipe-nothread");
 }
 SYSCTL_PROC(_debug, OID_AUTO, nmintelfb_agdc, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED | CTLFLAG_KERN, nullptr, 0,
             ifb_agdc_sysctl, "I", "1 = list the Intel panel in an AppleGraphicsDeviceControl on the NVIDIA GPU (1 up, 2 starting, < 0 failed)");
