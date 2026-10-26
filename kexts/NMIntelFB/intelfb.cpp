@@ -224,6 +224,9 @@ constexpr uint32_t fmtOf(uint32_t ctl)  { return (ctl >> 23) & 0x1F; }
 constexpr uint32_t tileOf(uint32_t ctl) { return (ctl >> 10) & 0x7; }
 }
 
+static bool gIfbDepNvrm = false;   // the panel sits in NVRM's group (dep=2, or dep=3 with a head 0)
+static unsigned ifb_nvrm_heads(void);
+
 class NMIntelFB : public IOFramebuffer {
     OSDeclareDefaultStructors(NMIntelFB)
     IOPCIDevice *fPCI = nullptr;
@@ -376,6 +379,10 @@ public:
     // now, so the panel becomes index 0 of its own controller here.
     IOReturn open() override {
         if (fOwnGroup) { setProperty("IOFBDependentIndex", 0ull, 32); IFB_ONCE("open-idx0"); }
+        // in NVRM's group the same walk stopped at the empty slot after NVRMFB's heads, so the panel at 4 was
+        // never in it and WindowServer found no pipe for it (pipe 1 active, "Unable to find display pipe").
+        // It takes the slot right after the NVIDIA heads, which is also the pipe number NVAccel gave it.
+        else if (gIfbDepNvrm) { setProperty("IOFBDependentIndex", (unsigned long long)ifb_nvrm_heads(), 32); IFB_ONCE("open-idxn"); }
         return IOFramebuffer::open();
     }
     bool isConsoleDevice() override { IFB_ONCE("con"); return true; }
@@ -598,6 +605,12 @@ SYSCTL_PROC(_debug, OID_AUTO, nmintelfb_sample, CTLTYPE_STRING | CTLFLAG_RD | CT
 static IOPCIDevice *gIfbPCI = nullptr;
 static IOService *gIfbNubFB = nullptr;   // intelfb-0014: the framebuffer on the nub, which the AGDC reports
 static uint32_t gIfbK5[NVK5_TIMING_WORDS];   // intelfb-0015: the panel's timing in NVRMFB's NVRMTiming layout
+// the panel beside a monitor on NVRMFB's head 0. In NVRM's group the panel is
+// NVAccel's head 4, whose pipe comes after head 0's, and WindowServer builds one pipe per entry of the AGDC 0x980
+// table, in order: the AGDC lists head 0 first, then the panel (listing the panel alone left it without one)
+static IOService *gIfbAgdcHead0 = nullptr;    // NVRMFB's head 0 listed by the AGDC, kept until reboot
+static IOService *ifb_nvrm_head0(void);
+static void ifb_autopipe_start(void);
 static void ifb_agdc_register(bool on);
 static void ifb_ram_register(NMIntelFB *fb);
 static NMIntelFB *volatile gIfbRamFB;   // intelfb-0017: the panel debug.nmintelfb_ram acts on
@@ -776,8 +789,17 @@ bool NMIntelFB::startReal(IOService *provider)
     // open()); dep=2 keeps NVRM's group as before. Index 4 at publish is what makes NVAccel treat it as head 4.
     publishBacklight();   // intelfb-0020: before IOFramebuffer::start(), whose open() looks for "backlight"
     uint32_t dep = fSurfMap ? ifb_knob("nullmoth-intelfb-dep", 1) : 0;
+    // dep=3 chooses at each boot, after the delay: NVRM's group when NVRMFB started a head 0 (a monitor on the
+    // NVIDIA port at boot), its own group otherwise. Never two head 0s (WindowServer crashes)
+    if (dep == 3) {
+        IOService *h0 = ifb_nvrm_head0();
+        dep = h0 ? 2 : 1;
+        OSSafeReleaseNULL(h0);
+        ifb_trail(dep == 2 ? "auto-nvrm" : "auto-own");
+    }
     if (dep) {
         fOwnGroup = dep != 2;
+        gIfbDepNvrm = !fOwnGroup;
         setProperty("IOFBDependentID", fOwnGroup ? 0x4E4D494E00000001ull : 0x4E56524D00000001ull, 64);
         // intelfb-0010: NVAccel makes only head 0 its primary framebuffer (fFB), and registers pipes (debug.nvaccelfb)
         // only once fFB is set; NVRMFB head 0 never starts here, so as head 4 the panel was never registered and the
@@ -795,7 +817,9 @@ bool NMIntelFB::startReal(IOService *provider)
     fVblAlways = ifb_knob("nullmoth-intelfb-vbl", 1) != 0;
     armVbl();
     ifb_trail(fVblAlways ? "vbl-always" : "vbl");
-    if (fOwnGroup && ifb_knob("nullmoth-intelfb-head", 0) != 4) kapiInit();
+    // in NVRM's group too. Without fDev the panel's pipe has no scanout resource (intelfb-0016) and stays
+    // inactive: a boot without it had pipe 1 "active 0", "Unable to find display pipe" and iop_ok_h4 0
+    if ((fOwnGroup && ifb_knob("nullmoth-intelfb-head", 0) != 4) || gIfbDepNvrm) kapiInit();
     // nmx-intel: nullmoth-intelfb-pm=0 leaves power management out (RTX-2 hung inside this call)
     if (ifb_knob("nullmoth-intelfb-pm", 1)) {
         ifb_trail("pm");
@@ -812,6 +836,9 @@ bool NMIntelFB::startReal(IOService *provider)
         IFBLOG("K5 timing: pclk %u %ux%u h %u-%u/%u v %u-%u/%u %u mHz%s", k5[1], fWidth, fHeight, fHSS, fHSE, fHT, fVSS, fVSE, fVT,
                k5[10], bad ? " - REJECTED by nvk5_timing_bad" : "");
         ifb_agdc_register(true);
+        // in NVRM's group NVRM's auto-go has armed head 0 long before this panel exists, and nmx-intel's
+        // auto.sh leaves an armed accelerator alone; nullmoth-intelfb-autopipe=0 leaves it to debug.* by hand
+        if (gIfbDepNvrm && ifb_knob("nullmoth-intelfb-autopipe", 1)) ifb_autopipe_start();
     }
     ifb_ram_register(this);
     IFBLOG("built-in panel published (%ux%u)", fWidth, fHeight);
@@ -1190,6 +1217,18 @@ IOReturn NMIntelFBAGDC::vendor_doDeviceAttribute(unsigned int cmd, unsigned long
     if (cmd == 0x980) {
         if (!out || !outSize || *outSize != sizeof(IfbAgdcGPUCapability)) return kIOReturnBadArgument;
         IfbAgdcGPUCapability *c = (IfbAgdcGPUCapability *)out; bzero(c, sizeof *c);
+        // beside NVRMFB's head 0, list it first and the panel second, NVAccel's pipe order
+        if (gIfbDepNvrm && !gIfbAgdcHead0) {
+            IOService *h0 = ifb_nvrm_head0();
+            if (h0 && !OSCompareAndSwapPtr(nullptr, h0, (void *volatile *)&gIfbAgdcHead0)) h0->release();
+        }
+        if (gIfbDepNvrm && gIfbAgdcHead0) {
+            c->portMask = (1ull << 1) | (1ull << 2);
+            c->countA = c->countB = c->countC = c->countD = 2;
+            c->maxFramebuffers = 2; c->pciDevice = fPci; c->framebuffer[0] = gIfbAgdcHead0; c->framebuffer[1] = fFB;
+            IFB_ONCE("agdc-980-2");
+            return kIOReturnSuccess;
+        }
         c->portMask = 1ull << 1;
         c->countA = c->countB = c->countC = c->countD = 1;
         c->maxFramebuffers = 1; c->pciDevice = fPci; c->framebuffer[0] = fFB;
@@ -1200,8 +1239,17 @@ IOReturn NMIntelFBAGDC::vendor_doDeviceAttribute(unsigned int cmd, unsigned long
     // auto-go sets debug.nvrmfb_agdc_k5; unanswered, CoreDisplay logged "Attempting to get capabilities ... with no
     // devices" and "No plane indices", and WindowServer sent no frame (RTX-13)
     if (cmd == NVK5_CMD_LINKCONFIG || cmd == NVK5_CMD_FBCAPEX) {
-        int why = 0;
-        int r = nvk5_answer(cmd, in, inSize, out, outSize ? *outSize : 0, gIfbK5, sizeof gIfbK5, &why);
+        int why = 0, r;
+        if (gIfbDepNvrm && gIfbAgdcHead0) {
+            // entry 0 is head 0, answered from its NVRMTiming as NVRMAGDC does; entry 1 is the panel
+            uint32_t t0[NVK5_TIMING_WORDS] = {}; unsigned long t0Bytes = 0;
+            OSObject *o = gIfbAgdcHead0->copyProperty("NVRMTiming"); OSData *d = OSDynamicCast(OSData, o);
+            if (d) { t0Bytes = d->getLength(); if (t0Bytes == sizeof t0) memcpy(t0, d->getBytesNoCopy(), sizeof t0); }
+            OSSafeReleaseNULL(o);
+            const struct nvk5_head h[2] = { { d ? t0 : nullptr, t0Bytes }, { gIfbK5, sizeof gIfbK5 } };
+            int32_t idx = -1;
+            r = nvk5_answer_heads(cmd, in, inSize, out, outSize ? *outSize : 0, h, 2, &why, &idx);
+        } else r = nvk5_answer(cmd, in, inSize, out, outSize ? *outSize : 0, gIfbK5, sizeof gIfbK5, &why);
         if (r == NVK5_R_LINK) { IFB_ONCE("k5-link"); return kIOReturnSuccess; }
         if (r == NVK5_R_CAPS) { IFB_ONCE("k5-caps"); return kIOReturnSuccess; }
         if (r != NVK5_R_UNSUPPORTED) {
@@ -1232,11 +1280,8 @@ static void ifb_agdc_up(void *, wait_result_t)
     thread_terminate(current_thread());
 }
 
-static int ifb_agdc_sysctl SYSCTL_HANDLER_ARGS
+static int ifb_agdc_start(void)
 {
-    int v = gIfbAgdcState, err = sysctl_handle_int(oidp, &v, 0, req);
-    if (err || !req->newptr) return err;
-    if (v != 1) return EINVAL;
     if (gIfbAgdcState == 1 || gIfbAgdcState == 2) return 0;
     if (!gIfbNubFB) return ENXIO;
     gIfbAgdcState = 2;
@@ -1244,6 +1289,110 @@ static int ifb_agdc_sysctl SYSCTL_HANDLER_ARGS
     if (kernel_thread_start(ifb_agdc_up, nullptr, &t) != KERN_SUCCESS) { gIfbAgdcState = -5; return ENOMEM; }
     thread_deallocate(t);
     return 0;
+}
+
+static int ifb_agdc_sysctl SYSCTL_HANDLER_ARGS
+{
+    int v = gIfbAgdcState, err = sysctl_handle_int(oidp, &v, 0, req);
+    if (err || !req->newptr) return err;
+    if (v != 1) return EINVAL;
+    return ifb_agdc_start();
+}
+
+// NVRMFB's head 0 (an NVRMNVDAFramebuffer published with IOFBDependentIndex 0), retained, or null
+static IOService *ifb_nvrm_head0(void)
+{
+    IOService *found = nullptr;
+    OSDictionary *m = IOService::serviceMatching("NVRMNVDAFramebuffer");
+    OSIterator *it = m ? IOService::getMatchingServices(m) : nullptr;
+    OSSafeReleaseNULL(m);
+    if (!it) return nullptr;
+    while (OSObject *o = it->getNextObject()) {
+        IOService *f = OSDynamicCast(IOService, o);
+        OSNumber *n = f ? OSDynamicCast(OSNumber, f->getProperty("IOFBDependentIndex")) : nullptr;
+        if (n && n->unsigned32BitValue() == 0) { f->retain(); found = f; break; }
+    }
+    it->release();
+    return found;
+}
+
+// how many NVRMFB heads sit at IOFBDependentIndex 0, 1, ... without a gap (NVAccel registers them in that
+// order and the panel after them)
+static unsigned ifb_nvrm_heads(void)
+{
+    unsigned mask = 0, n = 0;
+    OSDictionary *m = IOService::serviceMatching("NVRMNVDAFramebuffer");
+    OSIterator *it = m ? IOService::getMatchingServices(m) : nullptr;
+    OSSafeReleaseNULL(m);
+    if (it) {
+        while (OSObject *o = it->getNextObject()) {
+            IOService *f = OSDynamicCast(IOService, o);
+            OSNumber *i = f ? OSDynamicCast(OSNumber, f->getProperty("IOFBDependentIndex")) : nullptr;
+            if (i && i->unsigned32BitValue() < 4) mask |= 1u << i->unsigned32BitValue();
+        }
+        it->release();
+    }
+    while (n < 4 && (mask >> n) & 1) n++;
+    return n;
+}
+
+// NVAccel's debug.* knobs, from here. The walk does what `sysctl` does for a name: the debug node's children,
+// through the kernel's sysctlbyname (kernel buffers, its own locking and checks; NVRM imports it too). A first
+// version walked sysctl__debug_children itself and never found NVAccel's knobs on Tahoe.
+extern "C" int sysctlbyname(const char *name, void *oldp, size_t *oldlenp, void *newp, size_t newlen);
+// reads debug.<name> into *v and, with set, writes v first; the errno of sysctlbyname (ENOENT: no such knob)
+static int ifb_knob_rw(const char *name, int *v, bool set)
+{
+    char full[64];
+    snprintf(full, sizeof full, "debug.%s", name);
+    int now = 0, want = *v;
+    size_t len = sizeof now;
+    int err = sysctlbyname(full, &now, &len, set ? &want : nullptr, set ? sizeof want : 0);
+    *v = now;
+    return err;
+}
+
+// the pipe and AGDC setup a script did by hand, now at boot and before WindowServer opens its framebuffers
+// (measured at boot: the panel publishes about 17 s before), so no WindowServer restart is needed
+static void ifb_autopipe(void *, wait_result_t)
+{
+    int pub = 0, igpu = 1, fb = 3, nv = 0, nvst = -9, e0 = -2, e1 = -2, e2 = -2, e3 = -2, i;
+    for (i = 0; i < 100; i++) {   // NVAccel counts the panel as published: bit 4
+        if ((e0 = ifb_knob_rw("nvaccel_heads_published", &pub, false)) == 0 && (pub & 0x10)) break;
+        IOSleep(200);
+    }
+    if (pub & 0x10) {
+        e1 = ifb_knob_rw("nvaccel_igpu", &igpu, true);
+        e2 = ifb_knob_rw("nvaccelfb", &fb, true);
+        // NVRM's auto-go starts NullMoth's AGDC for head 0 at boot, and WindowServer sends its link and plane questions
+        // (0x2001, K5) there: with an AGDC of ours beside it the panel was never configured and showed only the cursor
+        // and NullMoth's cannot be terminated once anything opened it ("terminate -> 0"). NVRMAGDC with
+        // this change lists the panel after the NVIDIA heads, so it is the only AGDC. nullmoth-intelfb-ownagdc=1 brings
+        // back ours (and nullmoth-intelfb-agdcsolo=1 with it tries to terminate NullMoth's first).
+        if (ifb_knob("nullmoth-intelfb-ownagdc", 0)) {
+            if (ifb_knob("nullmoth-intelfb-agdcsolo", 1)) {
+                e3 = ifb_knob_rw("nvrmfb_agdc", &nv, true);
+                for (int j = 0; j < 30; j++) {   // 2 = terminated, 0 = never up
+                    if (ifb_knob_rw("nvrmfb_agdc", &nvst, false) == 0 && nvst != 1) break;
+                    IOSleep(100);
+                }
+            }
+            ifb_agdc_start();
+            for (i = 0; i < 30 && gIfbAgdcState == 2; i++) IOSleep(100);
+        }
+    }
+    // judged by the two writes: debug.nvaccel_heads_piped has no CTLFLAG_KERN, so the kernel cannot read it (it read 0
+    // while it was 0x11); NVAccel logs "index 4 -> pipe N" itself
+    ifb_trail(!e1 && !e2 ? "autopipe" : "autopipe-fail");
+    IFBLOG("autopipe: published %#x (err %d) after %d tries, igpu was %d (err %d), nvaccelfb was %d (err %d), "
+           "NullMoth AGDC was %d now %d (err %d), ours %d", pub, e0, i, igpu, e1, fb, e2, nv, nvst, e3, gIfbAgdcState);
+    thread_terminate(current_thread());
+}
+static void ifb_autopipe_start(void)
+{
+    thread_t t = nullptr;
+    if (kernel_thread_start(ifb_autopipe, nullptr, &t) == KERN_SUCCESS) thread_deallocate(t);
+    else ifb_trail("autopipe-nothread");
 }
 SYSCTL_PROC(_debug, OID_AUTO, nmintelfb_agdc, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED | CTLFLAG_KERN, nullptr, 0,
             ifb_agdc_sysctl, "I", "1 = list the Intel panel in an AppleGraphicsDeviceControl on the NVIDIA GPU (1 up, 2 starting, < 0 failed)");
