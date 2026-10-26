@@ -220,6 +220,22 @@ static void nvdaAgdcScan(IOService *pci)
         hole++; SCANLOG("slot %u (id %#llx) sits beyond a hole at slot %u: left out", i, (unsigned long long)tab[i]->getRegistryEntryID(), n);
         tab[i]->release(); tab[i] = nullptr;
     }
+    // the laptop's Intel panel (NMIntelFB) in NVRM's group beside NVIDIA heads takes
+    // the slot right after them, which is also its NVAccel pipe and the IOFBDependentIndex it has once open. Without it
+    // WindowServer asked this table, with one framebuffer, about both displays: the panel got no link or plane answers
+    // and showed only the cursor (an AGDC of NMIntelFB's own beside this one could not be the only one asked).
+    if (n < kAgdcMaxFB) {
+        OSDictionary *pm = IOService::serviceMatching("NMIntelFB");
+        IOService *f = pm ? IOService::copyMatchingService(pm) : nullptr;
+        OSSafeReleaseNULL(pm);
+        if (f) {
+            IOService *p = f->getProvider(); int hops = 0;
+            while (p && !p->metaCast("IOPCIDevice") && hops++ < 8) p = p->getProvider();
+            OSNumber *dep = OSDynamicCast(OSNumber, f->getProperty("IOFBDependentID"));
+            if (p == pci && dep && dep->unsigned64BitValue() == 0x4E56524D00000001ull) tab[n++] = f;   // keeps the retain
+            else { SCANLOG("NMIntelFB id %#llx is not in NVRM's group on this GPU: left out", f->getRegistryEntryID()); f->release(); }
+        }
+    }
     for (unsigned i = 0; i < n; i++) gAgdcFB[i] = tab[i];
     gAgdcNFB = n;
     int w = snprintf(gAgdcFBMap, sizeof gAgdcFBMap, "n=%u", n);
