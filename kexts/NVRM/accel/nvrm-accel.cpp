@@ -1249,6 +1249,14 @@ static SInt64 gCntIopOkHead[kNvMaxFB];
 // leaves the IOSurface's system pages alone (its pending mark stays, so a CPU reader still pages it off).
 static int    gIopMemcpy = 0, gIopDirect = 0;
 static SInt64 gCntIopDirect, gCntIopCopyUs;
+// those system pages are as old as the surface's last page-off, often seconds. nvAccelSurfCopyReady reads them
+// as they are when its hold runs out (one buffer cycle old on the usual path), and its count of held frames was only
+// reset by frames it copied itself, so with the direct copy every fifth decline, however far apart, put an old picture
+// on the panel: a window white or half drawn for a frame (on the Acer ANV15-52). The count now restarts
+// on every direct frame, a hold with the direct copy on lasts longer, and a VRAM copy the plugin never wrote is not used.
+static unsigned gIopCopyHeld[kNvMaxFB];
+static const unsigned kIopDirectHoldMax = 30;
+static SInt64 gCntIopDirectDeclined, gCntIopDirectUnwritten, gCntIopCopyReleased, gCntIopCopyStaleKept;
 // nmx-accel stage 4a: with debug.nvaccel_iop_direct=2 the copy engine writes the frame straight into the panel's scan-out
 // pages in RAM (NMIntelFB intelfb-0017, debug.nmintelfb_ram=1), so no CPU copy is left. Same layout as NMIntelFB's.
 #define NMINTELFB_RAM_VERSION 1u
@@ -1389,8 +1397,10 @@ IOReturn NVDisplayPipe::performTransaction(IOAccelDisplayPipeTransaction2 *txn)
                 OSAddAtomic64((SInt64)(ns / 1000), &gCntIopCopyUs);
                 OSAddAtomic64(1, &gCntIopDirect); OSAddAtomic64(1, &gCntIopSrcSurf);
                 OSAddAtomic64(1, &gCntIopOk); OSAddAtomic64(1, &gCntIopOkHead[head]);
+                if (head < kNvMaxFB) gIopCopyHeld[head] = 0;
                 return kIOReturnSuccess;
             }
+            OSAddAtomic64(1, &gCntIopDirectDeclined);
         }
         if (!nvAccelSurfCopyReady(s, head)) return kIOReturnSuccess;
         const unsigned fmt = s->getPixelFormat();
@@ -1617,10 +1627,14 @@ SYSCTL_INT(_debug, OID_AUTO, nvaccel_surface_gpu_wait_max_us, CTLFLAG_RD | CTLFL
 static SInt64 gCntIopAsync, gCntIopAsyncRefused, gCntIopAsyncDrop;
 SYSCTL_INT(_debug, OID_AUTO, nvaccel_iop_async, CTLFLAG_RW | CTLFLAG_LOCKED, &gIopAsync, 0, "1 = the swap runs on a thread call and completes through signalTransactionInterrupt (Apple's shape); 0 = the earlier synchronous flip");
 NVACCEL_CNT(nvaccel_iop_async_flips,   gCntIopAsync,        "swaps completed asynchronously");
-SYSCTL_INT(_debug, OID_AUTO, nvaccel_iop_memcpy, CTLFLAG_RW | CTLFLAG_LOCKED, &gIopMemcpy, 0, "nmx-accel: 1 = frames copied to a CPU scanout with memcpy rows, 0 = volatile word loop");
-SYSCTL_INT(_debug, OID_AUTO, nvaccel_iop_direct, CTLFLAG_RW | CTLFLAG_LOCKED, &gIopDirect, 0, "nmx-accel: 1 = copy engine staging -> CPU scanout, skipping the IOSurface's system pages; 2 = copy engine straight into the scanout's RAM pages when the framebuffer offers them");
+SYSCTL_INT(_debug, OID_AUTO, nvaccel_iop_memcpy, CTLFLAG_RW | CTLFLAG_KERN | CTLFLAG_LOCKED, &gIopMemcpy, 0, "nmx-accel: 1 = frames copied to a CPU scanout with memcpy rows, 0 = volatile word loop");
+SYSCTL_INT(_debug, OID_AUTO, nvaccel_iop_direct, CTLFLAG_RW | CTLFLAG_KERN | CTLFLAG_LOCKED, &gIopDirect, 0, "nmx-accel: 1 = copy engine staging -> CPU scanout, skipping the IOSurface's system pages; 2 = copy engine straight into the scanout's RAM pages when the framebuffer offers them");
 NVACCEL_CNT(nvaccel_iop_direct_frames, gCntIopDirect, "nmx-accel: frames put on a CPU scanout straight from the staging buffer");
 NVACCEL_CNT(nvaccel_iop_ram_frames,    gCntIopRam,    "nmx-accel: frames the copy engine wrote straight into the panel's scan-out pages in RAM");
+NVACCEL_CNT(nvaccel_iop_direct_declined,  gCntIopDirectDeclined,  "acer: frames the direct copy left to the usual path (surface current in system memory, lock busy, copy engine refused)");
+NVACCEL_CNT(nvaccel_iop_direct_unwritten, gCntIopDirectUnwritten, "acer: direct copies refused because the plugin never wrote the surface's VRAM copy");
+NVACCEL_CNT(nvaccel_iop_copy_released,    gCntIopCopyReleased,    "acer: held frames read from the system pages without a page-off when the hold ran out");
+NVACCEL_CNT(nvaccel_iop_copy_stale_kept,  gCntIopCopyStaleKept,   "acer: held frames kept past the usual 4 because the direct copy is on (its system pages may be seconds old)");
 SYSCTL_INT(_debug, OID_AUTO, nvaccel_iop_blank_hold, CTLFLAG_RW | CTLFLAG_LOCKED, &gIopBlankHold, 0, "nmx-accel: with the panel flipping RAM buffers, up to this many one-colour frames in a row stay off the panel (0 = show them all)");
 NVACCEL_CNT(nvaccel_iop_blank_held,    gCntIopBlankHeld, "nmx-accel: one-colour frames kept off the panel (the last picture stayed)");
 NVACCEL_CNT(nvaccel_iop_copy_us,       gCntIopCopyUs, "nmx-accel: microseconds spent getting copied frames onto a CPU scanout (copy engine + CPU)");
@@ -1670,6 +1684,8 @@ static void nvaccelInstallSysctl(void)
     sysctl_register_oid(&sysctl__debug_nvaccel_iop_memcpy);     sysctl_register_oid(&sysctl__debug_nvaccel_iop_direct);
     sysctl_register_oid(&sysctl__debug_nvaccel_iop_direct_frames); sysctl_register_oid(&sysctl__debug_nvaccel_iop_copy_us);
     sysctl_register_oid(&sysctl__debug_nvaccel_iop_ram_frames);
+    sysctl_register_oid(&sysctl__debug_nvaccel_iop_direct_declined); sysctl_register_oid(&sysctl__debug_nvaccel_iop_direct_unwritten);
+    sysctl_register_oid(&sysctl__debug_nvaccel_iop_copy_released);   sysctl_register_oid(&sysctl__debug_nvaccel_iop_copy_stale_kept);
     sysctl_register_oid(&sysctl__debug_nvaccel_iop_blank_hold); sysctl_register_oid(&sysctl__debug_nvaccel_iop_blank_held);
     sysctl_register_oid(&sysctl__debug_nvaccel_surface_gpu);    sysctl_register_oid(&sysctl__debug_nvaccel_surface_gpu_on);
     sysctl_register_oid(&sysctl__debug_nvaccel_surface_gpu_marks); sysctl_register_oid(&sysctl__debug_nvaccel_surface_gpu_waits);
@@ -2378,16 +2394,17 @@ static void nvAccelSurfScanoutSync(IOSurface *s)
 // Unlike nvAccelSurfScanoutSync it waits a few ms for the accelerator lock and does not clear the pending mark when the
 // page-off fails. At most 4 frames in a row are held back per head: a surface that never syncs is copied as before
 // rather than freezing the panel.
-static unsigned gIopCopyHeld[kNvMaxFB];
 static bool nvAccelSurfCopyReady(IOSurface *s, unsigned head)
 {
     NVAccel *a = NVAccel::gAccel;
     if (!s || !a) return true;
     const unsigned id = _ZNK9IOSurface12getSurfaceIDEv((void *)s);
     bool ready = !nvSVPend(id, 2);
+    // a frame held past the usual 4 with the direct copy on waits longer for the lock
+    const unsigned tries = (gIopDirect && head < kNvMaxFB && gIopCopyHeld[head] >= 4) ? 32 : 8;
     if (!ready) {
         bool locked = false;
-        for (unsigned i = 0; i < 8 && !(locked = nvFamLock(a, true)); i++) IOSleep(1);
+        for (unsigned i = 0; i < tries && !(locked = nvFamLock(a, true)); i++) IOSleep(1);
         if (locked) {
             void *cache = _ZN22IOGraphicsAccelerator223deviceCacheForIOSurfaceEP9IOSurfacej((void *)a, (void *)s, 0);
             OSObject *ctx = cache ? *(OSObject *volatile *)((unsigned char *)cache + 0x20) : nullptr;
@@ -2403,7 +2420,9 @@ static bool nvAccelSurfCopyReady(IOSurface *s, unsigned head)
     }
     if (head >= kNvMaxFB) return true;
     if (ready) { gIopCopyHeld[head] = 0; return true; }
-    if (++gIopCopyHeld[head] > 4) { gIopCopyHeld[head] = 0; return true; }
+    const unsigned held = ++gIopCopyHeld[head];
+    if (held > 4 && gIopDirect && held <= kIopDirectHoldMax) OSAddAtomic64(1, &gCntIopCopyStaleKept);
+    else if (held > 4) { gIopCopyHeld[head] = 0; OSAddAtomic64(1, &gCntIopCopyReleased); return true; }
     OSAddAtomic64(1, &gCntIopCopySkip);
     return false;
 }
@@ -2463,14 +2482,17 @@ static bool nvAccelIopDirect(NVAccel *a, IOService *fb, unsigned head, IOSurface
     NVVidMemory *vm = res ? nvres_vidmem(res) : nullptr;
     volatile unsigned short *valid = res ? *(unsigned short *volatile *)((volatile unsigned char *)res + 0x30) : nullptr;
     IOLock *lk = nvSVStageLock();
-    if (vm && vm->fRmHandle && !vm->fScanout && vm->fBytes >= len && valid && !(valid[0] & 1u) && ram) {
+    // as the usual path, a VRAM copy the plugin never wrote is not the picture; the system pages are
+    const bool wrote = nvAccelResPluginWrote(res);
+    if (vm && valid && !(valid[0] & 1u) && !wrote) OSAddAtomic64(1, &gCntIopDirectUnwritten);
+    if (wrote && vm && vm->fRmHandle && !vm->fScanout && vm->fBytes >= len && valid && !(valid[0] & 1u) && ram) {
         const unsigned st = nvIopPageoff(hh.kapiDevice, vm->fRmHandle, rp.pages, pages, len);
         if (st == 0) {
             if (!nvIopVaried((const volatile unsigned char *)rp.kva, W, H, P)) { OSAddAtomic64(1, &gCntIopBlank); blank = true; }
             OSAddAtomic64(1, &gCntIopRam);
             done = true;
         } else if (st == 0x65u) ALOG("iop direct: CE copy TIMED OUT into the panel's RAM pages");
-    } else if (vm && vm->fRmHandle && !vm->fScanout && vm->fBytes >= len && valid && !(valid[0] & 1u) && lk) {
+    } else if (wrote && vm && vm->fRmHandle && !vm->fScanout && vm->fBytes >= len && valid && !(valid[0] & 1u) && lk) {
         IOLockLock(lk);
         IOBufferMemoryDescriptor *sb = nvSVStage(len);
         IOByteCount sl = 0;
