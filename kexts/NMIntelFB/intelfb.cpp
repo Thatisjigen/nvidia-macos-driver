@@ -303,6 +303,37 @@ public:
                  rd(0xC8250), rd(0xC8254), rd(0xC8258), rd(0xC8350), rd(0xC8354), rd(0xC8358),
                  (unsigned long long)*((volatile uint64_t *)(fRegs + 0x800000) + (fSurf >> 12)));
     }
+    // the Type-C ports, power wells, PLLs and DBUF, as the firmware left them. Reads only, no
+    // MMIO write; logged once at start and read on demand through sysctl debug.nmintelfb_tcdiag. Offsets: Linux 7.3 i915
+    // (MIT) for display 13 (ADL-P/RPL-P): TC1-TC4 = ports D-G, modular FIA (FIA1 holds TC1-2, FIA2 TC3-4). A port in
+    // TC-cold reads 0xffffffff in TCSS/FIA.
+    void tcDiagInto(char *b, size_t n) {
+        if (!fRegs) { snprintf(b, n, "no registers\n"); return; }
+        size_t o = 0;
+        auto put = [&](const char *fmt, auto... a) { if (o < n) { int w = snprintf(b + o, n - o, fmt, a...); if (w > 0) o += (size_t)w; } };
+        put("power dc %08x pw1 %08x pw2 %08x aux1 %08x aux2 %08x ddi1 %08x ddi2 %08x fuse %08x\n", rd(0x45504), rd(0x45400),
+            rd(0x45404), rd(0x45440), rd(0x45444), rd(0x45450), rd(0x45454), rd(0x42000));
+        put("clock cdclk %08x dssm %08x dpclka %08x dpll0 %08x dpll1 %08x tbtpll %08x\n", rd(0x46000), rd(0x51004),
+            rd(0x164280), rd(0x46010), rd(0x46014), rd(0x46020));
+        put("dbuf mbus %08x s0 %08x s1 %08x s2 %08x s3 %08x abox %08x/%08x/%08x\n", rd(0x4438C), rd(0x45008), rd(0x44FE8),
+            rd(0x44300), rd(0x44304), rd(0x45038), rd(0x45048), rd(0x4504C));
+        put("hpd isr %08x imr %08x ier %08x tcctl %08x sdeisr %08x\n", rd(0x44470), rd(0x44474), rd(0x4447C), rd(0x44038),
+            rd(0xC4000));
+        for (uint32_t p = 0; p < 4; p++)
+            put("pipe%c trans %08x func %08x clksel %08x plane %08x buf1 %08x buf2 %08x cur %08x\n", 'A' + p,
+                rd(0x70008 + p * 0x1000), rd(0x60400 + p * 0x1000), rd(0x46140 + p * 4), rd(0x70180 + p * 0x1000),
+                rd(0x7027C + p * 0x1000), rd(0x7037C + p * 0x1000), rd(0x7017C + p * 0x1000));
+        for (uint32_t d = 0; d < 2; d++)
+            put("ddi%c buf %08x aux %08x\n", 'A' + d, rd(0x64000 + d * 0x100), rd(0x64010 + d * 0x100));
+        for (uint32_t t = 0; t < 4; t++)
+            put("tc%u status %08x buf %08x aux %08x clksel %08x pll %08x\n", t + 1, rd(0x161500 + t * 4),
+                rd(0x64300 + t * 0x100), rd(0x64310 + t * 0x100), rd(0x4610C + t * 4), rd(0x46038 + t * 8));
+        for (uint32_t f = 0; f < 2; f++) {
+            const uint32_t base = f ? 0x16E000 : 0x163000;
+            put("fia%u pa1 %08x pms %08x csss %08x dpsp %08x mle1 %08x\n", f + 1, rd(base + 0x880), rd(base + 0x890),
+                rd(base + 0x894), rd(base + 0x8A0), rd(base + 0x8C0));
+        }
+    }
 private:
     void kapiInit();
     void kapiFree();
@@ -862,6 +893,15 @@ bool NMIntelFB::startReal(IOService *provider)
         if (gIfbDepNvrm && ifb_knob("nullmoth-intelfb-autopipe", 1)) ifb_autopipe_start();
     }
     ifb_ram_register(this);
+    // the Type-C state the firmware left, before anything else runs on the display engine
+    if (char *d = (char *)IOMallocZero(4096)) {
+        tcDiagInto(d, 4096);
+        for (char *line = d, *end; *line; line = end + 1) {
+            if (!(end = strchr(line, '\n'))) { IFBLOG("tcdiag %s", line); break; }
+            *end = 0; IFBLOG("tcdiag %s", line);
+        }
+        IOFree(d, 4096);
+    }
     IFBLOG("built-in panel published (%ux%u)", fWidth, fHeight);
     return true;
 }
@@ -1618,6 +1658,18 @@ static int ifb_regs_sysctl SYSCTL_HANDLER_ARGS
 }
 SYSCTL_PROC(_debug, OID_AUTO, nmintelfb_regs, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED, nullptr, 0,
             ifb_regs_sysctl, "A", "intelfb-0018: pipe, plane, panel power, backlight PWM and the first scan-out PTE");
+// the Type-C/DBUF read-only dump
+static int ifb_tcdiag_sysctl SYSCTL_HANDLER_ARGS
+{
+    char *b = (char *)IOMallocZero(4096);
+    if (!b) return ENOMEM;
+    if (NMIntelFB *fb = gIfbRamFB) fb->tcDiagInto(b, 4096); else strlcpy(b, "no panel\n", 4096);
+    int err = sysctl_handle_string(oidp, b, 4096, req);
+    IOFree(b, 4096);
+    return err;
+}
+SYSCTL_PROC(_debug, OID_AUTO, nmintelfb_tcdiag, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED, nullptr, 0,
+            ifb_tcdiag_sysctl, "A", "Type-C ports, FIA, power wells, PLLs and DBUF (reads only)");
 SYSCTL_PROC(_debug, OID_AUTO, nmintelfb_ram, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED | CTLFLAG_KERN, nullptr, 0,
             ifb_ram_sysctl, "I", "1 = the panel scans out of RAM that NVAccel's copy engine writes, 2 = two such buffers flipped at vblank (0 off, < 0 failed)");
 SYSCTL_QUAD(_debug, OID_AUTO, nmintelfb_flips, CTLFLAG_RD | CTLFLAG_LOCKED, (SInt64 *)&gIfbFlips, "intelfb-0019: flips to the buffer NVAccel just wrote");
@@ -1626,7 +1678,7 @@ SYSCTL_QUAD(_debug, OID_AUTO, nmintelfb_flip_wait_us, CTLFLAG_RD | CTLFLAG_LOCKE
 SYSCTL_QUAD(_debug, OID_AUTO, nmintelfb_flip_late, CTLFLAG_RD | CTLFLAG_LOCKED, (SInt64 *)&gIfbFlipLate, "waits given up after 20 ms (that frame may tear)");
 static void ifb_ram_register(NMIntelFB *fb)
 {
-    sysctl_oid *o[] = { &sysctl__debug_nmintelfb_ram, &sysctl__debug_nmintelfb_regs, &sysctl__debug_nmintelfb_flips,
+    sysctl_oid *o[] = { &sysctl__debug_nmintelfb_ram, &sysctl__debug_nmintelfb_regs, &sysctl__debug_nmintelfb_tcdiag, &sysctl__debug_nmintelfb_flips,
                         &sysctl__debug_nmintelfb_flip_waits, &sysctl__debug_nmintelfb_flip_wait_us, &sysctl__debug_nmintelfb_flip_late };
     if (fb && !gIfbRamFB) { gIfbRamFB = fb; for (sysctl_oid *x : o) sysctl_register_oid(x); }
     else if (!fb && gIfbRamFB) { for (sysctl_oid *x : o) sysctl_unregister_oid(x); gIfbRamFB = nullptr; }
