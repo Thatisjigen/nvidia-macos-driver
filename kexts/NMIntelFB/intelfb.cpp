@@ -229,6 +229,15 @@ static bool gIfbDepNvrm = false;   // the panel sits in NVRM's group (dep=2, or 
 static volatile bool gTc1Clone = false;   // pipe B (USB-C) scans the panel's surface; flips follow it
 static int gTc1State = 0, gTc1Rate = 270000;   // debug.nmintelfb_tc1 and debug.nmintelfb_tc1_rate
 static IOLock *gTc1Lock;                       // one change at a time (sysctl, stop, sleep)
+// the USB-C screen as a framebuffer of its own (head 5 of NVAccel, after the panel's head 4)
+static volatile bool gIfbUsbcExpected = false;   // the claim published the USB-C nub: the autopipe waits for head 5
+static volatile bool gTc1ForUsbc = false;        // pipe B belongs to the USB-C framebuffer, not to the sysctl clone
+static IOService *volatile gIfbUsbcFB = nullptr; // the USB-C framebuffer once started (the panel's own AGDC lists it)
+static uint32_t gIfbUsbcK5[NVK5_TIMING_WORDS];   // its timing, for that AGDC's K5 answers
+static volatile bool gIfbUsbcReady = false;      // published with its VRAM device and properties: pipes may be registered
+static volatile bool gIfbPanelDone = false;      // the panel's start() returned (taken or declined)
+static volatile bool gIfbPanelOpen = false;      // IOGraphics opened the panel (slot 0 of the own group)
+static IOLock *volatile gIfbVramLock = nullptr;  // the VRAM table gIfbVram is shared by both instances
 static unsigned ifb_nvrm_heads(void);
 
 class NMIntelFB : public IOFramebuffer {
@@ -310,8 +319,11 @@ public:
     // MMIO write; logged once at start and read on demand through sysctl debug.nmintelfb_tcdiag. Offsets: Linux 7.3 i915
     // (MIT) for display 13 (ADL-P/RPL-P): TC1-TC4 = ports D-G, modular FIA (FIA1 holds TC1-2, FIA2 TC3-4). A port in
     // TC-cold reads 0xffffffff in TCSS/FIA.
-    // light the USB-C port as a second pipe (sysctl debug.nmintelfb_tc1), defined below
-    int tc1Set(int mode);
+    // light the USB-C port as a second pipe (sysctl debug.nmintelfb_tc1), defined below.
+    // with surf set, pipe B scans that GGTT offset (the USB-C framebuffer's own memory) instead of the panel's
+    int tc1Set(int mode, uint32_t surf = ~0u, uint32_t stride = 0);
+    bool fUsbc = false;   // this instance is the USB-C screen (nub nm-intel-usbc), not the panel
+    bool usbcStart(IOService *provider);
     void tcDiagInto(char *b, size_t n) {
         if (!fRegs) { snprintf(b, n, "no registers\n"); return; }
         size_t o = 0;
@@ -415,14 +427,24 @@ public:
     // NULL (the RTX-2..7 freezes). NVAccel took its head number from the same property at publish time, which is over by
     // now, so the panel becomes index 0 of its own controller here.
     IOReturn open() override {
+        // the USB-C screen takes the slot after the panel (NVIDIA heads, panel, USB-C)
+        if (fUsbc) {
+            // the slot before it should be filled first: IOGraphics walks fFbs[] from 0 to the first NULL
+            for (int i = 0; i < 40 && !gIfbPanelOpen; i++) IOSleep(50);
+            setProperty("IOFBDependentIndex", fOwnGroup ? 1ull : (unsigned long long)ifb_nvrm_heads() + 1, 32);
+            ifb_trail(gIfbPanelOpen ? "usbc-open" : "usbc-open-first");
+            return IOFramebuffer::open();
+        }
         if (fOwnGroup) { setProperty("IOFBDependentIndex", 0ull, 32); IFB_ONCE("open-idx0"); }
         // in NVRM's group the same walk stopped at the empty slot after NVRMFB's heads, so the panel at 4 was
         // never in it and WindowServer found no pipe for it (pipe 1 active, "Unable to find display pipe").
         // It takes the slot right after the NVIDIA heads, which is also the pipe number NVAccel gave it.
         else if (gIfbDepNvrm) { setProperty("IOFBDependentIndex", (unsigned long long)ifb_nvrm_heads(), 32); IFB_ONCE("open-idxn"); }
-        return IOFramebuffer::open();
+        const IOReturn r = IOFramebuffer::open();
+        if (r == kIOReturnSuccess) gIfbPanelOpen = true;
+        return r;
     }
-    bool isConsoleDevice() override { IFB_ONCE("con"); return true; }
+    bool isConsoleDevice() override { IFB_ONCE("con"); return !fUsbc; }
     IODeviceMemory *getApertureRange(IOPixelAperture aperture) override;
     const char *getPixelFormats() override { return IO32BitDirectPixels "\0"; }
     IOItemCount getDisplayModeCount() override { IFB_ONCE("dmc"); return 1; }
@@ -477,7 +499,17 @@ public:
         ifb_trail(ordinal ? "sp1" : "sp0");
         { char r[200]; regsInto(r, sizeof r); IFBLOG("power %lu: %s", ordinal, r); }
         for (unsigned b = 0; ordinal && b < (unsigned)fRamMode; b++) ramPtes(b, true);   // intelfb-0017: in case the GGTT was rewritten while asleep
-        if (!ordinal && gTc1Lock && gTc1State == 1) { IOLockLock(gTc1Lock); tc1Set(0); IOLockUnlock(gTc1Lock); }
+        if (!fUsbc && !ordinal && gTc1Lock && gTc1State == 1 && !gTc1ForUsbc) { IOLockLock(gTc1Lock); tc1Set(0); IOLockUnlock(gTc1Lock); }
+        // the USB-C screen keeps its link through display sleep (no retraining in this callout every time);
+        // after a system sleep pipe B is off: the screen's GGTT entries go back and the port is lit again
+        if (fUsbc && ordinal && gTc1Lock && gTc1ForUsbc && fRegs && !(rd(TRANSCONF(1)) & kEnable)) {
+            IOLockLock(gTc1Lock);
+            if (fRam[0]) ramPtes(0, true);
+            tc1Set(-1);   // forget what the last lighting turned on: the hardware lost it
+            const int r = tc1Set(1, fSurf, fRowBytes);
+            IOLockUnlock(gTc1Lock);
+            IFBLOG("usbc: lit again after power on: %d", r);
+        }
         handleEvent(ordinal ? kIOFBNotifyDidPowerOn : kIOFBNotifyWillPowerOff);
         ifb_trail("sp-done");
         return kIOPMAckImplied;
@@ -673,6 +705,12 @@ IOService *NMIntelFB::probe(IOService *provider, SInt32 *score)
         fVer = displayVersion(gIfbPCI->configRead16(kIOPCIConfigDeviceID));
         return fVer ? IOFramebuffer::probe(provider, score) : nullptr;
     }
+    // the USB-C nub the claim publishes beside the panel's (nullmoth-intelfb-usbc=1)
+    if (provider->getProperty("nm-intel-usbc") && gIfbPCI) {
+        fVer = displayVersion(gIfbPCI->configRead16(kIOPCIConfigDeviceID));
+        fUsbc = fVer != 0;
+        return fUsbc ? IOFramebuffer::probe(provider, score) : nullptr;
+    }
     IOPCIDevice *pci = OSDynamicCast(IOPCIDevice, provider);
     if (!pci) return nullptr;
     return ifb_pci_ok(pci, &fVer) ? IOFramebuffer::probe(provider, score) : nullptr;
@@ -779,6 +817,7 @@ bool NMIntelFB::start(IOService *provider)
     IFBLOG("virtual panel published (1920x1080 at phys 0x%llx)", (unsigned long long)fApertureBase);
     return true;
 #endif
+    if (fUsbc) return usbcStart(provider);
     gIfbTrail[0] = 0;
     ifb_nv_set("nullmoth-intelfb-attaching", "1");
     ifb_trail("start");
@@ -800,6 +839,7 @@ bool NMIntelFB::start(IOService *provider)
         ifb_trail("go");
     }
     bool ok = startReal(provider);
+    gIfbPanelDone = true;   // the USB-C screen waits for this
     ifb_trail(ok ? "ok" : "declined");
     // WindowServer's wait may end only when the panel is ready for it. With the autopipe that is after
     // the autopipe (ifb_autopipe), which must finish before WindowServer opens its framebuffers: published right here,
@@ -817,6 +857,127 @@ bool NMIntelFB::start(IOService *provider)
         else ifb_nv_set("nullmoth-intelfb-attaching", nullptr);
     } else ifb_nv_set("nullmoth-intelfb-attaching", nullptr);
     return ok;
+}
+
+// The USB-C screen: 1920x1080 at 60 Hz in RAM of its own, mapped into the GGTT at 32 MiB (past
+// the panel's two buffers at 0 and 8 MiB), scanned by pipe B through TC1 (tc1Set with that surface) and published in
+// NVRM's group as head 5 of NVAccel: IOFBDependentIndex 5 at publish, the slot after the panel once open. WindowServer
+// then composites it on the NVIDIA card and NVAccel copies its frames into fSurfMap, as for the panel. Without a monitor
+// on the HDMI at boot the panel is head 0 of a group of its own: the USB-C screen then joins that group as head 1
+// (IOFBDependentIndex 1, a slot no NVIDIA head takes then) and the panel's own AGDC lists both.
+static void ifb_usbc_guard(void *, wait_result_t)
+{
+    IOSleep(120000);   // two minutes alive with the USB-C screen: the next boot may start it again
+    ifb_nv_set("nullmoth-intelfb-usbc-attaching", nullptr);
+    ifb_trail("usbc-alive");
+    thread_terminate(current_thread());
+}
+
+bool NMIntelFB::usbcStart(IOService *provider)
+{
+    bool ptes = false, lit = false;
+    auto decline = [&](const char *why) {
+        IFBLOG("usbc: %s - no USB-C screen this boot", why);
+        ifb_trail("usbc-declined");
+        gIfbUsbcExpected = false;
+        if (fVblRunning) { fStopping = true; fVblOn = false; thread_wakeup((event_t)&fVblNext); while (fVblRunning) IOSleep(5); }
+        if (lit && gTc1Lock) { IOLockLock(gTc1Lock); tc1Set(0); gTc1ForUsbc = false; IOLockUnlock(gTc1Lock); }
+        if (ptes) ramPtes(0, false);
+        if (fRam[0]) { fRam[0]->complete(); OSSafeReleaseNULL(fRam[0]); }
+        if (fRamPages[0]) IODelete(fRamPages[0], unsigned long long, fRamCount);
+        if (fOldPte[0]) IODelete(fOldPte[0], unsigned long long, fRamCount);
+        fRamPages[0] = fOldPte[0] = nullptr;
+        OSSafeReleaseNULL(fSurfMap); OSSafeReleaseNULL(fMMIO); fRegs = nullptr;
+        ifb_nv_set("nullmoth-intelfb-usbc-attaching", nullptr);
+        return false;
+    };
+    ifb_trail("usbc-start");
+    for (int i = 0; i < 240 && !gIfbPanelDone; i++) IOSleep(500);   // the panel first: its delay, its group, its sysctls
+    NMIntelFB *panel = gIfbRamFB;
+    if (!panel || !gTc1Lock) return decline("the panel did not come up");
+    // a group with the panel in it: NVRM's (after the NVIDIA heads) or its own with the panel at slot 0; alone at
+    // index 1 of an empty group fFbs[0] would be NULL (the RTX-1..7 freezes)
+    if (!gIfbDepNvrm && !(panel->fOwnGroup && ifb_knob("nullmoth-intelfb-head", 0) != 4))
+        return decline("the panel is in no group (nullmoth-intelfb-dep=0) or not at slot 0 of its own");
+    if (panel->fSurf >= 0x400000u) return decline("the panel's surface is not near GGTT 0: 32 MiB may not be free");
+    ifb_nv_set("nullmoth-intelfb-usbc-attaching", "1");
+    fPCI = gIfbPCI;
+    fMMIO = fPCI->mapDeviceMemoryWithRegister(kIOPCIConfigBaseAddress0);
+    IODeviceMemory *ap = fPCI->getDeviceMemoryWithRegister(kIOPCIConfigBaseAddress2);
+    if (!fMMIO || !ap) return decline("BAR0 or BAR2 is not mapped");
+    fRegs = (volatile uint8_t *)fMMIO->getVirtualAddress();
+    fApertureBase = ap->getPhysicalAddress(); fApertureLen = ap->getLength();
+    // CEA-861 1920x1080@60 (VIC 16), the mode tc1Set programs
+    fPipe = 1; fWidth = 1920; fHeight = 1080; fRowBytes = 7680;
+    fHT = 2200; fVT = 1125; fHSS = 2008; fHSE = 2052; fVSS = 1084; fVSE = 1089;
+    fPclk = 148500000ull; fRefresh16 = 60u << 16; fFrameNs = 16666667ull;
+    const unsigned long long len = (unsigned long long)fRowBytes * fHeight;
+    fRamCount = (unsigned)((len + 4095) >> 12);
+    fRamGgtt[0] = 0x2000000u;
+    if (fApertureLen < fRamGgtt[0] + len || fMMIO->getLength() < 0x800000ull + ((fRamGgtt[0] >> 12) + (unsigned long long)fRamCount) * 8)
+        return decline("the GGTT range at 32 MiB is out of reach");
+    // the buffer, as ramMap allocates the panel's (contiguous when it can be, so the copy engine makes one run)
+    IOBufferMemoryDescriptor *m = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task, kIODirectionInOut | kIOMemoryPhysicallyContiguous,
+                                                                                (vm_size_t)fRamCount * 4096, 0x7FFFFFF000ull);
+    if (!m) m = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task, kIODirectionInOut, (vm_size_t)fRamCount * 4096, 0x7FFFFFF000ull);
+    if (!m) return decline("no memory for the screen");
+    if (m->prepare() != kIOReturnSuccess) { m->release(); return decline("the screen's memory would not wire"); }
+    fRam[0] = m;
+    fRamPages[0] = IONew(unsigned long long, fRamCount); fOldPte[0] = IONew(unsigned long long, fRamCount);
+    if (!fRamPages[0] || !fOldPte[0]) return decline("no memory for the page lists");
+    for (unsigned i = 0; i < fRamCount; i++) {
+        IOByteCount sl = 0;
+        fRamPages[0][i] = m->getPhysicalSegment((IOByteCount)i * 4096, &sl, kIOMemoryMapperNone);
+        if (!fRamPages[0][i] || (fRamPages[0][i] & 0xFFF)) return decline("a page of the screen has no physical address");
+    }
+    bzero(m->getBytesNoCopy(), (size_t)len);   // black; the display does not snoop CPU caches, so flush it out
+    for (size_t o = 0; o < len; o += 64) __asm__ volatile("clflush %0" : : "m"(((volatile const char *)m->getBytesNoCopy())[o]));
+    __asm__ volatile("mfence" ::: "memory");
+    volatile uint64_t *g = (volatile uint64_t *)(fRegs + 0x800000) + (fRamGgtt[0] >> 12);
+    for (unsigned i = 0; i < fRamCount; i++) fOldPte[0][i] = g[i];
+    ramPtes(0, true); ptes = true;
+    for (unsigned i = 0; i < fRamCount; i++) if (g[i] != (fRamPages[0][i] | 1ull)) return decline("the GGTT entries did not take");
+    fSurf = fRamGgtt[0];
+    if (IODeviceMemory *sm = IODeviceMemory::withRange(fApertureBase + fSurf, (IOPhysicalLength)len)) {
+        fSurfMap = sm->map(kIOMapWriteCombineCache); sm->release();
+    }
+    if (!fSurfMap) return decline("the screen would not map write-combined");
+    ifb_trail("usbc-mem");
+    IOLockLock(gTc1Lock);
+    const int r = tc1Set(1, fSurf, fRowBytes);
+    if (r == 0) gTc1ForUsbc = true;
+    IOLockUnlock(gTc1Lock);
+    if (r < 0) return decline("TC1 did not light (sysctl debug.nmintelfb_tc1_log)");
+    lit = true;
+    ifb_trail("usbc-lit");
+    fOwnGroup = !gIfbDepNvrm;   // the panel's group
+    setProperty("IOFBDependentID", fOwnGroup ? 0x4E4D494E00000001ull : 0x4E56524D00000001ull, 64);
+    setProperty("IOFBDependentIndex", fOwnGroup ? 1ull : 5ull, 32);
+    // all of it before IOFramebuffer::start publishes this framebuffer: NVAccel registers its pipe as soon as the
+    // autopipe sees it, and NVRMAGDC lists it by NMIntelFBUSBC; without the VRAM device the pipe had no scanout
+    // resource (the state the panel had without it)
+    setProperty("NMIntelFBPipe", fPipe, 32);
+    setProperty("NMIntelFBDisplayVersion", fVer, 32);
+    setProperty("NMIntelFBUSBC", kOSBooleanTrue);
+    // the timing NVRMAGDC answers WindowServer's K5 questions with for this slot (as the panel publishes its own)
+    const uint32_t k5[NVK5_TIMING_WORDS] = { NVK5_TIMING_TAG, (uint32_t)fPclk, fWidth, fHSS, fHSE, fHT, fHeight, fVSS, fVSE, fVT,
+                                             60000u, 1, 1 };
+    if (OSData *d = OSData::withBytes(k5, sizeof k5)) { setProperty("NVRMTiming", d); d->release(); }
+    memcpy(gIfbUsbcK5, k5, sizeof k5);
+    kapiInit();   // its own VRAM block stands for its scanout (intelfb-0016), as the panel's does
+    fVblAlways = ifb_knob("nullmoth-intelfb-vbl", 1) != 0;
+    armVbl();
+    if (!IOFramebuffer::start(provider)) return decline("IOFramebuffer::start failed");
+    gIfbUsbcFB = this;
+    if (ifb_knob("nullmoth-intelfb-pm", 1)) registerPowerDriver(this, kPowerStates, 2);
+    gIfbUsbcReady = true;
+    thread_t t = nullptr;
+    if (kernel_thread_start(ifb_usbc_guard, nullptr, &t) == KERN_SUCCESS) thread_deallocate(t);
+    else ifb_nv_set("nullmoth-intelfb-usbc-attaching", nullptr);
+    ifb_trail("usbc-up");
+    IFBLOG("usbc: USB-C screen published (1920x1080@60, pipe B, GGTT 0x%x, %s)", fSurf,
+           fOwnGroup ? "head 1 of the panel's own group" : "head 5 in NVRM's group");
+    return true;
 }
 
 bool NMIntelFB::startReal(IOService *provider)
@@ -923,7 +1084,12 @@ void NMIntelFB::stop(IOService *provider)
     thread_wakeup((event_t)&fVblNext);
     while (fVblRunning) IOSleep(5);
     if (gIfbNubFB == this) { ifb_agdc_register(false); gIfbNubFB = nullptr; }
-    if (gIfbRamFB == this && gTc1Lock) { IOLockLock(gTc1Lock); tc1Set(0); IOLockUnlock(gTc1Lock); }
+    if (gIfbRamFB == this && gTc1Lock && !gTc1ForUsbc) { IOLockLock(gTc1Lock); tc1Set(0); IOLockUnlock(gTc1Lock); }
+    if (fUsbc) {
+        if (gTc1Lock) { IOLockLock(gTc1Lock); tc1Set(0); gTc1ForUsbc = false; IOLockUnlock(gTc1Lock); }
+        if (fRam[0] && fRegs) ramPtes(0, false);
+        if (gIfbUsbcFB == this) gIfbUsbcFB = nullptr;
+    }
     if (gIfbRamFB == this) ifb_ram_register(nullptr);
     ramSet(0);
     for (unsigned b = 0; b < 2; b++) {
@@ -939,7 +1105,7 @@ void NMIntelFB::stop(IOService *provider)
 }
 
 // intelfb-0011. The table of VRAM blocks handed to NVAccel (one NMIntelFB per machine).
-struct IfbVram { struct NvKmsKapiMemory *m; void *k; uint64_t n, cookie; };
+struct IfbVram { struct NvKmsKapiMemory *m; void *k; uint64_t n, cookie; const void *owner; };   // owner
 static IfbVram gIfbVram[2048];
 
 static void ifb_kapi_event(const struct NvKmsKapiEvent *) {}
@@ -950,6 +1116,11 @@ void NMIntelFB::kapiInit()
 {
     if (!ifb_knob("nullmoth-intelfb-kapi", 1)) { ifb_trail("kapi-off"); return; }
     fVramLock = IOLockAlloc();
+    if (!gIfbVramLock) {   // one lock for the table both instances share
+        IOLock *l = IOLockAlloc();
+        if (l && !OSCompareAndSwapPtr(nullptr, l, (void *volatile *)&gIfbVramLock)) IOLockFree(l);
+    }
+    if (!gIfbVramLock && fVramLock) { IOLockFree(fVramLock); fVramLock = nullptr; }   // no table lock: no VRAM from this instance
     OSDictionary *m = IOService::serviceMatching("NVRMDisplay");
     IOService *nub = m ? IOService::waitForMatchingService(m, 20ull * NSEC_PER_SEC) : nullptr;
     OSSafeReleaseNULL(m);
@@ -983,15 +1154,15 @@ void NMIntelFB::kapiInit()
 void NMIntelFB::kapiFree()
 {
     if (!fKms || !fDev) return;
-    IOLockLock(fVramLock);
+    IOLockLock(gIfbVramLock);
     for (IfbVram &e : gIfbVram) {
-        if (!e.m) continue;
+        if (!e.m || e.owner != this) continue;
         fKms->unmapMemory(fDev, e.m, NVKMS_KAPI_MAPPING_TYPE_KERNEL, e.k);
         fKms->freeMemory(fDev, e.m);
         e = {};
     }
     fKms->freeDevice(fDev); fDev = nullptr; fVramBytes = 0;
-    IOLockUnlock(fVramLock);
+    IOLockUnlock(gIfbVramLock);
 }
 
 // NVRMFB's vramGrant without its NVIDIA-display parts (no NVIDIA scanout or console to keep clear of here)
@@ -1001,11 +1172,11 @@ IOReturn NMIntelFB::vramGrant(NVRMVramRequest *r)
     if (!fKms || !fDev) return kIOReturnNotReady;
     const NvU64 want = (r->size + 0xFFFFull) & ~0xFFFFull;
     if (!want) return kIOReturnBadArgument;
-    IOLockLock(fVramLock);
+    IOLockLock(gIfbVramLock);
     IfbVram *slot = nullptr;
     for (IfbVram &e : gIfbVram) if (!e.m) { slot = &e; break; }
     if (!slot || fVramBytes + want > fVramBudget) {
-        IOLockUnlock(fVramLock);
+        IOLockUnlock(gIfbVramLock);
         IFBLOG("nvAllocVram(%llu): refused (%s, %llu of %llu bytes)", want, slot ? "budget" : "table full", fVramBytes, fVramBudget);
         return kIOReturnNoMemory;
     }
@@ -1026,15 +1197,15 @@ IOReturn NMIntelFB::vramGrant(NVRMVramRequest *r)
     if (!live) {
         if (k) fKms->unmapMemory(fDev, m, NVKMS_KAPI_MAPPING_TYPE_KERNEL, k);
         if (m) fKms->freeMemory(fDev, m);
-        IOLockUnlock(fVramLock);
+        IOLockUnlock(gIfbVramLock);
         IFBLOG("nvAllocVram(%llu): %s", want, !m ? "allocateMemory failed" : !k ? "mapMemory failed" : !p ? "no physical address" : "the mapping is not live");
         return kIOReturnNoMemory;
     }
-    *slot = { m, k, want, ++fVramCookie };
+    *slot = { m, k, want, ++fVramCookie, this };
     fVramBytes += want;
     r->handle = m; r->kva = k; r->phys = p; r->actualSize = want; r->mappedTotal = fVramBytes;
     r->allocationCookie = slot->cookie;
-    IOLockUnlock(fVramLock);
+    IOLockUnlock(gIfbVramLock);
     if (fVramLogged < 16) { fVramLogged++; IFBLOG("nvAllocVram: %llu bytes VRAM, phys 0x%llx (%llu MB in use)", want, p, fVramBytes >> 20); }
     if (fVramLogged == 1) ifb_trail("vram1");
     return kIOReturnSuccess;
@@ -1043,18 +1214,18 @@ IOReturn NMIntelFB::vramGrant(NVRMVramRequest *r)
 IOReturn NMIntelFB::vramRelease(NVRMVramRequest *r)
 {
     if (!fKms || !fDev || !r->handle) return kIOReturnBadArgument;
-    IOLockLock(fVramLock);
+    IOLockLock(gIfbVramLock);
     for (IfbVram &e : gIfbVram) {
-        if (e.m != r->handle || e.cookie != r->allocationCookie) continue;
+        if (e.m != r->handle || e.cookie != r->allocationCookie || e.owner != this) continue;
         fKms->unmapMemory(fDev, e.m, NVKMS_KAPI_MAPPING_TYPE_KERNEL, e.k);
         fKms->freeMemory(fDev, e.m);
         fVramBytes -= e.n;
         e = {};
-        IOLockUnlock(fVramLock);
+        IOLockUnlock(gIfbVramLock);
         r->handle = nullptr; r->kva = nullptr; r->phys = 0; r->actualSize = 0; r->allocationCookie = 0;
         return kIOReturnSuccess;
     }
-    IOLockUnlock(fVramLock);
+    IOLockUnlock(gIfbVramLock);
     return kIOReturnBadArgument;
 }
 
@@ -1095,7 +1266,7 @@ IOReturn NMIntelFB::getAttributeForConnection(IOIndex idx, IOSelect attr, uintpt
     switch (attr) {
     case kConnectionEnable: *value = 1; return kIOReturnSuccess;
     case kConnectionCheckEnable: *value = 1; return kIOReturnSuccess;
-    case kConnectionFlags: *value = kIOConnectionBuiltIn; return kIOReturnSuccess;
+    case kConnectionFlags: *value = fUsbc ? 0 : kIOConnectionBuiltIn; return kIOReturnSuccess;   // external
     // the colour answers NVRMFB gives (RGB, 8 bits per component), which WindowServer asks before compositing
     case kConnectionColorModesSupported: case kConnectionColorMode: *value = 0x00000001; return kIOReturnSuccess;
     case kConnectionColorDepthsSupported: case kConnectionControllerColorDepth: case kConnectionControllerDepthsSupported:
@@ -1237,6 +1408,44 @@ bool NMIntelFBClaim::start(IOService *provider)
     return true;
 }
 
+// nullmoth-intelfb-usbc=1: a second nub beside the panel's (fb-index 5, nm-intel-usbc) when the
+// USB-C port (TC1) is in DP Alt Mode and READY at boot, so an NMIntelFB starts on it as the USB-C screen. A boot that
+// died while that screen started leaves nullmoth-intelfb-usbc-attaching: the next boots skip it until it is deleted.
+static void ifb_usbc_publish(IOService *nub0, IOService *nvrm)
+{
+    if (!ifb_knob("nullmoth-intelfb-usbc", 0)) return;
+    if (ifb_nv_has("nullmoth-intelfb-usbc-attaching")) {
+        ifb_trail("usbc-guard");
+        IFBLOG("usbc: the last start of the USB-C screen never finished - skipped (sudo nvram -d nullmoth-intelfb-usbc-attaching to retry)");
+        return;
+    }
+    uint32_t tcss = ~0u, isr = 0;
+    if (IOMemoryMap *mm = gIfbPCI ? gIfbPCI->mapDeviceMemoryWithRegister(kIOPCIConfigBaseAddress0) : nullptr) {
+        const volatile uint8_t *r = (const volatile uint8_t *)mm->getVirtualAddress();
+        if (mm->getLength() > 0x161504) { tcss = *(const volatile uint32_t *)(r + 0x161500); isr = *(const volatile uint32_t *)(r + 0x44470); }
+        mm->release();
+    }
+    if (tcss == ~0u || (tcss & 5u) != 5u || !(isr & (1u << 16))) {
+        ifb_trail("usbc-none");
+        IFBLOG("usbc: TC1 not in DP Alt Mode at boot (TCSS %08x HPD %08x) - no USB-C screen this boot", tcss, isr);
+        return;
+    }
+    IOService *nub = OSDynamicCast(IOService, OSMetaClass::allocClassWithName("NVRMDisplay"));
+    bool ok = nub && nub->init();
+    if (ok) {
+        static const char *const kCopy[] = {"nvkms-kapi", "gpu-id", "phys-for-va"};
+        for (const char *k : kCopy) if (OSObject *v = nub0->getProperty(k)) nub->setProperty(k, v);
+        nub->setProperty("fb-index", 5ull, 32);
+        nub->setProperty("nm-intel-usbc", kOSBooleanTrue);
+        gIfbUsbcExpected = true;
+        ok = nub->attach(nvrm);
+        if (ok) nub->registerService(); else gIfbUsbcExpected = false;
+    }
+    OSSafeReleaseNULL(nub);
+    ifb_trail(ok ? "usbc-nub" : "usbc-nub-fail");
+    IFBLOG("usbc: USB-C NVRMDisplay nub %s (TCSS %08x)", ok ? "published under NVRM" : "could not be published", tcss);
+}
+
 // NVRM publishes its NVRMDisplay nubs some seconds into the boot; wait for nub 0 and add the Intel panel's beside it
 void NMIntelFBClaim::publishThread(void *, wait_result_t)
 {
@@ -1268,6 +1477,7 @@ void NMIntelFBClaim::publishThread(void *, wait_result_t)
     }
     ifb_trail(ok ? "nub" : nub0 ? "nub-fail" : "nub-no-nvrm");
     IFBLOG("claim: Intel-panel NVRMDisplay nub %s", ok ? "published under NVRM" : nub0 ? "could not be published" : "not published: no NVRMDisplay 0 after 120 s");
+    if (ok) ifb_usbc_publish(nub0, nvrm);
     OSSafeReleaseNULL(nub); OSSafeReleaseNULL(nub0); OSSafeReleaseNULL(nvrm);
     thread_terminate(current_thread());
 }
@@ -1327,6 +1537,14 @@ IOReturn NMIntelFBAGDC::vendor_doDeviceAttribute(unsigned int cmd, unsigned long
             IFB_ONCE("agdc-980-2");
             return kIOReturnSuccess;
         }
+        // in its own group the USB-C screen follows the panel, its NVAccel pipe after the panel's
+        if (!gIfbDepNvrm && gIfbUsbcFB) {
+            c->portMask = (1ull << 1) | (1ull << 2);
+            c->countA = c->countB = c->countC = c->countD = 2;
+            c->maxFramebuffers = 2; c->pciDevice = fPci; c->framebuffer[0] = fFB; c->framebuffer[1] = gIfbUsbcFB;
+            IFB_ONCE("agdc-980-usbc");
+            return kIOReturnSuccess;
+        }
         c->portMask = 1ull << 1;
         c->countA = c->countB = c->countC = c->countD = 1;
         c->maxFramebuffers = 1; c->pciDevice = fPci; c->framebuffer[0] = fFB;
@@ -1345,6 +1563,10 @@ IOReturn NMIntelFBAGDC::vendor_doDeviceAttribute(unsigned int cmd, unsigned long
             if (d) { t0Bytes = d->getLength(); if (t0Bytes == sizeof t0) memcpy(t0, d->getBytesNoCopy(), sizeof t0); }
             OSSafeReleaseNULL(o);
             const struct nvk5_head h[2] = { { d ? t0 : nullptr, t0Bytes }, { gIfbK5, sizeof gIfbK5 } };
+            int32_t idx = -1;
+            r = nvk5_answer_heads(cmd, in, inSize, out, outSize ? *outSize : 0, h, 2, &why, &idx);
+        } else if (!gIfbDepNvrm && gIfbUsbcFB) {   // entry 0 the panel, entry 1 the USB-C screen
+            const struct nvk5_head h[2] = { { gIfbK5, sizeof gIfbK5 }, { gIfbUsbcK5, sizeof gIfbUsbcK5 } };
             int32_t idx = -1;
             r = nvk5_answer_heads(cmd, in, inSize, out, outSize ? *outSize : 0, h, 2, &why, &idx);
         } else r = nvk5_answer(cmd, in, inSize, out, outSize ? *outSize : 0, gIfbK5, sizeof gIfbK5, &why);
@@ -1488,6 +1710,14 @@ static void ifb_autopipe(void *, wait_result_t)
         if ((e0 = ifb_knob_rw("nvaccel_heads_published", &pub, false)) == 0 && (pub & 0x10)) break;
         IOSleep(200);
     }
+    // the USB-C screen (head 5) must be published and ready before the pipes are registered, or it gets
+    // none this boot; a failed read keeps the last value (the panel's registration must not depend on it)
+    for (int j = 0; (pub & 0x10) && gIfbUsbcExpected && !((pub & 0x20) && gIfbUsbcReady) && j < 50; j++) {
+        IOSleep(200);
+        int p2 = 0;
+        if (ifb_knob_rw("nvaccel_heads_published", &p2, false) == 0 && (p2 & 0x10)) pub = p2;
+    }
+    if (gIfbUsbcExpected) ifb_trail((pub & 0x20) && gIfbUsbcReady ? "autopipe-usbc" : "autopipe-nousbc");
     if (pub & 0x10) {
         e1 = ifb_knob_rw("nvaccel_igpu", &igpu, true);
         e2 = ifb_knob_rw("nvaccelfb", &fb, true);
@@ -1691,9 +1921,10 @@ static struct { bool pwB, owner, aux, mle1, pll, clk, ddiIo, clkSel, trans, buf;
         } \
     } while (0)
 
-int NMIntelFB::tc1Set(int mode)
+int NMIntelFB::tc1Set(int mode, uint32_t surf, uint32_t stride)
 {
     if (!fRegs) { gTc1Clone = false; gTc1State = 0; bzero(&gTc1Own, sizeof gTc1Own); return -1; }
+    if (mode < 0) { gTc1Clone = false; gTc1State = 0; bzero(&gTc1Own, sizeof gTc1Own); return 0; }   // after a reset
     const int rate = gTc1Rate;   // one value for the whole run, whatever the sysctl does meanwhile
     // TC1 = tc_port 0: port D, PHY TC1, AUX USBC1, FIA1 index 0. Pipe and transcoder B sit 0x1000 above A.
     enum : uint32_t {
@@ -1835,10 +2066,12 @@ int NMIntelFB::tc1Set(int mode)
     }
     if (gTc1State == 1) { TC1LOG("already lit: write 0 first"); return 0; }
     gTc1LogLen = 0; gTc1Log[0] = 0;
-    if (!fRegs || fPipe != 0 || fWidth != 1920 || fHeight != 1080) return fail(1, "the panel is not a 1920x1080 pipe A");
+    const bool own = surf != ~0u;   // the USB-C framebuffer's memory; otherwise a clone of the panel
+    if (!fRegs || (!own && (fPipe != 0 || fWidth != 1920 || fHeight != 1080)) || (own && (stride < 7680 || (stride & 63) || (surf & 0xFFF))))
+        return fail(1, own ? "the USB-C surface is not a 1920x1080 linear buffer" : "the panel is not a 1920x1080 pipe A");
     const uint32_t tcss = rd(TCSS), isr = rd(HPD_ISR), pa1 = rd(FIA1_PA1);
-    TC1LOG("start: mode %d rate %d; TCSS %08x HPD %08x PA1 %08x DDI_BUF %08x PLL %08x PW2 %08x AUX2 %08x DDI2 %08x MBUS %08x",
-           mode, rate, tcss, isr, pa1, rd(DDI_BUF), rd(PLL_EN), rd(PW_CTL2), rd(PW_AUX2), rd(PW_DDI2), rd(MBUS_CTL));
+    TC1LOG("start: mode %d rate %d %s; TCSS %08x HPD %08x PA1 %08x DDI_BUF %08x PLL %08x PW2 %08x AUX2 %08x DDI2 %08x MBUS %08x",
+           mode, rate, own ? "own surface" : "clone", tcss, isr, pa1, rd(DDI_BUF), rd(PLL_EN), rd(PW_CTL2), rd(PW_AUX2), rd(PW_DDI2), rd(MBUS_CTL));
     TC1LOG("pipe A for reference: VBLANK %08x SCL %08x PLANE_CTL %08x STRIDE %08x WM0 %08x BUF %08x DBOX %08x; "
            "ERR_FATAL_MASK %08x CHICKEN_DCPR_2 %08x", rd(VBLANK(0)), rd(SCL_A), rd(PLANE_CTL(0)), rd(PLANE_STRIDE(0)),
            rd(WM_A), rd(WM_A + 0x3C), rd(DBOX_A), rd(0x4421C), rd(0x46434));
@@ -2038,12 +2271,12 @@ int NMIntelFB::tc1Set(int mode)
       for (int i = 0; i < 100 && !(moving = rd(PIPEDSL_B) != d0); i++) IOSleep(1);
       if (!moving) return fail(30, "the scanline of pipe B does not move"); }
     wr(PLANE_COLOR_B, 1u << 13);
-    wr(PLANE_STRIDE(1), rd(PLANE_STRIDE(0)));
+    wr(PLANE_STRIDE(1), own ? stride / 64 : rd(PLANE_STRIDE(0)));
     wr(PLANE_POS_B, 0); wr(PLANE_SIZE(1), (1079u << 16) | 1919u); wr(PLANE_OFFSET_B, 0);
     wr(PLANE_KEYVAL_B, 0); wr(PLANE_KEYMSK_B, 0); wr(PLANE_KEYMAX_B, 0); wr(PLANE_AUX_DIST_B, 0); wr(PLANE_AUX_OFF_B, 0);
     wr(PLANE_CTL(1), kEnable | (1u << 28) | (4u << 24));
-    gTc1Clone = true;
-    wr(PLANE_SURF(1), rd(PLANE_SURF(0)) & ~0xFFFu);
+    gTc1Clone = !own;
+    wr(PLANE_SURF(1), own ? surf : rd(PLANE_SURF(0)) & ~0xFFFu);
     IOSleep(50);
     const uint32_t f0 = rd(FRMCOUNT(1));
     IOSleep(100);
@@ -2062,10 +2295,12 @@ static int ifb_tc1_sysctl SYSCTL_HANDLER_ARGS
     if (v != 0 && v != 1 && v != 2) return EINVAL;
     NMIntelFB *fb = gIfbRamFB;
     if (!fb || !gTc1Lock) return ENODEV;
+    if (gTc1ForUsbc) return EBUSY;   // pipe B is the USB-C screen's
     IOLockLock(gTc1Lock);
-    const int r = gIfbRamFB == fb ? fb->tc1Set(v) : -1;
+    const bool busy = gTc1ForUsbc;
+    const int r = busy || gIfbRamFB != fb ? -1 : fb->tc1Set(v);
     IOLockUnlock(gTc1Lock);
-    return r < 0 ? EIO : 0;
+    return busy ? EBUSY : r < 0 ? EIO : 0;
 }
 SYSCTL_PROC(_debug, OID_AUTO, nmintelfb_tc1, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, nullptr, 0, ifb_tc1_sysctl, "I",
             "2 = probe the USB-C sink over AUX, 1 = light the USB-C port as a 1080p60 clone of the panel, 0 = off; < 0 = failed step");
