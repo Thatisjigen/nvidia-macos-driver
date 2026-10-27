@@ -100,7 +100,9 @@ SYSCTL_INT(_debug, OID_AUTO, nvaccel_headless, CTLFLAG_RD | CTLFLAG_LOCKED | CTL
 #endif
 // 4 NVIDIA heads (nvfbheads=4) + 1 for an Intel built-in panel (NMIntelFB, IOFBDependentIndex 4): WindowServer composites
 // that panel on the NVIDIA card and the display-pipe copy path below writes each frame into the Intel scan-out surface.
-static const unsigned kNvMaxFB = 5;
+// + 1 for the Intel GPU's USB-C screen (NMIntelFB on its TC1 port, IOFBDependentIndex 5),
+// copied the same way.
+static const unsigned kNvMaxFB = 6;
 static unsigned gNvHeadsPublished = 0, gNvHeadsRegistered = 0;
 static unsigned gNvHeadsPiped = 0;
 // The Intel built-in panel (head 4) joins only when this is 1. Off by default while the path is proven: a write at run
@@ -522,7 +524,7 @@ public:
                 break;
             }
             if (fFBRegistered & (1u << i)) continue;
-            if (i == 4 && !gNvIgpu) break;   // the Intel panel waits for debug.nvaccel_igpu=1
+            if (i >= 4 && !gNvIgpu) break;   // the Intel screens (4 panel, 5 USB-C) wait for debug.nvaccel_igpu=1
             unsigned b = fDM->getFramebufferCount();
             ALOG("  %s: calling found_framebuffer(%s index %u) -- count before %u", why, fb->getName(), i, b);
             fDM->found_framebuffer((IOFramebuffer *)fb);
@@ -1507,13 +1509,14 @@ NVACCEL_CNT(nvaccel_iop_ok_h1,        gCntIopOkHead[1],   "frames copied to head
 NVACCEL_CNT(nvaccel_iop_ok_h2,        gCntIopOkHead[2],   "frames copied to head 2's panel");
 NVACCEL_CNT(nvaccel_iop_ok_h3,        gCntIopOkHead[3],   "frames copied to head 3's panel");
 NVACCEL_CNT(nvaccel_iop_ok_h4,        gCntIopOkHead[4],   "frames copied to head 4 (an Intel built-in panel, NMIntelFB)");
+NVACCEL_CNT(nvaccel_iop_ok_h5,        gCntIopOkHead[5],   "frames copied to head 5 (an Intel USB-C screen, NMIntelFB)");
 SYSCTL_UINT(_debug, OID_AUTO, nvaccel_heads_published, CTLFLAG_RD | CTLFLAG_LOCKED | CTLFLAG_KERN, &gNvHeadsPublished, 0,
             "bit i = head i's framebuffer has published to the accelerator");
 SYSCTL_UINT(_debug, OID_AUTO, nvaccel_heads_registered, CTLFLAG_RD | CTLFLAG_LOCKED, &gNvHeadsRegistered, 0,
             "bit i = head i's framebuffer was handed to the display machine (found_framebuffer)");
 SYSCTL_UINT(_debug, OID_AUTO, nvaccel_heads_piped, CTLFLAG_RD | CTLFLAG_LOCKED, &gNvHeadsPiped, 0,
             "bit i = head i has a display pipe that drives ITS OWN framebuffer (pipe+0x98 read back)");
-static_assert(kNvMaxFB == 5, "kNvMaxFB changed: add debug.nvaccel_iop_ok_h<i> for every new head");
+static_assert(kNvMaxFB == 6, "kNvMaxFB changed: add debug.nvaccel_iop_ok_h<i> for every new head");
 NVACCEL_CNT(nvaccel_iop_fail,         gCntIopFail,        "K3: transactions refused (see the capped iop: log lines)");
 NVACCEL_CNT(nvaccel_iop_empty,        gCntIopEmpty,       "K3: transactions with no plane (gamma/options only)");
 NVACCEL_CNT(nvaccel_iop_src_res,      gCntIopSrcRes,      "K3: frames sourced from our VRAM resource");
@@ -1694,7 +1697,7 @@ static void nvaccelInstallSysctl(void)
     sysctl_register_oid(&sysctl__debug_nvaccel_iop_late);
     sysctl_register_oid(&sysctl__debug_nvaccel_iop_ok_h0);      sysctl_register_oid(&sysctl__debug_nvaccel_iop_ok_h1);
     sysctl_register_oid(&sysctl__debug_nvaccel_iop_ok_h2);      sysctl_register_oid(&sysctl__debug_nvaccel_iop_ok_h3);
-    sysctl_register_oid(&sysctl__debug_nvaccel_iop_ok_h4);      sysctl_register_oid(&sysctl__debug_nvaccel_igpu);
+    sysctl_register_oid(&sysctl__debug_nvaccel_iop_ok_h4);      sysctl_register_oid(&sysctl__debug_nvaccel_iop_ok_h5);      sysctl_register_oid(&sysctl__debug_nvaccel_igpu);
     sysctl_register_oid(&sysctl__debug_nvaccel_heads_published); sysctl_register_oid(&sysctl__debug_nvaccel_heads_registered);
     sysctl_register_oid(&sysctl__debug_nvaccel_heads_piped);
     gSysctlInstalled = true;
