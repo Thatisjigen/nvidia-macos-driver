@@ -3395,7 +3395,10 @@ static BOOL nvmtl_pixel_sampler_update(NSMutableDictionary *states, NSString *in
         NSData *key=_pixelSamplerKey;
         // same pipeline, same sampler values as this encoder's last draw: its choice stands (no lock, no lookup; ANGLE
         // binds every draw)
-        if (_svSel && _svFor==_ps && _svKey==key) return _svSel==[NSNull null] ? nil : _svSel;
+        // NVMTL_NO_SV_MEMO=1 (nvrm610.conf) looks the variant up on every draw again, to A/B a text glitch
+        static int memo = -1;
+        if (memo < 0) { const char *e = getenv("NVMTL_NO_SV_MEMO"); memo = !(e && *e && *e != '0'); }
+        if (memo && _svSel && _svFor==_ps && _svKey==key) return _svSel==[NSNull null] ? nil : _svSel;
         _svFor=_ps; _svKey=key; _svSel=nil;
         @synchronized(_ps) {
             if(!_ps->_samplerVariants) _ps->_samplerVariants=[NSMutableDictionary new];
@@ -3614,7 +3617,11 @@ static BOOL nvmtl_pixel_sampler_update(NSMutableDictionary *states, NSString *in
     // NVMTL_DUMP_PSO=<text>: the first encoder that sets a pipeline whose label contains it has the fragment buffers bound
     // at its end dumped, as NVMTL_DUMP_GROUP does, for apps that label pipelines but push no debug groups (diagnostic)
     // The same pipeline again inside a begun pass (Apple's GL renderer sets it before every draw) changes nothing.
-    if (ps && (NVMTLRenderPipelineState *)ps == _ps && _begun && !(_cb->_c.pt_open && _cb->_c.pt_pool)) return;
+    // NVMTL_NO_PSO_SKIP=1 (nvrm610.conf) sets it every time again, to A/B a text glitch reported against this
+    static int skip = -1;
+    if (skip < 0) { const char *e = getenv("NVMTL_NO_PSO_SKIP"); skip = !(e && *e && *e != '0'); }
+    if (skip && ps && (NVMTLRenderPipelineState *)ps == _ps && _begun && !(_cb->_c.pt_open && _cb->_c.pt_pool)) return;
+    // </wtl>
     // Only asked for when the switch is set: this runs on every pipeline bind, and an unconditional `ps.label` was a message
     // send plus a string retain/release per draw call in profiles of a game that never sets NVMTL_DUMP_PSO.
     { static const char *want; static int once; static _Atomic int armed; if (!once) { once = 1; want = getenv("NVMTL_DUMP_PSO"); }
