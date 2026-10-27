@@ -614,6 +614,7 @@ static void ifb_autopipe_start(void);
 static void ifb_agdc_register(bool on);
 static void ifb_ram_register(NMIntelFB *fb);
 static NMIntelFB *volatile gIfbRamFB;   // intelfb-0017: the panel debug.nmintelfb_ram acts on
+static volatile SInt32 gIfbScanAsks;    // NVAccel's scanout questions, one per frame it copies to the panel
 static bool ifb_pci_ok(IOPCIDevice *pci, uint8_t *ver);
 
 IOService *NMIntelFB::probe(IOService *provider, SInt32 *score)
@@ -1043,6 +1044,7 @@ IOReturn NMIntelFB::callPlatformFunction(const OSSymbol *fn, bool wait, void *p1
 {
     if (fn && fn->isEqualTo(NVRM_VRAM_FN_SCANOUT)) {
         IFB_ONCE("scan");
+        OSIncrementAtomic(&gIfbScanAsks);
         NVRMVramRequest *r = (NVRMVramRequest *)p1;
         if (!r || r->version != NVRM_VRAM_ABI_VERSION) return kIOReturnBadArgument;
         if (!fSurfMap) return kIOReturnNotReady;
@@ -1352,6 +1354,35 @@ static int ifb_knob_rw(const char *name, int *v, bool set)
     return err;
 }
 
+// the panel's fast copy with the HDMI as well, in the steps nmx-intel's auto.sh takes without
+// it and that were checked by hand: NVAccel's direct copy, the RAM scanout (two buffers flipped unless
+// nullmoth-accel-ram says 1 or 0), then the copy engine straight into it. Like auto.sh it starts once WindowServer's
+// frames reach the panel; nullmoth-accel-fast=0 keeps the base copy. The kernel can write NVAccel's two knobs only in
+// a build with the fix for the stale frames of the direct copy; with any other the base copy stays.
+static void ifb_fastcopy(void)
+{
+    if (!ifb_knob("nullmoth-accel-fast", 1)) { ifb_trail("fast-off"); return; }
+    int i = 0;
+    for (; i < 900 && gIfbScanAsks < 10; i++) IOSleep(200);   // up to 3 minutes
+    if (gIfbScanAsks < 10) { ifb_trail("fast-noframes"); IFBLOG("fast copy: only %d copied frames in 3 min, base copy", (int)gIfbScanAsks); return; }
+    IOSleep(5000);
+    int mc = 1, d1 = 1, d2 = 2, e1 = ifb_knob_rw("nvaccel_iop_memcpy", &mc, true), e2 = -2, e3 = -2, e4 = -2;
+    if (!e1) e2 = ifb_knob_rw("nvaccel_iop_direct", &d1, true);
+    if (e1 || e2) {
+        ifb_trail("fast-nokern");
+        IFBLOG("fast copy: NVAccel did not take its knobs from the kernel (memcpy err %d, direct err %d): base copy", e1, e2);
+        return;
+    }
+    IOSleep(2000);
+    uint32_t ram = ifb_knob("nullmoth-accel-ram", 2);
+    int rv = ram > 2 ? 2 : (int)ram;
+    if (rv) e3 = ifb_knob_rw("nmintelfb_ram", &rv, true);
+    if (!e3) e4 = ifb_knob_rw("nvaccel_iop_direct", &d2, true);
+    ifb_trail(!e4 ? "fast-on" : "fast-direct1");
+    IFBLOG("fast copy after %d copied frames: memcpy 1, direct 1; ram scanout %u (err %d); direct 2 (err %d)",
+           (int)gIfbScanAsks, ram > 2 ? 2u : ram, e3, e4);
+}
+
 // the pipe and AGDC setup a script did by hand, now at boot and before WindowServer opens its framebuffers
 // (measured at boot: the panel publishes about 17 s before), so no WindowServer restart is needed
 static void ifb_autopipe(void *, wait_result_t)
@@ -1386,6 +1417,7 @@ static void ifb_autopipe(void *, wait_result_t)
     ifb_trail(!e1 && !e2 ? "autopipe" : "autopipe-fail");
     IFBLOG("autopipe: published %#x (err %d) after %d tries, igpu was %d (err %d), nvaccelfb was %d (err %d), "
            "NullMoth AGDC was %d now %d (err %d), ours %d", pub, e0, i, igpu, e1, fb, e2, nv, nvst, e3, gIfbAgdcState);
+    if (!e1 && !e2) ifb_fastcopy();
     thread_terminate(current_thread());
 }
 static void ifb_autopipe_start(void)
