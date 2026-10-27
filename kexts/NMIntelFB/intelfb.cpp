@@ -14,6 +14,7 @@
 #include <IOKit/pci/IOPCIDevice.h>
 #include <IOKit/graphics/IOFramebuffer.h>
 #include <IOKit/graphics/IODisplay.h>
+#include <IOKit/graphics/IOAccelerator.h>
 #include <IOKit/ndrvsupport/IOMacOSVideo.h>
 #include <libkern/OSAtomic.h>
 #include "nvrm_vram_abi.h"
@@ -603,6 +604,10 @@ SYSCTL_PROC(_debug, OID_AUTO, nmintelfb_sample, CTLTYPE_STRING | CTLFLAG_RD | CT
 
 // intelfb-0013: the Intel GPU whose panel this driver shows, kept by NMIntelFBClaim when the framebuffer sits under NVRM
 static IOPCIDevice *gIfbPCI = nullptr;
+static IOService *gIfbClaim;   // NMIntelFBClaim, parent of the GPUWrangler accelerator
+static void ifb_gwready(bool panel);
+static bool gIfbAutopipeOn;   // the autopipe thread runs, and publishes the Intel GPU when done
+static bool gIfbBootMonitor;  // a monitor on the NVIDIA port at boot (NVRMFB head 0 when start() ran)
 static IOService *gIfbNubFB = nullptr;   // intelfb-0014: the framebuffer on the nub, which the AGDC reports
 static uint32_t gIfbK5[NVK5_TIMING_WORDS];   // intelfb-0015: the panel's timing in NVRMFB's NVRMTiming layout
 // the panel beside a monitor on NVRMFB's head 0. In NVRM's group the panel is
@@ -742,7 +747,15 @@ bool NMIntelFB::start(IOService *provider)
     ifb_trail("start");
     // intelfb-0008: nullmoth-intelfb-delay=<s> waits before taking the panel, so the boot log reaches the disk and the
     // NVIDIA stack (NVRM auto-go, NVAccel) has started before this framebuffer exists. The firmware screen stays meanwhile
-    if (uint32_t w = ifb_knob("nullmoth-intelfb-delay", 0)) {
+    // the short delay and the early GPUWrangler publish were tested only with a monitor on the NVIDIA
+    // port at boot (NVRM's group, autopipe). Without one (no NVRMFB head 0 when this nub is published, which NVRM does
+    // after nub 0's framebuffer started) the Mac hung about 10 s after start() with WindowServer already on the panel
+    //: there the panel waits nullmoth-intelfb-delay-own (default 45 s, as before) and the Intel
+    // GPU is not published, so WindowServer waits GPUWrangler's 60 s as it always did in that mode.
+    IOService *h0 = ifb_nvrm_head0();
+    gIfbBootMonitor = h0 != nullptr;
+    OSSafeReleaseNULL(h0);
+    if (uint32_t w = gIfbBootMonitor ? ifb_knob("nullmoth-intelfb-delay", 0) : ifb_knob("nullmoth-intelfb-delay-own", 45)) {
         if (w > 120) w = 120;
         IFBLOG("waiting %u s before taking the panel (nullmoth-intelfb-delay)", w);
         ifb_trail("wait");
@@ -751,6 +764,13 @@ bool NMIntelFB::start(IOService *provider)
     }
     bool ok = startReal(provider);
     ifb_trail(ok ? "ok" : "declined");
+    // WindowServer's wait may end only when the panel is ready for it. With the autopipe that is after
+    // the autopipe (ifb_autopipe), which must finish before WindowServer opens its framebuffers: published right here,
+    // WindowServer opened the panel 0.2 s after start() and the Mac hung (both times).
+    // In its own group (no monitor at boot) nothing is published: the 60 s wait, as before (see the delay above);
+    // nullmoth-intelfb-gwready-own=1 publishes there too, untested.
+    if (!ok) ifb_gwready(false);
+    else if (!gIfbAutopipeOn && ifb_knob("nullmoth-intelfb-gwready-own", 0)) ifb_gwready(true);
     // intelfb-0005: RTX-3 froze after start() returned, so the boot guard stays armed until the Mac has lived two
     // minutes with this framebuffer; a freeze before that leaves the panel to the firmware on the next boot
     if (ok) {
@@ -1121,6 +1141,33 @@ public:
 };
 OSDefineMetaClassAndStructors(NMIntelFBClaim, IOService)
 
+// AppleGPUWrangler makes a GPU of every display-class PCI device and holds WindowServer's
+// GPUWranglerWaitForPublish (60 s, from CoreDisplay) until each GPU has an accelerator, an AGDC or a framebuffer under
+// it. The panel's framebuffer and AGDC sit under the NVIDIA GPU, so the Intel GPU never published and every boot waited
+// the full 60 s. WindowServer lists the framebuffers once, when the wait ends, and does not add one
+// that comes later (the NVIDIA GPU published at +20 s, the panel at +31.6 s). So an
+// empty accelerator goes under the claim when the panel is ready for WindowServer (after the autopipe, see
+// NMIntelFB::start): the Intel GPU publishes then, and the wait ends with the panel there. No IOAccelIndex, no Metal
+// plugin: nothing renders on it.
+// nullmoth-intelfb-gwready=0: not published (the 60 s wait comes back).
+class NMIntelFBGPUReady : public IOAccelerator {
+    OSDeclareDefaultStructors(NMIntelFBGPUReady)
+};
+OSDefineMetaClassAndStructors(NMIntelFBGPUReady, IOAccelerator)
+
+static void ifb_gwready(bool panel)
+{
+    static SInt32 done;
+    if (!gIfbClaim || !OSCompareAndSwap(0, 1, &done)) return;
+    if (!ifb_knob("nullmoth-intelfb-gwready", 1)) { ifb_trail("gwready-off"); return; }
+    NMIntelFBGPUReady *a = OSTypeAlloc(NMIntelFBGPUReady);
+    bool up = a && a->init() && a->attach(gIfbClaim);
+    if (up) a->registerService();
+    OSSafeReleaseNULL(a);   // the registry keeps it while attached
+    ifb_trail(up ? "gwready" : "gwready-fail");
+    IFBLOG("GPUWrangler: Intel GPU %s (panel %s)", up ? "published" : "NOT published", panel ? "up" : "declined");
+}
+
 IOService *NMIntelFBClaim::probe(IOService *provider, SInt32 *score)
 {
     IOPCIDevice *pci = OSDynamicCast(IOPCIDevice, provider);
@@ -1135,6 +1182,7 @@ bool NMIntelFBClaim::start(IOService *provider)
     if (!pci || !IOService::start(provider)) return false;
     pci->retain(); gIfbPCI = pci;
     ifb_trail("claim");
+    retain(); gIfbClaim = this;   // NMIntelFB::start() publishes the Intel GPU under it
     thread_t t = nullptr;
     if (kernel_thread_start(publishThread, nullptr, &t) != KERN_SUCCESS) { ifb_trail("claim-nothread"); return true; }
     thread_deallocate(t);
@@ -1417,13 +1465,17 @@ static void ifb_autopipe(void *, wait_result_t)
     ifb_trail(!e1 && !e2 ? "autopipe" : "autopipe-fail");
     IFBLOG("autopipe: published %#x (err %d) after %d tries, igpu was %d (err %d), nvaccelfb was %d (err %d), "
            "NullMoth AGDC was %d now %d (err %d), ours %d", pub, e0, i, igpu, e1, fb, e2, nv, nvst, e3, gIfbAgdcState);
+    // only now may WindowServer open its framebuffers; nullmoth-intelfb-gwdelay (s, default 3) keeps a
+    // margin. ifb_fastcopy waits for WindowServer's frames, so it follows.
+    if (uint32_t m = ifb_knob("nullmoth-intelfb-gwdelay", 3)) IOSleep((m > 30 ? 30 : m) * 1000);
+    ifb_gwready(true);
     if (!e1 && !e2) ifb_fastcopy();
     thread_terminate(current_thread());
 }
 static void ifb_autopipe_start(void)
 {
     thread_t t = nullptr;
-    if (kernel_thread_start(ifb_autopipe, nullptr, &t) == KERN_SUCCESS) thread_deallocate(t);
+    if (kernel_thread_start(ifb_autopipe, nullptr, &t) == KERN_SUCCESS) { gIfbAutopipeOn = true; thread_deallocate(t); }
     else ifb_trail("autopipe-nothread");
 }
 SYSCTL_PROC(_debug, OID_AUTO, nmintelfb_agdc, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED | CTLFLAG_KERN, nullptr, 0,
