@@ -208,16 +208,28 @@ static void nvdaAgdcScan(IOService *pci)
     // the slot right after them, which is also its NVAccel pipe and the IOFBDependentIndex it has once open. Without it
     // WindowServer asked this table, with one framebuffer, about both displays: the panel got no link or plane answers
     // and showed only the cursor (an AGDC of NMIntelFB's own beside this one could not be the only one asked).
+    // and the Intel GPU's USB-C screen, a second NMIntelFB (property NMIntelFBUSBC), right
+    // after the panel: its NVAccel pipe (head 5) follows the panel's, and so does its IOFBDependentIndex once open.
     if (n < kAgdcMaxFB) {
+        IOService *intel[2] = {};   // [0] the panel, [1] the USB-C screen
         OSDictionary *pm = IOService::serviceMatching("NMIntelFB");
-        IOService *f = pm ? IOService::copyMatchingService(pm) : nullptr;
+        OSIterator *pit = pm ? IOService::getMatchingServices(pm) : nullptr;
         OSSafeReleaseNULL(pm);
-        if (f) {
+        while (OSObject *po = pit ? pit->getNextObject() : nullptr) {
+            IOService *f = OSDynamicCast(IOService, po); if (!f) continue;
             IOService *p = f->getProvider(); int hops = 0;
             while (p && !p->metaCast("IOPCIDevice") && hops++ < 8) p = p->getProvider();
             OSNumber *dep = OSDynamicCast(OSNumber, f->getProperty("IOFBDependentID"));
-            if (p == pci && dep && dep->unsigned64BitValue() == 0x4E56524D00000001ull) tab[n++] = f;   // keeps the retain
-            else { SCANLOG("NMIntelFB id %#llx is not in NVRM's group on this GPU: left out", f->getRegistryEntryID()); f->release(); }
+            IOService *nub = f->getProvider();   // the nub says it too, even before the framebuffer sets its property
+            const unsigned k = (f->getProperty("NMIntelFBUSBC") || (nub && nub->getProperty("nm-intel-usbc"))) ? 1 : 0;
+            if (p == pci && dep && dep->unsigned64BitValue() == 0x4E56524D00000001ull && !intel[k]) { f->retain(); intel[k] = f; }
+            else SCANLOG("NMIntelFB id %#llx is not in NVRM's group on this GPU: left out", f->getRegistryEntryID());
+        }
+        OSSafeReleaseNULL(pit);
+        for (unsigned k = 0; k < 2; k++) {
+            if (!intel[k]) continue;
+            if (n < kAgdcMaxFB && (k == 0 || intel[0])) tab[n++] = intel[k];   // keeps the retain
+            else { SCANLOG("NMIntelFB id %#llx: no slot left, or no panel before it", intel[k]->getRegistryEntryID()); intel[k]->release(); }
         }
     }
     for (unsigned i = 0; i < n; i++) gAgdcFB[i] = tab[i];
