@@ -226,6 +226,9 @@ constexpr uint32_t tileOf(uint32_t ctl) { return (ctl >> 10) & 0x7; }
 }
 
 static bool gIfbDepNvrm = false;   // the panel sits in NVRM's group (dep=2, or dep=3 with a head 0)
+static volatile bool gTc1Clone = false;   // pipe B (USB-C) scans the panel's surface; flips follow it
+static int gTc1State = 0, gTc1Rate = 270000;   // debug.nmintelfb_tc1 and debug.nmintelfb_tc1_rate
+static IOLock *gTc1Lock;                       // one change at a time (sysctl, stop, sleep)
 static unsigned ifb_nvrm_heads(void);
 
 class NMIntelFB : public IOFramebuffer {
@@ -307,6 +310,8 @@ public:
     // MMIO write; logged once at start and read on demand through sysctl debug.nmintelfb_tcdiag. Offsets: Linux 7.3 i915
     // (MIT) for display 13 (ADL-P/RPL-P): TC1-TC4 = ports D-G, modular FIA (FIA1 holds TC1-2, FIA2 TC3-4). A port in
     // TC-cold reads 0xffffffff in TCSS/FIA.
+    // light the USB-C port as a second pipe (sysctl debug.nmintelfb_tc1), defined below
+    int tc1Set(int mode);
     void tcDiagInto(char *b, size_t n) {
         if (!fRegs) { snprintf(b, n, "no registers\n"); return; }
         size_t o = 0;
@@ -472,6 +477,7 @@ public:
         ifb_trail(ordinal ? "sp1" : "sp0");
         { char r[200]; regsInto(r, sizeof r); IFBLOG("power %lu: %s", ordinal, r); }
         for (unsigned b = 0; ordinal && b < (unsigned)fRamMode; b++) ramPtes(b, true);   // intelfb-0017: in case the GGTT was rewritten while asleep
+        if (!ordinal && gTc1Lock && gTc1State == 1) { IOLockLock(gTc1Lock); tc1Set(0); IOLockUnlock(gTc1Lock); }
         handleEvent(ordinal ? kIOFBNotifyDidPowerOn : kIOFBNotifyWillPowerOff);
         ifb_trail("sp-done");
         return kIOPMAckImplied;
@@ -917,6 +923,7 @@ void NMIntelFB::stop(IOService *provider)
     thread_wakeup((event_t)&fVblNext);
     while (fVblRunning) IOSleep(5);
     if (gIfbNubFB == this) { ifb_agdc_register(false); gIfbNubFB = nullptr; }
+    if (gIfbRamFB == this && gTc1Lock) { IOLockLock(gTc1Lock); tc1Set(0); IOLockUnlock(gTc1Lock); }
     if (gIfbRamFB == this) ifb_ram_register(nullptr);
     ramSet(0);
     for (unsigned b = 0; b < 2; b++) {
@@ -1144,6 +1151,7 @@ IOReturn NMIntelFB::callPlatformFunction(const OSSymbol *fn, bool wait, void *p1
         const unsigned b = fFront ^ 1u;
         if (fRamMode != 2 || p1 != (void *)fRamPages[b]) return kIOReturnSuccess;
         wr(PLANE_SURF(fPipe), fRamGgtt[b] | fSurfLow);
+        if (gTc1Clone) wr(PLANE_SURF(1), fRamGgtt[b]);   // the USB-C clone shows the same frame
         fFront = b;
         OSIncrementAtomic64(&gIfbFlips);
         return kIOReturnSuccess;
@@ -1618,6 +1626,7 @@ int NMIntelFB::ramSet(int mode)
             // back to buffer 0 at the firmware's offset before buffer 1's entries go
             fRamMode = 1;
             wr(PLANE_SURF(fPipe), fRamGgtt[0] | fSurfLow); fFront = 0;
+            if (gTc1Clone) wr(PLANE_SURF(1), fRamGgtt[0]);
             flipLatched(50000);
             ramPtes(1, false);
             IFBLOG("ram scanout: flipping off, one buffer"); ifb_trail("flip-off");
@@ -1658,6 +1667,417 @@ static int ifb_regs_sysctl SYSCTL_HANDLER_ARGS
 }
 SYSCTL_PROC(_debug, OID_AUTO, nmintelfb_regs, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED, nullptr, 0,
             ifb_regs_sysctl, "A", "intelfb-0018: pipe, plane, panel power, backlight PWM and the first scan-out PTE");
+
+// ---- the USB-C port lit as a second pipe ----
+// The firmware leaves the USB-C port (TC1, port D) in DP Alt Mode and READY with pin assignment D (2 DP lanes) but never
+// lights it. sysctl debug.nmintelfb_tc1: 2 = connect the PHY, read the sink's DPCD over AUX and let go;
+// 1 = light 1920x1080@60 (CEA-861 VIC 16) as one SST stream on pipe and transcoder B (DBUF S3-S4), its plane scanning
+// the panel's own surface (a clone); 0 = turn it all off again. Nothing runs at boot. Steps and values follow Linux 7.3
+// i915 (MIT) for ADL-P: adlp_tc_phy_connect, intel_ddi_pre_pll_enable, mg_pll_enable/dkl_pll_write,
+// tgl_ddi_pre_enable_dp, intel_dp_start/stop_link_train, hsw_crtc_enable and intel_ddi_enable. Linux's own run on this
+// laptop shows the same TC PLL 1, DDI_CLK_SEL MG, DPCLKA bit 12 and AUX/DDI IO wells (index 3).
+// debug.nmintelfb_tc1_rate picks the link rate (270000 = default, 540000; i915 port_clock units) and
+// debug.nmintelfb_tc1_log keeps the steps. A failed step undoes what was done and leaves debug.nmintelfb_tc1 < 0.
+static char gTc1Log[4096];
+static size_t gTc1LogLen;
+// what this code turned on, so that off() undoes exactly that and nothing the firmware owns
+static struct { bool pwB, owner, aux, mle1, pll, clk, ddiIo, clkSel, trans, buf; uint32_t mle1Was; } gTc1Own;
+#define TC1LOG(fmt, ...) do { \
+        IFBLOG("tc1: " fmt, ##__VA_ARGS__); \
+        if (gTc1LogLen < sizeof gTc1Log) { \
+            int w_ = snprintf(gTc1Log + gTc1LogLen, sizeof gTc1Log - gTc1LogLen, fmt "\n", ##__VA_ARGS__); \
+            if (w_ > 0) gTc1LogLen += (size_t)w_; \
+            if (gTc1LogLen > sizeof gTc1Log - 1) gTc1LogLen = sizeof gTc1Log - 1; \
+        } \
+    } while (0)
+
+int NMIntelFB::tc1Set(int mode)
+{
+    if (!fRegs) { gTc1Clone = false; gTc1State = 0; bzero(&gTc1Own, sizeof gTc1Own); return -1; }
+    const int rate = gTc1Rate;   // one value for the whole run, whatever the sysctl does meanwhile
+    // TC1 = tc_port 0: port D, PHY TC1, AUX USBC1, FIA1 index 0. Pipe and transcoder B sit 0x1000 above A.
+    enum : uint32_t {
+        DDI_BUF = 0x64300, AUX_CTL = 0x64310, AUX_DATA = 0x64314, DDI_CLK_SEL = 0x4610C, TCSS = 0x161500,
+        PLL_EN = 0x46038, DPCLKA = 0x164280, DPCLKA_TC1_OFF = 1u << 12, PW_CTL2 = 0x45404, PW_AUX2 = 0x45444,
+        PW_DDI2 = 0x45454, FIA1_PA1 = 0x163880, FIA1_MLE1 = 0x1638C0, HIP_INDEX = 0x1010A0, DKL = 0x168000,
+        HPD_ISR = 0x44470, DSSM = 0x51004, MBUS_CTL = 0x4438C, DBUF_S2 = 0x44300, DBUF_S3 = 0x44304,
+        TRANS_CLK_SEL_B = 0x46144, FUNC_B = 0x61400, FUNC2_B = 0x61404, MSA_B = 0x61410, TP_CTL_B = 0x61540,
+        TP_STATUS_B = 0x61544, DATA_M1_B = 0x61030, DATA_N1_B = 0x61034, LINK_M1_B = 0x61040, LINK_N1_B = 0x61044,
+        VSYNCSHIFT_B = 0x61028, CUR_CTL_B = 0x71080, PS1_CTRL_B = 0x68980, PS2_CTRL_B = 0x68A80,
+        TRANS_MULT_B = 0x6102C, SCL_A = 0x6007C, SCL_B = 0x6107C, PIPESRC_B = 0x6101C, CHICKEN_TRANS_B = 0x420C4,
+        PIPE_MISC_B = 0x71030, PIPE_CHICKEN_B = 0x71038, PIPE_ARB_B = 0x71028, LINETIME_B = 0x45274,
+        GAMMA_MODE_B = 0x4AC80, CSC_MODE_B = 0x49128, DBOX_A = 0x7003C, DBOX_B = 0x7103C, PIPEDSL_B = 0x71000,
+        PLANE_POS_B = 0x7118C, PLANE_KEYVAL_B = 0x71194, PLANE_KEYMSK_B = 0x71198, PLANE_KEYMAX_B = 0x711A0,
+        PLANE_OFFSET_B = 0x711A4, PLANE_AUX_DIST_B = 0x711C0, PLANE_AUX_OFF_B = 0x711C4, PLANE_COLOR_B = 0x711CC,
+        // plane 1 watermarks: levels 0-5, SAGV and SAGV transition at +0x00..+0x1C, transition +0x28, PLANE_BUF_CFG +0x3C
+        WM_A = 0x70240, WM_B = 0x71240,
+    };
+    auto waitBits = [&](uint32_t reg, uint32_t mask, uint32_t want, unsigned us) {
+        for (unsigned t = 0;; t += 10) { if ((rd(reg) & mask) == want) return true; if (t >= us) return false; IODelay(10); }
+    };
+    // Dekel PHY registers: bank (bits 15:12 of the PHY offset) through HIP_INDEX_REG0's TC1 byte, then the 4 KiB window
+    auto dkl = [&](uint32_t off) { wr(HIP_INDEX, (off >> 12) & 0xF); return rd(DKL + (off & 0xFFF)); };
+    auto dklw = [&](uint32_t off, uint32_t v) { wr(HIP_INDEX, (off >> 12) & 0xF); wr(DKL + (off & 0xFFF), v); };
+    auto dklm = [&](uint32_t off, uint32_t clr, uint32_t set) { dklw(off, (dkl(off) & ~clr) | set); };
+    // one AUX transfer (intel_dp_aux_xfer, skl_get_aux_send_ctl) without the interrupt bit: nothing services the iGPU's
+    // interrupt here, the done bit is polled. Returns the reply length or < 0.
+    auto auxXfer = [&](const uint8_t *tx, int txn, uint8_t *rx, int rxn) -> int {
+        for (int i = 0; i < 30 && (rd(AUX_CTL) & (1u << 31)); i++) IODelay(100);
+        if (rd(AUX_CTL) & (1u << 31)) return -16;
+        for (int t = 0; t < 5; t++) {
+            for (int i = 0; i < txn; i += 4) {
+                uint32_t v = 0;
+                for (int j = 0; j < 4 && i + j < txn; j++) v |= (uint32_t)tx[i + j] << (24 - 8 * j);
+                wr(AUX_DATA + (uint32_t)i, v);
+            }
+            // send, clear done/timeout/receive error, 4 ms timeout, size, FW sync 18 and sync 32 pulses, TBT_IO 0
+            wr(AUX_CTL, (1u << 31) | (1u << 30) | (1u << 28) | (3u << 26) | (1u << 25) | ((uint32_t)txn << 20) |
+                        (17u << 5) | 31u);
+            uint32_t st = 0;
+            for (unsigned us = 0; us < 10000; us += 20) { st = rd(AUX_CTL); if (!(st & (1u << 31))) break; IODelay(20); }
+            if (st & (1u << 31)) return -60;
+            wr(AUX_CTL, st | (1u << 30) | (1u << 28) | (1u << 25));
+            if (st & (1u << 28)) continue;
+            if (st & (1u << 25)) { IODelay(450); continue; }
+            if (!(st & (1u << 30))) continue;
+            int n = (int)((st >> 20) & 0x1F);
+            if (n == 0 || n > 20) return -5;
+            if (n > rxn) n = rxn;
+            for (int i = 0; i < n; i += 4) {
+                const uint32_t v = rd(AUX_DATA + (uint32_t)i);
+                for (int j = 0; j < 4 && i + j < n; j++) rx[i + j] = (uint8_t)(v >> (24 - 8 * j));
+            }
+            return n;
+        }
+        return -60;
+    };
+    // native AUX read or write of 1-16 DPCD bytes; DEFER and failed transfers retried 32 times, as drm_dp_dpcd_access
+    auto dpcd = [&](bool write, uint32_t addr, uint8_t *buf, int len) -> bool {
+        uint8_t tx[20], rx[20];
+        tx[0] = (uint8_t)((write ? 0x80 : 0x90) | ((addr >> 16) & 0xF)); tx[1] = (uint8_t)(addr >> 8);
+        tx[2] = (uint8_t)addr; tx[3] = (uint8_t)(len - 1);
+        if (write) for (int i = 0; i < len; i++) tx[4 + i] = buf[i];
+        for (int r = 0; r < 32; r++) {
+            const int n = auxXfer(tx, write ? 4 + len : 4, rx, write ? 1 : 1 + len);
+            if (n < 1) { IODelay(500); continue; }
+            const uint8_t reply = (rx[0] >> 4) & 3;
+            if (reply == 2) { IODelay(500); continue; }
+            if (reply) return false;
+            if (!write) { if (n - 1 < len) return false; for (int i = 0; i < len; i++) buf[i] = rx[1 + i]; }
+            return true;
+        }
+        return false;
+    };
+    // ADL-P Dekel drive tables (intel_ddi_buf_trans.c: vswing, preshoot, de-emphasis), rows as index_to_dp_signal_levels
+    static const uint8_t kHbr[10][3] = { {7, 0, 1}, {5, 0, 6}, {2, 0, 11}, {0, 0, 23}, {5, 0, 0}, {2, 0, 8}, {0, 0, 20},
+                                         {2, 0, 0}, {0, 0, 11}, {0, 0, 0} };
+    static const uint8_t kHbr2[10][3] = { {7, 0, 0}, {5, 0, 4}, {2, 0, 10}, {0, 0, 24}, {5, 0, 0}, {2, 0, 6}, {0, 0, 20},
+                                          {2, 0, 0}, {0, 0, 9}, {0, 0, 0} };
+    // tgl_dkl_phy_set_signal_levels with one level for every lane (the highest any lane asks for)
+    auto levels = [&](unsigned vs, unsigned pe) {
+        unsigned row = vs == 0 ? pe : vs == 1 ? 4 + pe : vs == 2 ? 7 + pe : 9;
+        if (row > 9) row = 9;
+        const uint8_t *e = (rate > 270000 ? kHbr2 : kHbr)[row];
+        const uint32_t m = (0x1Fu << 13) | (0x1Fu << 8) | 0x7u;
+        const uint32_t v = ((uint32_t)e[1] << 13) | ((uint32_t)e[2] << 8) | e[0];
+        for (uint32_t ln = 0; ln < 2; ln++) {
+            const uint32_t o = ln * 0x1000;
+            dklw(0x0D00 + o, 0);                                            // DKL_TX_PMD_LANE_SUS
+            dklm(0x02C0 + o, m, v);                                         // DKL_TX_DPCNTL0
+            dklm(0x02C4 + o, m, v);                                         // DKL_TX_DPCNTL1
+            dklm(0x02C8 + o, (1u << 2) | (3u << 3) | (3u << 5), 0);         // DPCNTL2: no 20-bit mode, DP load generators
+        }
+    };
+    // undo, in i915's disable order, only what this code turned on
+    auto off = [&]() {
+        gTc1Clone = false;
+        if (gTc1Own.trans) {
+            wr(PLANE_CTL(1), 0); wr(PLANE_SURF(1), 0); IOSleep(20);
+            wr(TRANSCONF(1), rd(TRANSCONF(1)) & ~kEnable);
+            for (int i = 0; i < 100 && (rd(TRANSCONF(1)) & (1u << 30)); i++) IOSleep(1);
+            wr(FUNC_B, 0);
+            gTc1Own.trans = false;
+        }
+        if (gTc1Own.buf) {
+            uint8_t d3 = 2; dpcd(true, 0x600, &d3, 1);
+            wr(DDI_BUF, rd(DDI_BUF) & ~kEnable);
+            wr(TP_CTL_B, 0);
+            waitBits(DDI_BUF, 1u << 7, 1u << 7, 8000);
+            gTc1Own.buf = false;
+        }
+        if (gTc1Own.clkSel) { wr(TRANS_CLK_SEL_B, 0); gTc1Own.clkSel = false; }
+        if (gTc1Own.ddiIo) { wr(PW_DDI2, rd(PW_DDI2) & ~(1u << 7)); waitBits(PW_DDI2, 1u << 6, 0, 1000); gTc1Own.ddiIo = false; }
+        if (gTc1Own.clk) { wr(DPCLKA, rd(DPCLKA) | DPCLKA_TC1_OFF); wr(DDI_CLK_SEL, 0); gTc1Own.clk = false; }
+        if (gTc1Own.pll) {
+            wr(PLL_EN, rd(PLL_EN) & ~(1u << 31)); waitBits(PLL_EN, 1u << 30, 0, 1000);
+            wr(PLL_EN, rd(PLL_EN) & ~(1u << 27)); waitBits(PLL_EN, 1u << 26, 0, 1000);
+            gTc1Own.pll = false;
+        }
+        if (gTc1Own.mle1) { wr(FIA1_MLE1, gTc1Own.mle1Was); gTc1Own.mle1 = false; }
+        if (gTc1Own.aux) { wr(PW_AUX2, rd(PW_AUX2) & ~(1u << 7)); gTc1Own.aux = false; }
+        if (gTc1Own.owner) { wr(DDI_BUF, rd(DDI_BUF) & ~(1u << 6)); gTc1Own.owner = false; }
+        if (gTc1Own.pwB) { wr(PW_CTL2, rd(PW_CTL2) & ~(1u << 13)); gTc1Own.pwB = false; }
+    };
+    auto fail = [&](int code, const char *why) {
+        TC1LOG("FAILED at step %d: %s", code, why);
+        off();
+        gTc1State = -code;
+        ifb_trail("tc1-failed");
+        return -code;
+    };
+
+    if (mode == 0) {
+        const bool any = gTc1Own.pwB || gTc1Own.owner || gTc1Own.aux || gTc1Own.mle1 || gTc1Own.pll || gTc1Own.clk ||
+                         gTc1Own.ddiIo || gTc1Own.clkSel || gTc1Own.trans || gTc1Own.buf;
+        off(); gTc1State = 0;
+        if (any) { TC1LOG("off"); ifb_trail("tc1-off"); }
+        return 0;
+    }
+    if (gTc1State == 1) { TC1LOG("already lit: write 0 first"); return 0; }
+    gTc1LogLen = 0; gTc1Log[0] = 0;
+    if (!fRegs || fPipe != 0 || fWidth != 1920 || fHeight != 1080) return fail(1, "the panel is not a 1920x1080 pipe A");
+    const uint32_t tcss = rd(TCSS), isr = rd(HPD_ISR), pa1 = rd(FIA1_PA1);
+    TC1LOG("start: mode %d rate %d; TCSS %08x HPD %08x PA1 %08x DDI_BUF %08x PLL %08x PW2 %08x AUX2 %08x DDI2 %08x MBUS %08x",
+           mode, rate, tcss, isr, pa1, rd(DDI_BUF), rd(PLL_EN), rd(PW_CTL2), rd(PW_AUX2), rd(PW_DDI2), rd(MBUS_CTL));
+    TC1LOG("pipe A for reference: VBLANK %08x SCL %08x PLANE_CTL %08x STRIDE %08x WM0 %08x BUF %08x DBOX %08x; "
+           "ERR_FATAL_MASK %08x CHICKEN_DCPR_2 %08x", rd(VBLANK(0)), rd(SCL_A), rd(PLANE_CTL(0)), rd(PLANE_STRIDE(0)),
+           rd(WM_A), rd(WM_A + 0x3C), rd(DBOX_A), rd(0x4421C), rd(0x46434));
+    if (tcss == ~0u || (tcss & 5u) != 5u || !(isr & (1u << 16))) return fail(2, "TC1 is not in DP Alt Mode and READY");
+    if (((rd(DSSM) >> 29) & 7u) != 2u) return fail(4, "the reference clock is not 38.4 MHz");
+    bool busy = (rd(TRANSCONF(1)) & kEnable) || (rd(FUNC_B) & kEnable) || (rd(DDI_BUF) & kEnable) ||
+                (rd(PLL_EN) & (1u << 31)) || (rd(CUR_CTL_B) & 0x27u) || (rd(PS1_CTRL_B) & kEnable) || (rd(PS2_CTRL_B) & kEnable);
+    for (uint32_t pl = 0; pl < 5; pl++) busy = busy || (rd(PLANE_CTL(1) + pl * 0x100) & kEnable);
+    if (busy) return fail(5, "pipe B (a plane, the cursor or a scaler), the port or its PLL is already in use");
+    if ((rd(MBUS_CTL) & (1u << 31)) || !(rd(DBUF_S2) & (1u << 30)) || !(rd(DBUF_S3) & (1u << 30)))
+        return fail(6, "DBUF S3-S4 are not powered and free (MBUS joined?)");
+    if (!(rd(PW_CTL2) & (1u << 2))) return fail(7, "PW_2 is off");
+    if (rate != 270000 && rate != 540000)
+        return fail(8, "debug.nmintelfb_tc1_rate must be 270000 or 540000 (1.62 Gbit/s x2 cannot carry 1080p60)");
+    if (!(rd(PW_CTL2) & (1u << 12))) {
+        wr(PW_CTL2, rd(PW_CTL2) | (1u << 13)); gTc1Own.pwB = true;
+        if (!waitBits(PW_CTL2, 1u << 12, 1u << 12, 1000)) return fail(9, "PW_B did not come up");
+    }
+
+    // TC PHY connect (adlp_tc_phy_connect): ownership (the firmware already holds it here), READY, then the AUX power
+    // well, which also blocks TC-cold; the Dekel microcontroller reports its health after it
+    ifb_trail("tc1-connect");
+    if (!(rd(DDI_BUF) & (1u << 6))) {
+        wr(DDI_BUF, rd(DDI_BUF) | (1u << 6)); gTc1Own.owner = true;
+        if (!(rd(DDI_BUF) & (1u << 6))) return fail(10, "PHY ownership was not taken");
+    }
+    if (!(rd(TCSS) & 4u)) return fail(11, "the PHY is not ready after ownership");
+    wr(AUX_CTL, rd(AUX_CTL) & ~((1u << 31) | (1u << 11)));
+    if (!(rd(PW_AUX2) & (1u << 7))) { wr(PW_AUX2, rd(PW_AUX2) | (1u << 7)); gTc1Own.aux = true; }
+    bool up = false;
+    for (int i = 0; i < 500 && !(up = (rd(PW_AUX2) & (1u << 6)) != 0); i++) IOSleep(1);
+    if (!up) return fail(12, "the AUX power well of TC1 did not come up");
+    if ((rd(FIA1_PA1) & 0xFu) != 4u) return fail(3, "the pin assignment is not D (2 lanes)");
+    { bool ok = false; for (int i = 0; i < 10 && !(ok = (dkl(0x236C) & (1u << 15)) != 0); i++) IODelay(100);
+      if (!ok) TC1LOG("Dekel uC health not seen (i915 only warns)"); }
+    uint8_t caps[16] = {}, ext[16] = {}, mstCap = 0, mstCtl = 0, sinkCount = 0;
+    if (!dpcd(false, 0x000, caps, 16)) return fail(13, "no DPCD over AUX");
+    const bool haveExt = dpcd(false, 0x2200, ext, 16);
+    dpcd(false, 0x021, &mstCap, 1); dpcd(false, 0x111, &mstCtl, 1); dpcd(false, 0x200, &sinkCount, 1);
+    TC1LOG("DPCD %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x", caps[0], caps[1],
+           caps[2], caps[3], caps[4], caps[5], caps[6], caps[7], caps[8], caps[9], caps[10], caps[11], caps[12], caps[13],
+           caps[14], caps[15]);
+    TC1LOG("extended caps %s %02x %02x %02x %02x; MST cap %02x ctrl %02x; sink count %02x", haveExt ? "" : "(none)",
+           ext[0], ext[1], ext[2], ext[3], mstCap, mstCtl, sinkCount);
+    uint8_t lttpr[8] = {};
+    if (dpcd(false, 0xF0000, lttpr, 8)) {
+        TC1LOG("LTTPR caps %02x %02x count %02x mode %02x", lttpr[0], lttpr[1], lttpr[2], lttpr[3]);
+        if (mode == 1 && lttpr[2] && lttpr[3] != 0x55) {
+            uint8_t t = 0x55; dpcd(true, 0xF0003, &t, 1); TC1LOG("LTTPR set to transparent mode");
+        }
+    }
+    if (mode == 2) { off(); gTc1State = 2; TC1LOG("probe done, port released"); ifb_trail("tc1-probed"); return 0; }
+
+    const uint8_t *dp = (haveExt && (caps[0x0E] & 0x80)) ? ext : caps;
+    const uint8_t bw = rate == 270000 ? 0x0A : 0x14;
+    if (dp[1] < bw || (dp[2] & 0x1F) < 2) return fail(14, "the sink does not take this rate on 2 lanes");
+    const bool enh = (dp[2] & 0x80) != 0, tps3 = (dp[2] & 0x40) != 0;
+    // drm_dp_read_clock_recovery_delay / channel_eq_delay and i915's clock recovery tries
+    const unsigned rdi = dp[0x0E] & 0x7Fu;
+    const unsigned crUs = (dp[0] >= 0x14 || !rdi) ? 100u : rdi * 4000u, eqUs = rdi ? rdi * 4000u : 400u;
+    const int crTries = dp[0] >= 0x14 ? 10 : 80;
+    if (mstCtl) { uint8_t z = 0; dpcd(true, 0x111, &z, 1); TC1LOG("MST was on in the branch: set to SST"); }
+
+    // FIA lanes (intel_tc_port_set_fia_lane_count: 2 lanes, no reversal) and TC PLL 1 (mg_pll_enable): for DP the DCO
+    // is always 8.1 GHz, so with the 38.4 MHz reference only HSDIV/DSDIV/A_DIVRATIO change with the rate
+    gTc1Own.mle1Was = rd(FIA1_MLE1); gTc1Own.mle1 = true;
+    wr(FIA1_MLE1, (gTc1Own.mle1Was & ~0xFu) | 0x3u);
+    const uint32_t div2 = rate == 540000 ? 1u : 2u;                                   // HSDIV 3 for both rates
+    const uint32_t hsdiv = 1u, adiv = div2 >= 2 ? 10u : 5u, tline = div2 >= 2 ? 1u : 0u;
+    wr(PLL_EN, rd(PLL_EN) | (1u << 27)); gTc1Own.pll = true;
+    if (!waitBits(PLL_EN, 1u << 26, 1u << 26, 1000)) return fail(15, "TC PLL 1 power did not come up");
+    dklm(0x212C, 0x7u << 8, 1u << 8);                                            // REFCLKIN_CTL: OD_2_MUX 1
+    dklm(0x20D8, 0xFFu << 8, adiv << 8);                                         // CLKTOP2_CORECLKCTL1: A_DIVRATIO
+    dklm(0x20D4, (3u << 14) | (1u << 16) | (3u << 12) | (0xFu << 8),            // CLKTOP2_HSCLKCTL: TLINEDRV, DP input,
+         (tline << 14) | (hsdiv << 12) | (div2 << 8));                           //   HSDIV, DSDIV
+    dklm(0x2200, (0x1Fu << 16) | (0xFu << 12) | (0xFu << 8) | 0xFFu, 0x00084269u); // DIV0 (AFC startup kept: no VBT override)
+    dklm(0x2204, (0x1Fu << 16) | 0xFFu, 0x001C0027u);                            // DIV1: IREF_TRIM 28, TDC target 39
+    dklm(0x2210, (7u << 29) | (0xFFu << 16) | (7u << 11) | (1u << 9), 0x40002000u); // SSC off, IREF_NDIV 2, 4 steps
+    dklm(0x2214, (1u << 30) | (0x3FFFFFu << 8), 0x5E000000u);                    // BIAS: fraction 0x1E0000
+    dklm(0x2218, (0xFFu << 8) | 0xFFu, 0x00000052u);                             // TDC_COLDST_BIAS: feed-forward gain 82
+    (void)dkl(0x2218);
+    wr(PLL_EN, rd(PLL_EN) | (1u << 31));
+    if (!waitBits(PLL_EN, 1u << 30, 1u << 30, 5000)) return fail(16, "TC PLL 1 did not lock");
+
+    // tgl_ddi_pre_enable_dp: port clock, DDI IO power, Dekel DP x2 mode, transcoder clock and function, levels, D0
+    const uint32_t rateCode = rate == 270000 ? 1u : 2u;
+    const uint32_t ddiBuf = (1u << 1) /* 2 lanes */ | (rateCode << 20) | (1u << 6) /* ownership */ |
+                            ((((uint32_t)rate + 9999u) / 10000u) << 8) /* lane stagger, 100 ns */;
+    wr(DDI_CLK_SEL, 8u << 28); wr(DPCLKA, rd(DPCLKA) & ~DPCLKA_TC1_OFF); gTc1Own.clk = true;
+    if (!(rd(PW_DDI2) & (1u << 7))) { wr(PW_DDI2, rd(PW_DDI2) | (1u << 7)); gTc1Own.ddiIo = true; }
+    if (!waitBits(PW_DDI2, 1u << 6, 1u << 6, 2000)) return fail(17, "the DDI IO power well of TC1 did not come up");
+    for (uint32_t ln = 0; ln < 2; ln++) dklm(0x00A0 + ln * 0x1000, 0xC0u, 0x80u);     // DKL_DP_MODE: x2 (pin D, 2 lanes)
+    for (uint32_t ln = 0; ln < 2; ln++)                                              // WA_14018221282
+        if ((dkl(0x00A0 + ln * 0x1000) & 0xC0u) != 0x80u) dklm(0x00A0 + ln * 0x1000, 0xC0u, 0x80u);
+    wr(TRANS_CLK_SEL_B, 6u << 28); gTc1Own.clkSel = true;                            // PHY TC1 (5) + 1
+    const uint32_t func = kEnable | (4u << 27) /* port D */ | (2u << 24) /* DP SST */ | (1u << 17) | (1u << 16) |
+                          (1u << 1) /* 2 lanes */;
+    wr(FUNC2_B, 0); wr(FUNC_B, func & ~kEnable); gTc1Own.trans = true;
+    levels(0, 0);
+    { uint8_t d0 = 1; bool ok = false; for (int i = 0; i < 3 && !(ok = dpcd(true, 0x600, &d0, 1)); i++) IOSleep(1);
+      if (!ok) return fail(18, "the sink did not take D0"); }
+
+    // link training (intel_ddi_prepare_link_retrain, then clock recovery and channel equalisation as i915 does)
+    ifb_trail("tc1-train");
+    wr(TP_CTL_B, kEnable | (enh ? 1u << 18 : 0u)); (void)rd(TP_CTL_B);               // TPS1, SST
+    for (uint32_t ln = 0; ln < 2; ln++) dklm(0x0014 + ln * 0x1000, 1u << 11, 0);     // adlp_tbt_to_dp_alt_switch_wa
+    wr(DDI_BUF, ddiBuf | kEnable); (void)rd(DDI_BUF); gTc1Own.buf = true;
+    if (!waitBits(DDI_BUF, 1u << 7, 0, 10000)) return fail(19, "the DDI buffer did not leave idle");
+    { uint8_t m2[2] = { 0x00, 0x01 }, bs[2] = { bw, (uint8_t)(2 | (enh ? 0x80 : 0)) };
+      if (!dpcd(true, 0x107, m2, 2) || !dpcd(true, 0x100, bs, 2)) return fail(20, "the sink refused the link settings"); }
+    unsigned vs = 0, pe = 0, same = 1;
+    auto ts = [&]() { uint8_t t = (uint8_t)(vs | (pe << 3)); if (vs >= 3) t |= 1u << 2; if (pe >= 3) t |= 1u << 5; return t; };
+    auto request = [&](const uint8_t *st, unsigned &rv, unsigned &rp) {
+        rv = rp = 0;
+        for (int l = 0; l < 2; l++) {
+            const unsigned a = (st[4] >> (4 * l)) & 0xFu;
+            if ((a & 3u) > rv) rv = a & 3u;
+            if ((a >> 2) > rp) rp = a >> 2;
+        }
+        if (rv > 3u - rp) rv = 3u - rp;
+    };
+    uint8_t st[6] = {};
+    { uint8_t p[3] = { 0x21, ts(), ts() }; if (!dpcd(true, 0x102, p, 3)) return fail(21, "the sink refused TPS1"); }
+    bool cr = false;
+    for (int tries = 0; tries < crTries; tries++) {
+        if (crUs >= 1000) IOSleep(crUs / 1000); else IODelay(crUs);
+        if (!dpcd(false, 0x202, st, 6)) return fail(22, "lane status unreadable");
+        if ((st[0] & 0x11) == 0x11) { cr = true; break; }
+        if (vs >= 3) return fail(23, "clock recovery failed at the highest swing");
+        unsigned rv, rp; request(st, rv, rp);
+        if (rv == vs && rp == pe) { if (++same == 5) return fail(24, "clock recovery: the same request five times"); }
+        else same = 1;
+        vs = rv; pe = rp; levels(vs, pe);
+        uint8_t l2[2] = { ts(), ts() };
+        if (!dpcd(true, 0x103, l2, 2)) return fail(25, "the sink refused new levels");
+    }
+    if (!cr) return fail(26, "clock recovery did not finish");
+    TC1LOG("clock recovery done: swing %u pre-emphasis %u, status %02x", vs, pe, st[0]);
+    const uint32_t pat = (tps3 && rate >= 540000) ? 4u : 1u;                    // TPS3 at HBR2, otherwise TPS2
+    wr(TP_CTL_B, (rd(TP_CTL_B) & ~(7u << 8)) | (pat << 8));
+    { uint8_t p[3] = { (uint8_t)(0x20 | (pat == 4u ? 0x03 : 0x02)), ts(), ts() };
+      if (!dpcd(true, 0x102, p, 3)) return fail(27, "the sink refused TPS2/TPS3"); }
+    bool eq = false;
+    for (int tries = 0; tries < 5; tries++) {
+        if (eqUs >= 1000) IOSleep(eqUs / 1000); else IODelay(eqUs);
+        if (!dpcd(false, 0x202, st, 6)) return fail(22, "lane status unreadable");
+        if ((st[0] & 0x11) != 0x11) return fail(28, "clock recovery lost during equalisation");
+        if ((st[0] & 0x77) == 0x77 && (st[2] & 1)) { eq = true; break; }
+        unsigned rv, rp; request(st, rv, rp);
+        vs = rv; pe = rp; levels(vs, pe);
+        uint8_t l2[2] = { ts(), ts() };
+        if (!dpcd(true, 0x103, l2, 2)) return fail(25, "the sink refused new levels");
+    }
+    { uint8_t z = 0; dpcd(true, 0x102, &z, 1); }
+    if (!eq) return fail(29, "channel equalisation failed");
+    wr(TP_CTL_B, (rd(TP_CTL_B) & ~(7u << 8)) | (2u << 8));                           // idle patterns
+    if (!waitBits(TP_STATUS_B, 1u << 25, 1u << 25, 2000)) TC1LOG("idle patterns not confirmed (i915 only logs it)");
+    wr(TP_CTL_B, (rd(TP_CTL_B) & ~(7u << 8)) | (3u << 8));                           // normal pixels
+    { uint8_t z = 0; dpcd(true, 0x102, &z, 1); }
+    TC1LOG("link trained: rate %d x2, swing %u pre-emphasis %u, lanes %02x align %02x", rate, vs, pe, st[0], st[2]);
+    wr(MSA_B, (1u << 0) | (1u << 5));                                                // synchronous clock, 8 bpc RGB
+
+    // pipe and transcoder B (hsw_crtc_enable): 1920x1080, 2200x1125 totals, 148.5 MHz, +hsync +vsync
+    wr(PIPESRC_B, (1919u << 16) | 1079u);
+    wr(PIPE_MISC_B, (1u << 8) | (1u << 23));             // pixel rounding truncate, HDR-plane precision; 8 bpc
+    auto mn = [](uint64_t m, uint64_t n, uint32_t cn, uint32_t &om, uint32_t &on) {
+        uint64_t M = m * cn / n, N = cn;
+        while (M > 0xFFFFFFu || N > 0xFFFFFFu) { M >>= 1; N >>= 1; }
+        om = (uint32_t)M; on = (uint32_t)N;
+    };
+    uint32_t dm, dn, lm, lnn;
+    mn(148500ull * 24 / 8, (uint64_t)rate * 10 * 2 * 800000 / (1000000ull * 8), 0x8000000u, dm, dn);   // kB/s
+    mn(148500, (uint64_t)rate, 0x80000u, lm, lnn);                               // pixel clock / symbol clock
+    wr(DATA_M1_B, (63u << 25) | dm); wr(DATA_N1_B, dn); wr(LINK_M1_B, lm); wr(LINK_N1_B, lnn);
+    wr(SCL_B, 0); wr(VSYNCSHIFT_B, 0);
+    wr(HTOTAL(1), (2199u << 16) | 1919u); wr(HBLANK(1), (2199u << 16) | 1919u); wr(HSYNC(1), (2051u << 16) | 2007u);
+    wr(VTOTAL(1), (1124u << 16) | 1079u); wr(VBLANK(1), 1124u << 16);              // display 13: vblank start field 0
+    wr(VSYNC(1), (1088u << 16) | 1083u);
+    wr(TRANS_MULT_B, 0);
+    wr(CHICKEN_TRANS_B, rd(CHICKEN_TRANS_B) & ~(3u << 27));                          // frame start delay 1
+    wr(TRANSCONF(1), 0);                                                             // progressive, still off
+    wr(PIPE_CHICKEN_B, rd(PIPE_CHICKEN_B) | (1u << 7) | (1u << 15) | (1u << 30));   // icl_set_pipe_chicken
+    wr(LINETIME_B, (2200u * 8000u + 148500u / 2) / 148500u);                         // line time in 1/8 us
+    wr(GAMMA_MODE_B, 0); wr(CSC_MODE_B, 0);                                          // pixels pass unchanged
+    // plane 1 watermarks, its DBUF allocation and the MBUS credits as the firmware set them for the panel on pipe A:
+    // pipe B's S3-S4 pair holds the same 2048 blocks, and 1080p60 needs less than the panel
+    for (uint32_t o = 0; o <= 0x1C; o += 4) wr(WM_B + o, rd(WM_A + o));
+    wr(WM_B + 0x28, rd(WM_A + 0x28)); wr(WM_B + 0x3C, rd(WM_A + 0x3C)); wr(DBOX_B, rd(DBOX_A));
+
+    // intel_ddi_enable: function on, transcoder on, then the plane (skl_plane_ctl / glk_plane_color_ctl: XRGB8888,
+    // linear, ARB slots 1, plane gamma off) on the panel's surface
+    ifb_trail("tc1-enable");
+    wr(FUNC_B, func);
+    wr(PIPE_ARB_B, rd(PIPE_ARB_B) | (1u << 13));                                    // Wa_22012358565
+    wr(TRANSCONF(1), kEnable); (void)rd(TRANSCONF(1));
+    { const uint32_t d0 = rd(PIPEDSL_B); bool moving = false;
+      for (int i = 0; i < 100 && !(moving = rd(PIPEDSL_B) != d0); i++) IOSleep(1);
+      if (!moving) return fail(30, "the scanline of pipe B does not move"); }
+    wr(PLANE_COLOR_B, 1u << 13);
+    wr(PLANE_STRIDE(1), rd(PLANE_STRIDE(0)));
+    wr(PLANE_POS_B, 0); wr(PLANE_SIZE(1), (1079u << 16) | 1919u); wr(PLANE_OFFSET_B, 0);
+    wr(PLANE_KEYVAL_B, 0); wr(PLANE_KEYMSK_B, 0); wr(PLANE_KEYMAX_B, 0); wr(PLANE_AUX_DIST_B, 0); wr(PLANE_AUX_OFF_B, 0);
+    wr(PLANE_CTL(1), kEnable | (1u << 28) | (4u << 24));
+    gTc1Clone = true;
+    wr(PLANE_SURF(1), rd(PLANE_SURF(0)) & ~0xFFFu);
+    IOSleep(50);
+    const uint32_t f0 = rd(FRMCOUNT(1));
+    IOSleep(100);
+    const uint32_t f1 = rd(FRMCOUNT(1));
+    TC1LOG("lit: pipe B %u frames in 100 ms; TP_STATUS %08x DDI_BUF %08x FUNC %08x PLANE %08x SURF %08x", f1 - f0,
+           rd(TP_STATUS_B), rd(DDI_BUF), rd(FUNC_B), rd(PLANE_CTL(1)), rd(PLANE_SURF(1)));
+    gTc1State = 1;
+    ifb_trail("tc1-lit");
+    return 0;
+}
+
+static int ifb_tc1_sysctl SYSCTL_HANDLER_ARGS
+{
+    int v = gTc1State, err = sysctl_handle_int(oidp, &v, 0, req);
+    if (err || !req->newptr) return err;
+    if (v != 0 && v != 1 && v != 2) return EINVAL;
+    NMIntelFB *fb = gIfbRamFB;
+    if (!fb || !gTc1Lock) return ENODEV;
+    IOLockLock(gTc1Lock);
+    const int r = gIfbRamFB == fb ? fb->tc1Set(v) : -1;
+    IOLockUnlock(gTc1Lock);
+    return r < 0 ? EIO : 0;
+}
+SYSCTL_PROC(_debug, OID_AUTO, nmintelfb_tc1, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, nullptr, 0, ifb_tc1_sysctl, "I",
+            "2 = probe the USB-C sink over AUX, 1 = light the USB-C port as a 1080p60 clone of the panel, 0 = off; < 0 = failed step");
+SYSCTL_INT(_debug, OID_AUTO, nmintelfb_tc1_rate, CTLFLAG_RW | CTLFLAG_LOCKED, &gTc1Rate, 0,
+           "link rate for debug.nmintelfb_tc1 (270000, 540000)");
+static int ifb_tc1_log_sysctl SYSCTL_HANDLER_ARGS
+{
+    return sysctl_handle_string(oidp, gTc1Log, sizeof gTc1Log, req);
+}
+SYSCTL_PROC(_debug, OID_AUTO, nmintelfb_tc1_log, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED, nullptr, 0,
+            ifb_tc1_log_sysctl, "A", "the steps of the last debug.nmintelfb_tc1 change");
+
 // the Type-C/DBUF read-only dump
 static int ifb_tcdiag_sysctl SYSCTL_HANDLER_ARGS
 {
@@ -1678,8 +2098,10 @@ SYSCTL_QUAD(_debug, OID_AUTO, nmintelfb_flip_wait_us, CTLFLAG_RD | CTLFLAG_LOCKE
 SYSCTL_QUAD(_debug, OID_AUTO, nmintelfb_flip_late, CTLFLAG_RD | CTLFLAG_LOCKED, (SInt64 *)&gIfbFlipLate, "waits given up after 20 ms (that frame may tear)");
 static void ifb_ram_register(NMIntelFB *fb)
 {
-    sysctl_oid *o[] = { &sysctl__debug_nmintelfb_ram, &sysctl__debug_nmintelfb_regs, &sysctl__debug_nmintelfb_tcdiag, &sysctl__debug_nmintelfb_flips,
+    sysctl_oid *o[] = { &sysctl__debug_nmintelfb_ram, &sysctl__debug_nmintelfb_regs, &sysctl__debug_nmintelfb_tcdiag, &sysctl__debug_nmintelfb_tc1,
+                        &sysctl__debug_nmintelfb_tc1_rate, &sysctl__debug_nmintelfb_tc1_log, &sysctl__debug_nmintelfb_flips,
                         &sysctl__debug_nmintelfb_flip_waits, &sysctl__debug_nmintelfb_flip_wait_us, &sysctl__debug_nmintelfb_flip_late };
+    if (fb && !gTc1Lock) gTc1Lock = IOLockAlloc();
     if (fb && !gIfbRamFB) { gIfbRamFB = fb; for (sysctl_oid *x : o) sysctl_register_oid(x); }
     else if (!fb && gIfbRamFB) { for (sysctl_oid *x : o) sysctl_unregister_oid(x); gIfbRamFB = nullptr; }
 }
