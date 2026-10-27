@@ -25,6 +25,14 @@
       <key>IOPropertyMatch</key><dict><key>nm-intel-panel</key><true/></dict>
       <key>IOProbeScore</key><integer>60000</integer>
     </dict>
+    <!-- the USB-C screen, on the nub NMIntelFBClaim publishes beside the panel's (nullmoth-intelfb-usbc=1) -->
+    <key>NMIntelFBUSBC</key><dict>
+      <key>CFBundleIdentifier</key><string>com.nullmoth.NMIntelFB</string>
+      <key>IOClass</key><string>NMIntelFB</string>
+      <key>IOProviderClass</key><string>NVRMDisplay</string>
+      <key>IOPropertyMatch</key><dict><key>nm-intel-usbc</key><true/></dict>
+      <key>IOProbeScore</key><integer>60000</integer>
+    </dict>
     <key>NMIntelFB</key><dict>
       <key>CFBundleIdentifier</key><string>com.nullmoth.NMIntelFB</string>
       <key>IOClass</key><string>NMIntelFB</string>
