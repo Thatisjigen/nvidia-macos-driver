@@ -80,7 +80,7 @@ static size_t nvidiaAudioIds(uint16_t *ids, size_t max) {
 
 // Lilu keeps its log in its own buffer, so the outcome is also kept in a read-only sysctl, debug.nmhda (the newest
 // lines, oldest first), which Send logs and a user can read at any time after boot.
-static char gReport[512];
+static char gReport[1024];
 SYSCTL_STRING(_debug, OID_AUTO, nmhda, CTLFLAG_RD | CTLFLAG_KERN, gReport, sizeof(gReport), "NVIDIA HD Audio table patch");
 static void report(const char *, const char *fmt, ...) {
     char line[160]; va_list ap; va_start(ap, fmt); vsnprintf(line, sizeof line, fmt, ap); va_end(ap);
@@ -107,6 +107,18 @@ static uint32_t numberValue(OSDictionary *dict, const char *key) {
     auto number = OSDynamicCast(OSNumber, dict->getObject(key));
     return number ? number->unsigned32BitValue() : 0xFFFFFFFF;
 }
+// AppleALC's controller patch replaces the PCI device-id read in AppleHDAController::probe with a fixed Intel id, so every
+// controller of the machine probes with it: 0x9D70, 0xA170 or 0xA348 in AppleALC 1.9.8 (0xA348 for Raptor Lake-P 0x51CA).
+static const uint16_t kAlcSourceDid[] { 0x9D70, 0xA170, 0xA348 };
+static bool hasTranslation(OSArray *entries, uint32_t layout, uint32_t source, uint32_t device) {
+    for (unsigned i = 0; i < entries->getCount(); i++) {
+        auto entry = OSDynamicCast(OSDictionary, entries->getObject(i));
+        if (entry && numberValue(entry, "LayoutID") == layout && numberValue(entry, "VID") == 0x10DE &&
+            numberValue(entry, "SourceDID") == source && numberValue(entry, "StandInDID") == device)
+            return true;
+    }
+    return false;
+}
 static bool restoreNvidiaDeviceId(IOService *self, IOService *provider) {
     uint32_t layout = readU32(provider, "layout-id");
     uint32_t device = readU32(provider, "device-id");
@@ -114,22 +126,20 @@ static bool restoreNvidiaDeviceId(IOService *self, IOService *provider) {
     if (layout == 0xFFFFFFFF) return true;
     if (device == 0xFFFFFFFF) return false;
     auto existing = OSDynamicCast(OSArray, self->getProperty("HwFactoryPrefixTranslation"));
-    if (existing) {
-        for (unsigned i = 0; i < existing->getCount(); i++) {
-            auto entry = OSDynamicCast(OSDictionary, existing->getObject(i));
-            if (entry && numberValue(entry, "LayoutID") == layout && numberValue(entry, "VID") == 0x10DE &&
-                numberValue(entry, "SourceDID") == 0x9D70 && numberValue(entry, "StandInDID") == (device & 0xFFFF))
-                return true;
-        }
+    auto entries = existing ? OSArray::withArray(existing) : OSArray::withCapacity(arrsize(kAlcSourceDid));
+    if (!entries) return false;
+    bool ok = true, added = false;
+    for (auto source : kAlcSourceDid) {
+        if (hasTranslation(entries, layout, source, device & 0xFFFF)) continue;
+        auto entry = OSDictionary::withCapacity(4);
+        ok = entry && setNumber(entry, "LayoutID", layout) && setNumber(entry, "VID", 0x10DE) &&
+            setNumber(entry, "SourceDID", source) && setNumber(entry, "StandInDID", device & 0xFFFF) && entries->setObject(entry);
+        if (entry) entry->release();
+        if (!ok) break;
+        added = true;
     }
-    auto entries = existing ? OSArray::withArray(existing) : OSArray::withCapacity(1);
-    auto entry = OSDictionary::withCapacity(4);
-    bool ok = entries && entry && setNumber(entry, "LayoutID", layout) &&
-        setNumber(entry, "VID", 0x10DE) && setNumber(entry, "SourceDID", 0x9D70) &&
-        setNumber(entry, "StandInDID", device & 0xFFFF) && entries->setObject(entry) &&
-        self->setProperty("HwFactoryPrefixTranslation", entries);
-    if (entry) entry->release();
-    if (entries) entries->release();
+    if (ok && added) ok = self->setProperty("HwFactoryPrefixTranslation", entries);
+    entries->release();
     return ok;
 }
 static IOService *wrapProbe(IOService *self, IOService *provider, SInt32 *score) {
