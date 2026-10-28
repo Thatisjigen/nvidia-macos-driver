@@ -37,6 +37,8 @@ static bool nvrm_kernel_supported(void) { return version_major == 24 || version_
 #include "nvrm_gpuva_abi.h"
 #define NVRM_SS_KERNEL_ABI 1
 #include "nvrm_surfshare_abi.h"
+extern "C" void nvgfx_power_start(nv_state_t *nv);   // NvGfx nvrm_power.cpp (nvrmtgp)
+extern "C" void nvgfx_power_stop(void);
 extern "C" int nvrm_surfshare_rm(struct NVRMSurfShareRm *);
 extern "C" int nvrm_surfshare_pageoff(struct NVRMSurfPageoff *, void *nv);
 extern "C" task_t current_task(void);
@@ -1483,6 +1485,7 @@ IOReturn NVRM::go(uint32_t pass)
         }
         publishGpuProfile();
         if (nvkms_xnu_load()) nvrm_display_publish(this, fNv.gpu_id);
+        nvgfx_power_start(nv);   // boot-arg nvrmtgp=1: GSP TGP mode while on AC; without it nothing happens
     }
     return kIOReturnSuccess;
 }
@@ -1505,6 +1508,7 @@ void NVRM::interruptOccurred(IOInterruptEventSource *src, int count)
 
 void NVRM::stop(IOService *provider)
 {
+    nvgfx_power_stop();
     // Keep the lock until free(): another service can retain this object and
     // call its platform interface after stop(), when it must answer NotReady.
     if (fUtilizationLock) {
