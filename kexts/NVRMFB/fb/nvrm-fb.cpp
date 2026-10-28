@@ -1653,9 +1653,21 @@ void NVRMNVDAFramebuffer::hotplugFire(thread_call_param_t, thread_call_param_t)
     }
     for (unsigned f = 0; f < nrelight; f++) {
         NVRMNVDAFramebuffer *fb = relight[f];
-        bool ok = !OSAddAtomic(0, &fb->fStopping) && !fb->fHeadSlept && fb->reflip();
-        FBLOG("hot-plug: display 0x%x is back (fb %u): head %u lit again -> ok %u rc %d",
-              fb->fDisplay, fb->fIndex, fb->fHead, (unsigned)ok, fb->fReflipRc);
+        // ANV15-52: fHeadSlept also stays set when a wake could not light the head (its display was unplugged
+        // during the sleep), and then this skipped the head and logged the wake's stale rc (only a later
+        // WindowServer mode set lit it). A head is left to setPowerState(1) only while the display is asleep or the GPU
+        // is in standby.
+        bool ok = false, asleep = false;
+        if (!OSAddAtomic(0, &fb->fStopping)) {
+            NVRMDisplayGate gate;
+            asleep = fb->fHeadSlept && (!fb->fPowerOn || !fb->rmGpuReady());
+            if (!asleep && gate.valid()) {
+                ok = fb->reflip();
+                if (ok) fb->fHeadSlept = false;
+            }
+        }
+        FBLOG("hot-plug: display 0x%x is back (fb %u): head %u %s -> ok %u rc %d", fb->fDisplay, fb->fIndex, fb->fHead,
+              asleep ? "left for the display wake" : "lit again", (unsigned)ok, asleep ? 0 : fb->fReflipRc);
         if (!OSAddAtomic(0, &fb->fStopping) && !fb->fDpyLost) {
             const bool swapped = fb->fEdidSwapped;
             fb->fEdidSwapped = false;
@@ -3237,6 +3249,9 @@ IOReturn NVRMNVDAFramebuffer::switchMode(IODisplayModeID id, const struct NvKmsK
     struct NvKmsKapiSurface *old = fSurf;
     fSurf = ns; fFrontSurf = ns; fMode = m; fW = w; fH = h; fPitch = pitch;
     fRasterW = m.timings.hVisible; fRasterH = m.timings.vVisible; fCurId = id; fModeSet = true; fModeSwitches++;
+    // ANV15-52: the committed mode lit the head. A flag left set (the wake failed, then
+    // WindowServer set a mode after the replug) made the next display sleep skip the head-off and dropped gamma tables.
+    fHeadSlept = false;
     fCurShownKnown = false;   // the mode set named no cursor
     publishFlipWait();
     fHwVblTries = 0;   // a new mode gets its own hardware-vblank tries (fModeSet stays set, so vblFire would not reset them)
@@ -4192,6 +4207,12 @@ bool NVRMNVDAFramebuffer::setHeadPower(bool awake)
         // NVRM's "NVRMGpuPower" 1 lights the head once the GPU is back.
         if (!rmGpuReady()) {
             FBLOG("display wake: GPU not resumed yet - head %u is lit when NVRM resumes it", fHead);
+            return true;
+        }
+        // ANV15-52: a display unplugged before the sleep is still gone at wake, and NVKMS refused the mode set
+        // naming it ("NVKMS ioctl 9 refused", wake FAILED). The head stays off; hotplugFire lights it.
+        if (fDpyLost) {
+            FBLOG("display wake: display 0x%x is disconnected - head %u stays off until it is back", fDisplay, fHead);
             return true;
         }
         const bool ok = reflip();
