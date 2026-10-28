@@ -11,6 +11,10 @@
  *   debug.nvgfx_tgp_ac           RO  last _PSR reading: 1 AC, 0 battery, -1 unknown
  *   debug.nvgfx_tgp_last_status  RO  NV_STATUS of the last control
  *   debug.nvgfx_tgp_applies      RO  controls sent
+ *
+ * without the boot-arg the manager is armed too, but with enable 0, and it sends nothing to GSP
+ * until root sets debug.nvgfx_tgp_enable=1 (runtime opt-in, no EFI change); "off" goes out only after an "on". The
+ * sysctls are unregistered on stop.
  */
 // <wtl> fork: nvgfx | author: watchthelight </wtl>
 
@@ -42,6 +46,7 @@ static thread_call_t gTgpCall;
 static nv_state_t *gTgpNv;
 static volatile SInt32 gTgpStopping, gTgpRunning;
 static int gTgpFails;
+static bool sysctlsUp;   // anv1552: file scope, so nvgfx_power_stop can unregister
 
 static void nvgfx_tgp_arm(uint32_t ms)
 {
@@ -71,7 +76,8 @@ static void nvgfx_tgp_tick_body(void)
     // Unknown power source: keep what was applied rather than flapping; first decision needs a reading.
     const int want = gTgpAc < 0 ? gTgpState : (gTgpEnable && gTgpAc == 1) ? 1 : 0;
 
-    if (want >= 0 && want != gTgpState) {
+    // anv1552: nothing sent yet and nothing wanted: GSP is still at its default, leave it alone.
+    if (want >= 0 && want != gTgpState && (gTgpState >= 0 || want == 1)) {
         NvU8 b = (NvU8)want;
         NV_STATUS st = rm_nvgfx_phys_control(gTgpNv, NVRM_PHYSCTL_PHYS_SUBDEV, 0, 0, NVGFX_CTRL_CONFIGURE_TGP_MODE, &b, sizeof b);
         gTgpLastStatus = (int)st;
@@ -94,9 +100,9 @@ static void nvgfx_tgp_tick_body(void)
 extern "C" void nvgfx_power_start(nv_state_t *nv)
 {
     int v = 0;
-    if (!PE_parse_boot_argn("nvrmtgp", &v, sizeof(v)) || !v) return;
+    const bool bootArg = PE_parse_boot_argn("nvrmtgp", &v, sizeof(v)) && v;
     if (gTgpCall || !nv) return;
-    static bool sysctlsUp;
+    gTgpEnable = bootArg ? 1 : 0;   // anv1552: no boot-arg = armed but off until debug.nvgfx_tgp_enable=1
     if (!sysctlsUp) {
         sysctlsUp = true;
         sysctl_register_oid(&sysctl__debug_nvgfx_tgp_enable); sysctl_register_oid(&sysctl__debug_nvgfx_tgp_state);
@@ -107,7 +113,9 @@ extern "C" void nvgfx_power_start(nv_state_t *nv)
     gTgpStopping = 0;
     gTgpCall = thread_call_allocate(nvgfx_tgp_tick, NULL);
     if (!gTgpCall) { kprintf("NVRM-xnu: nvgfx TGP: no thread call\n"); return; }
-    kprintf("NVRM-xnu: nvgfx TGP mode manager armed (nvrmtgp=1), first check in %u ms\n", NVGFX_TGP_FIRST_MS);
+    kprintf("NVRM-xnu: nvgfx TGP mode manager armed (%s), first check in %u ms\n",
+            bootArg ? "nvrmtgp=1" : "off until debug.nvgfx_tgp_enable=1", NVGFX_TGP_FIRST_MS);
+    IOLog("NVRM-xnu: nvgfx TGP mode manager armed, enable %d\n", gTgpEnable);
     nvgfx_tgp_arm(NVGFX_TGP_FIRST_MS);
 }
 
@@ -123,4 +131,10 @@ extern "C" void nvgfx_power_stop(void)
     for (int i = 0; i < 100 && !thread_call_free(gTgpCall); i++) { IOSleep(10); thread_call_cancel(gTgpCall); }
     gTgpCall = NULL;
     gTgpNv = NULL;
+    if (sysctlsUp) {   // anv1552: the OIDs live in this kext; drop them before it can be unloaded
+        sysctlsUp = false;
+        sysctl_unregister_oid(&sysctl__debug_nvgfx_tgp_enable); sysctl_unregister_oid(&sysctl__debug_nvgfx_tgp_state);
+        sysctl_unregister_oid(&sysctl__debug_nvgfx_tgp_ac); sysctl_unregister_oid(&sysctl__debug_nvgfx_tgp_last_status);
+        sysctl_unregister_oid(&sysctl__debug_nvgfx_tgp_applies);
+    }
 }
