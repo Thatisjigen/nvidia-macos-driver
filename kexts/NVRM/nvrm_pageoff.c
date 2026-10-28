@@ -84,9 +84,11 @@ static NV_STATUS _nvrmCopyLocked(OBJGPU *pGpu, NvU32 hClient, NvU32 hMemory, con
         }
         if (st == NV_OK) {
             NvU32 spins = 0;
+            // sleep 1 ms per check instead of spinning 10 us under RM's
+            // locks; the timeout stays about 2 s.
             while (ceutilsUpdateProgress(pMemoryManager->pCeUtils) < workId) {
-                if (++spins > 200000) { st = NV_ERR_TIMEOUT; break; }
-                osDelayUs(10);
+                if (++spins > 2000) { st = NV_ERR_TIMEOUT; break; }
+                os_delay(1);
             }
         }
         return st;
