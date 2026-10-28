@@ -3810,7 +3810,9 @@ unsigned NVRMNVDAFramebuffer::addKmsRefreshModes(unsigned n)
         // 720x576 ... on a 2560x1440 panel) and the login window came up black on a 2560x1440@180 DisplayPort monitor
         // until the user logged in blind; with this block removed it showed again on that machine. Smaller desktops still
         // come from macOS's own scaled modes on the native raster.
-        const bool larger = fBootW && k.hVisible >= fBootW && k.vVisible >= fBootH && (k.hVisible > fBootW || k.vVisible > fBootH);
+        // ANV15-52: no raster larger than the boot raster. The LG on the HDMI (1080p, 144 Hz boot raster) was
+        // offered NVKMS's 3840x2160 rasters and went black when macOS picked one; its desktops come from scaled modes.
+        const bool larger = false;
         const bool bootRaster = fBootW && k.hVisible == fBootW && k.vVisible == fBootH;
         // nvfbsmall=1 offers the smaller ones as well: where NVKMS refuses macOS's scaled modes on the native raster (a
         // 4K-only firmware raster on an HDMI dummy plug), they are the only way to a desktop below the boot size.
