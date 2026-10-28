@@ -239,6 +239,16 @@ static volatile bool gIfbPanelDone = false;      // the panel's start() returned
 static volatile bool gIfbPanelOpen = false;      // IOGraphics opened the panel (slot 0 of the own group)
 static IOLock *volatile gIfbVramLock = nullptr;  // the VRAM table gIfbVram is shared by both instances
 static unsigned ifb_nvrm_heads(void);
+// one mode of the USB-C port: pixel clock in kHz, sync start/end and totals as the transcoder takes
+// them (counted from 0 at the first active pixel/line), sync polarities, and the DP link rate tc1Set trains for it
+struct Tc1Mode { uint32_t clock, w, hss, hse, ht, h, vss, vse, vt; bool phs, pvs; int rate; };
+static const Tc1Mode kTc1Cea1080p60 = { 148500, 1920, 2008, 2052, 2200, 1080, 1084, 1089, 1125, true, true, 270000 };
+static Tc1Mode gTc1Mode = kTc1Cea1080p60;   // what the next tc1Set(1) lights (under gTc1Lock)
+static uint8_t gTc1Edid[512];               // the sink's EDID, read by tc1Set(2) and tc1Set(3)
+static unsigned gTc1EdidLen = 0;
+static uint8_t gTc1MaxBw = 0;               // the sink's highest link rate code (DPCD 0x001, or 0x2201 with extended caps)
+static uint32_t gTc1DfpMaxKhz = 0;          // a DP-to-HDMI/DVI branch's max TMDS clock (DPCD 0x081), 0 when none is stated
+static const unsigned kUsbcMaxModes = 24;
 
 class NMIntelFB : public IOFramebuffer {
     OSDeclareDefaultStructors(NMIntelFB)
@@ -324,6 +334,20 @@ public:
     int tc1Set(int mode, uint32_t surf = ~0u, uint32_t stride = 0);
     bool fUsbc = false;   // this instance is the USB-C screen (nub nm-intel-usbc), not the panel
     bool usbcStart(IOService *provider);
+    // the USB-C screen's modes (from the sink's EDID; CEA 1080p60 alone without one), mode IDs 1..fNModes,
+    // and the EDID itself, handed to IODisplay through getDDCBlock
+    Tc1Mode fModes[kUsbcMaxModes] = {};
+    unsigned fNModes = 0, fCurMode = 1;
+    uint8_t fEdid[512] = {};
+    unsigned fEdidLen = 0;
+    uint32_t fMaxHeight = 0;   // the rows the screen's memory holds (every mode fits in it)
+    uint32_t fBadModes = 0;    // bit i: mode i + 1 did not light; refused from then on, never the default
+    void usbcAdopt(unsigned i);
+    IOReturn usbcSetMode(IODisplayModeID id);
+    int usbcLight(unsigned i);
+    unsigned usbcCea60();
+    IODisplayModeID usbcDefault() const { for (unsigned i = 0; i < fNModes; i++) if (!(fBadModes & (1u << i))) return (IODisplayModeID)(i + 1); return (IODisplayModeID)fCurMode; }
+    const Tc1Mode *usbcMode(IODisplayModeID id) const { return (fUsbc && id >= 1 && (unsigned)id <= fNModes) ? &fModes[id - 1] : nullptr; }
     void tcDiagInto(char *b, size_t n) {
         if (!fRegs) { snprintf(b, n, "no registers\n"); return; }
         size_t o = 0;
@@ -370,6 +394,7 @@ private:
                 me->fVbl.proc(me->fVbl.target, me->fVbl.ref); me->fVblCalls++;
             }
             uint64_t now = mach_absolute_time();
+            nanoseconds_to_absolutetime(me->fFrameNs, &period);   // the USB-C screen's refresh changes with its mode
             next += period; if (next <= now) next = now + period;
         }
         me->fVblRunning = false;
@@ -447,16 +472,48 @@ public:
     bool isConsoleDevice() override { IFB_ONCE("con"); return !fUsbc; }
     IODeviceMemory *getApertureRange(IOPixelAperture aperture) override;
     const char *getPixelFormats() override { return IO32BitDirectPixels "\0"; }
-    IOItemCount getDisplayModeCount() override { IFB_ONCE("dmc"); return 1; }
-    IOReturn getDisplayModes(IODisplayModeID *modes) override { IFB_ONCE("dms"); modes[0] = 1; return kIOReturnSuccess; }
+    // the USB-C screen lists its modes (IDs 1..fNModes); the panel keeps its one mode, ID 1
+    IOItemCount getDisplayModeCount() override { IFB_ONCE("dmc"); return fUsbc && fNModes ? fNModes : 1; }
+    IOReturn getDisplayModes(IODisplayModeID *modes) override {
+        IFB_ONCE("dms");
+        const unsigned n = fUsbc && fNModes ? fNModes : 1;
+        for (unsigned i = 0; i < n; i++) modes[i] = (IODisplayModeID)(i + 1);
+        return kIOReturnSuccess;
+    }
     IOReturn getInformationForDisplayMode(IODisplayModeID mode, IODisplayModeInformation *info) override;
     UInt64 getPixelFormatsForDisplayMode(IODisplayModeID, IOIndex) override { return 0; }
     IOReturn getPixelInformation(IODisplayModeID mode, IOIndex depth, IOPixelAperture aperture, IOPixelInformation *pi) override;
-    IOReturn getCurrentDisplayMode(IODisplayModeID *mode, IOIndex *depth) override { IFB_ONCE("cdm"); *mode = 1; *depth = 0; return kIOReturnSuccess; }
+    IOReturn getCurrentDisplayMode(IODisplayModeID *mode, IOIndex *depth) override {
+        IFB_ONCE("cdm"); *mode = fUsbc && fNModes ? (IODisplayModeID)fCurMode : 1; *depth = 0; return kIOReturnSuccess;
+    }
     IOReturn getStartupDisplayMode(IODisplayModeID *mode, IOIndex *depth) override { IFB_ONCE("sdm"); return getCurrentDisplayMode(mode, depth); }
+    // the sink's EDID for IODisplay (name, size, serial for macOS's display preferences), as NVRMFB hands its own
+    bool hasDDCConnect(IOIndex) override { IFB_ONCE("ddc"); return fUsbc && fEdidLen >= 128; }
+    IOReturn getDDCBlock(IOIndex, UInt32 block, IOSelect type, IOOptionBits, UInt8 *data, IOByteCount *length) override {
+        IFB_ONCE("ddcb");
+        if (!fUsbc || type != kIODDCBlockTypeEDID || !block || block > fEdidLen / 128 || !data || !length) return kIOReturnUnsupported;
+        if (*length < 128) return kIOReturnBadArgument;
+        memcpy(data, fEdid + (block - 1) * 128, 128); *length = 128;
+        return kIOReturnSuccess;
+    }
     // WindowServer showed the panel at 0.00 Hz without this (virtual panel)
     IOReturn getTimingInfoForDisplayMode(IODisplayModeID mode, IOTimingInformation *info) override {
         IFB_ONCE("tim");
+        if (fUsbc && fNModes) {
+            const Tc1Mode *m = usbcMode(mode);
+            if (!m || !info) return kIOReturnUnsupportedMode;
+            bzero(info, sizeof(*info));
+            info->appleTimingID = kIOTimingIDInvalid;
+            IODetailedTimingInformationV2 &d = info->detailedInfo.v2;
+            d.pixelClock = d.minPixelClock = d.maxPixelClock = (UInt64)m->clock * 1000;
+            d.horizontalActive = m->w; d.horizontalBlanking = m->ht - m->w;
+            d.horizontalSyncOffset = m->hss - m->w; d.horizontalSyncPulseWidth = m->hse - m->hss;
+            d.verticalActive = m->h; d.verticalBlanking = m->vt - m->h;
+            d.verticalSyncOffset = m->vss - m->h; d.verticalSyncPulseWidth = m->vse - m->vss;
+            d.horizontalSyncConfig = m->phs ? 1 : 0; d.verticalSyncConfig = m->pvs ? 1 : 0;
+            info->flags = kIODetailedTimingValid;
+            return kIOReturnSuccess;
+        }
         if (mode != 1 || !info) return kIOReturnUnsupportedMode;
         bzero(info, sizeof(*info));
         info->appleTimingID = kIOTimingIDInvalid;
@@ -470,7 +527,11 @@ public:
         info->flags = kIODetailedTimingValid;
         return kIOReturnSuccess;
     }
-    IOReturn setDisplayMode(IODisplayModeID mode, IOIndex depth) override { IFB_ONCE("setdm"); return (mode == 1 && depth == 0) ? kIOReturnSuccess : kIOReturnUnsupported; }
+    IOReturn setDisplayMode(IODisplayModeID mode, IOIndex depth) override {
+        IFB_ONCE("setdm");
+        if (fUsbc && fNModes) return depth == 0 ? usbcSetMode(mode) : kIOReturnUnsupported;
+        return (mode == 1 && depth == 0) ? kIOReturnSuccess : kIOReturnUnsupported;
+    }
     IOItemCount getConnectionCount() override { IFB_ONCE("cc"); return 1; }
     IOReturn callPlatformFunction(const OSSymbol *fn, bool wait, void *p1, void *p2, void *p3, void *p4) override;
     IOReturn registerForInterruptType(IOSelect type, IOFBInterruptProc proc, OSObject *target, void *ref, void **iref) override {
@@ -502,13 +563,20 @@ public:
         if (!fUsbc && !ordinal && gTc1Lock && gTc1State == 1 && !gTc1ForUsbc) { IOLockLock(gTc1Lock); tc1Set(0); IOLockUnlock(gTc1Lock); }
         // the USB-C screen keeps its link through display sleep (no retraining in this callout every time);
         // after a system sleep pipe B is off: the screen's GGTT entries go back and the port is lit again
-        if (fUsbc && ordinal && gTc1Lock && gTc1ForUsbc && fRegs && !(rd(TRANSCONF(1)) & kEnable)) {
+        // tested under the lock (a mode change may have the transcoder off for a moment), and with the
+        // fallback to CEA 1080p60 when the mode it had does not light
+        if (fUsbc && ordinal && gTc1Lock && fRegs) {
             IOLockLock(gTc1Lock);
-            if (fRam[0]) ramPtes(0, true);
-            tc1Set(-1);   // forget what the last lighting turned on: the hardware lost it
-            const int r = tc1Set(1, fSurf, fRowBytes);
+            const bool off = gTc1ForUsbc && !(rd(TRANSCONF(1)) & kEnable);
+            int lit = -2;
+            if (off) {
+                if (fRam[0]) ramPtes(0, true);
+                tc1Set(-1);   // forget what the last lighting turned on: the hardware lost it
+                lit = usbcLight(fCurMode - 1);
+            }
             IOLockUnlock(gTc1Lock);
-            IFBLOG("usbc: lit again after power on: %d", r);
+            if (off) IFBLOG("usbc: lit again after power on: mode %d", lit + 1);
+            if (lit >= 0 && (unsigned)lit + 1 != fCurMode) usbcAdopt((unsigned)lit);
         }
         handleEvent(ordinal ? kIOFBNotifyDidPowerOn : kIOFBNotifyWillPowerOff);
         ifb_trail("sp-done");
@@ -536,9 +604,11 @@ public:
         default: return IOFramebuffer::setAttributeForConnection(idx, attribute, value);
         }
     }
-    IOReturn connectFlags(IOIndex, IODisplayModeID, IOOptionBits *flags) override {
+    IOReturn connectFlags(IOIndex, IODisplayModeID mode, IOOptionBits *flags) override {
         IFB_ONCE("cf");
-        if (flags) *flags = kDisplayModeValidFlag | kDisplayModeSafeFlag | kDisplayModeDefaultFlag;
+        // the default is the sink's preferred mode, or the first after it that did not fail to light
+        if (fUsbc && fNModes && (!usbcMode(mode) || (fBadModes & (1u << (mode - 1))))) return kIOReturnUnsupportedMode;
+        if (flags) *flags = kDisplayModeValidFlag | kDisplayModeSafeFlag | (!fUsbc || mode == usbcDefault() ? kDisplayModeDefaultFlag : 0);
         return kIOReturnSuccess;
     }
     IODeviceMemory *getVRAMRange() override { IFB_ONCE("vram"); return getApertureRange(kIOFBSystemAperture); }
@@ -873,15 +943,233 @@ static void ifb_usbc_guard(void *, wait_result_t)
     thread_terminate(current_thread());
 }
 
+// The USB-C screen's modes from the sink's EDID, read as Linux's drm_edid.c reads them: detailed
+// timings (base block, CEA-861 extension, DisplayID type I and VII), then the CEA short video descriptors and the
+// established and standard timings that name a mode in the tables below. Kept: progressive, no larger than 1920x1080
+// (the screen's memory; also the widest plane pipe A's watermarks cover, which tc1Set copies), no faster pixel clock
+// than the panel's (the same watermarks), and one that 2 DP lanes carry at 24 bpp: at HBR, or at HBR2 when the sink takes
+// it. One mode per size and refresh, the first found. Mode 1 is the EDID's preferred timing when it is kept.
+static char gIfbUsbcModes[1280];        // the list, for sysctl debug.nmintelfb_usbc_modes
+static volatile unsigned gIfbUsbcCur;   // the mode on screen
+// CEA-861 VICs with square pixels up to 1920x1080 (rate 0: chosen per mode)
+static const struct { uint8_t vic; Tc1Mode m; } kIfbVic[] = {
+    { 1,  { 25175, 640, 656, 752, 800, 480, 490, 492, 525, false, false, 0 } },
+    { 4,  { 74250, 1280, 1390, 1430, 1650, 720, 725, 730, 750, true, true, 0 } },
+    { 16, { 148500, 1920, 2008, 2052, 2200, 1080, 1084, 1089, 1125, true, true, 0 } },
+    { 19, { 74250, 1280, 1720, 1760, 1980, 720, 725, 730, 750, true, true, 0 } },
+    { 31, { 148500, 1920, 2448, 2492, 2640, 1080, 1084, 1089, 1125, true, true, 0 } },
+    { 32, { 74250, 1920, 2558, 2602, 2750, 1080, 1084, 1089, 1125, true, true, 0 } },
+    { 33, { 74250, 1920, 2448, 2492, 2640, 1080, 1084, 1089, 1125, true, true, 0 } },
+    { 34, { 74250, 1920, 2008, 2052, 2200, 1080, 1084, 1089, 1125, true, true, 0 } },
+    { 63, { 297000, 1920, 2008, 2052, 2200, 1080, 1084, 1089, 1125, true, true, 0 } },
+    { 64, { 297000, 1920, 2448, 2492, 2640, 1080, 1084, 1089, 1125, true, true, 0 } },
+};
+// VESA DMT modes at 60 Hz that established and standard timings name (drm_edid.c's drm_dmt_modes)
+static const Tc1Mode kIfbDmt60[] = {
+    { 25175, 640, 656, 752, 800, 480, 490, 492, 525, false, false, 0 },
+    { 40000, 800, 840, 968, 1056, 600, 601, 605, 628, true, true, 0 },
+    { 65000, 1024, 1048, 1184, 1344, 768, 771, 777, 806, false, false, 0 },
+    { 74250, 1280, 1390, 1430, 1650, 720, 725, 730, 750, true, true, 0 },
+    { 83500, 1280, 1352, 1480, 1680, 800, 803, 809, 831, false, true, 0 },
+    { 108000, 1280, 1376, 1488, 1800, 960, 961, 964, 1000, true, true, 0 },
+    { 108000, 1280, 1328, 1440, 1688, 1024, 1025, 1028, 1066, true, true, 0 },
+    { 106500, 1440, 1520, 1672, 1904, 900, 903, 909, 934, false, true, 0 },
+    { 108000, 1600, 1624, 1704, 1800, 900, 901, 904, 1000, true, true, 0 },
+    { 146250, 1680, 1784, 1960, 2240, 1050, 1053, 1059, 1089, false, true, 0 },
+    { 148500, 1920, 2008, 2052, 2200, 1080, 1084, 1089, 1125, true, true, 0 },
+};
+static uint32_t ifb_mode_mhz(const Tc1Mode &m) { return (uint32_t)((uint64_t)m.clock * 1000000ull / ((uint64_t)m.ht * m.vt)); }
+static bool ifb_mode_same(const Tc1Mode &a, const Tc1Mode &b)
+{
+    return a.clock == b.clock && a.w == b.w && a.hss == b.hss && a.hse == b.hse && a.ht == b.ht && a.h == b.h && a.vss == b.vss &&
+           a.vse == b.vse && a.vt == b.vt && a.phs == b.phs && a.pvs == b.pvs;
+}
+struct IfbModeList { Tc1Mode *m; unsigned n, max; uint32_t maxClock; uint8_t maxBw; };
+static void ifb_mode_add(IfbModeList &l, Tc1Mode m)
+{
+    if (l.n >= l.max || m.w < 640 || m.w > 1920 || m.h < 480 || m.h > 1080) return;
+    if (!(m.hss > m.w && m.hse > m.hss && m.ht >= m.hse && m.ht - m.w >= 32 && m.ht <= 8192)) return;   // i915: no 0 front porch
+    if (!(m.vss > m.h && m.vse > m.vss && m.vt >= m.vse && m.vt - m.h >= 5 && m.vt <= 8192)) return;   // i915: vblank >= 5
+    if (!m.clock || m.clock > l.maxClock) return;
+    const uint32_t mhz = ifb_mode_mhz(m);
+    if (mhz < 23000 || mhz > 240500) return;
+    // 24 bpp on 2 lanes, 0.6 % kept for spread spectrum: HBR carries 540000 kB/s, HBR2 1080000 kB/s
+    const uint64_t need = (uint64_t)m.clock * 3 * 1006 / 1000;
+    if (need <= 540000) m.rate = 270000;
+    else if (need <= 1080000 && l.maxBw >= 0x14) m.rate = 540000;
+    else return;
+    const uint32_t hz = (mhz + 500) / 1000;
+    for (unsigned i = 0; i < l.n; i++)
+        if (l.m[i].w == m.w && l.m[i].h == m.h && (ifb_mode_mhz(l.m[i]) + 500) / 1000 == hz) return;
+    l.m[l.n++] = m;
+}
+// an 18-byte detailed timing descriptor (drm_mode_detailed); false for a display descriptor, interlace or stereo
+static bool ifb_dtd(const uint8_t *d, Tc1Mode &m)
+{
+    const uint32_t pc = (uint32_t)(d[0] | d[1] << 8) * 10;
+    if (!pc || (d[17] & 0x80) || (d[17] & 0x60)) return false;
+    const uint32_t ha = d[2] | (uint32_t)(d[4] >> 4) << 8, hb = d[3] | (uint32_t)(d[4] & 15) << 8;
+    const uint32_t va = d[5] | (uint32_t)(d[7] >> 4) << 8, vb = d[6] | (uint32_t)(d[7] & 15) << 8;
+    const uint32_t hso = d[8] | (uint32_t)(d[11] >> 6) << 8, hsw = d[9] | (uint32_t)((d[11] >> 4) & 3) << 8;
+    const uint32_t vso = (uint32_t)(d[10] >> 4) | (uint32_t)((d[11] >> 2) & 3) << 4, vsw = (uint32_t)(d[10] & 15) | (uint32_t)(d[11] & 3) << 4;
+    if (!hsw || !vsw) return false;
+    m = { pc, ha, ha + hso, ha + hso + hsw, ha + hb, va, va + vso, va + vso + vsw, va + vb, (d[17] & 2) != 0, (d[17] & 4) != 0, 0 };
+    return true;
+}
+// a 20-byte DisplayID detailed timing (drm_mode_displayid_detailed): 10 kHz units in type I, kHz in type VII
+static bool ifb_did(const uint8_t *t, bool kHz, Tc1Mode &m)
+{
+    if (t[3] & 0x10) return false;   // interlaced
+    const uint32_t pc = (uint32_t)(t[0] | t[1] << 8 | t[2] << 16) + 1;
+    const uint32_t ha = (uint32_t)(t[4] | t[5] << 8) + 1, hb = (uint32_t)(t[6] | t[7] << 8) + 1;
+    const uint32_t hso = (uint32_t)(t[8] | (t[9] & 0x7F) << 8) + 1, hsw = (uint32_t)(t[10] | t[11] << 8) + 1;
+    const uint32_t va = (uint32_t)(t[12] | t[13] << 8) + 1, vb = (uint32_t)(t[14] | t[15] << 8) + 1;
+    const uint32_t vso = (uint32_t)(t[16] | (t[17] & 0x7F) << 8) + 1, vsw = (uint32_t)(t[18] | t[19] << 8) + 1;
+    m = { kHz ? pc : pc * 10, ha, ha + hso, ha + hso + hsw, ha + hb, va, va + vso, va + vso + vsw, va + vb,
+          (t[9] & 0x80) != 0, (t[17] & 0x80) != 0, 0 };
+    return true;
+}
+static unsigned ifb_edid_modes(const uint8_t *e, unsigned len, Tc1Mode *out, unsigned max, uint32_t maxClock, uint8_t maxBw)
+{
+    IfbModeList l = { out, 0, max, maxClock, maxBw };
+    Tc1Mode m;
+    if (len < 128) return 0;
+    for (unsigned i = 0; i < 4; i++) if (ifb_dtd(e + 54 + 18 * i, m)) ifb_mode_add(l, m);
+    for (unsigned b = 1; b * 128 + 128 <= len; b++) {
+        const uint8_t *x = e + b * 128;
+        if (x[0] == 0x02 && x[2] >= 4 && x[2] <= 127) {   // CEA-861: detailed timings from byte x[2]
+            for (unsigned i = x[2]; i + 18 <= 127 && (x[i] || x[i + 1]); i += 18) if (ifb_dtd(x + i, m)) ifb_mode_add(l, m);
+        } else if (x[0] == 0x70) {                         // DisplayID: section header at 1, data blocks from 5
+            const unsigned end = 5u + x[2] < 127u ? 5u + x[2] : 127u;
+            for (unsigned i = 5; i + 3 <= end && (x[i] || x[i + 2]); i += 3u + x[i + 2]) {
+                const uint8_t tag = x[i], n = x[i + 2];
+                if (i + 3u + n > end) break;
+                if (tag == 0x03 || tag == 0x22)
+                    for (unsigned j = 0; j + 20 <= n; j += 20) if (ifb_did(x + i + 3 + j, tag == 0x22, m)) ifb_mode_add(l, m);
+            }
+        }
+    }
+    for (unsigned b = 1; b * 128 + 128 <= len; b++) {   // CEA short video descriptors (data block tag 2)
+        const uint8_t *x = e + b * 128;
+        if (x[0] != 0x02 || x[2] < 4 || x[2] > 127) continue;
+        for (unsigned i = 4; i < x[2]; i += 1u + (x[i] & 31)) {
+            if ((x[i] >> 5) != 2) continue;
+            for (unsigned j = 1; j <= (x[i] & 31u) && i + j < x[2]; j++) {
+                const uint8_t s = x[i + j], vic = (s >= 129 && s <= 192) ? (uint8_t)(s & 0x7F) : s;
+                for (const auto &v : kIfbVic) if (v.vic == vic) ifb_mode_add(l, v.m);
+            }
+        }
+    }
+    auto dmt = [&](uint32_t w, uint32_t h) { for (const Tc1Mode &d : kIfbDmt60) if (d.w == w && d.h == h) ifb_mode_add(l, d); };
+    if (e[35] & 0x20) dmt(640, 480);
+    if (e[35] & 0x01) dmt(800, 600);
+    if (e[36] & 0x08) dmt(1024, 768);
+    for (unsigned i = 0; i < 8; i++) {   // standard timings: (width / 8 - 31), aspect and refresh - 60
+        const uint8_t b0 = e[38 + 2 * i], b1 = e[39 + 2 * i];
+        if (b0 <= 1 || (b1 & 0x3F) != 0) continue;   // unused, or not 60 Hz
+        const uint32_t w = ((uint32_t)b0 + 31) * 8, ar = b1 >> 6;
+        dmt(w, ar == 0 ? ((e[18] > 1 || e[19] >= 3) ? w * 10 / 16 : w) : ar == 1 ? w * 3 / 4 : ar == 2 ? w * 4 / 5 : w * 9 / 16);
+    }
+    return l.n;
+}
+// the monitor name descriptor (0xFC), for the logs (the serial descriptor is never printed)
+static void ifb_edid_name(const uint8_t *e, char *out, size_t n)
+{
+    out[0] = 0;
+    for (unsigned i = 0; i < 4 && n; i++) {
+        const uint8_t *d = e + 54 + 18 * i;
+        if (d[0] || d[1] || d[3] != 0xFC) continue;
+        size_t k = 0;
+        for (unsigned j = 5; j < 18 && d[j] != 0x0A && k + 1 < n; j++) out[k++] = (d[j] >= 0x20 && d[j] < 0x7F) ? (char)d[j] : '?';
+        out[k] = 0;
+        return;
+    }
+}
+
+// mode i as this framebuffer's current one: its fields, the VBL period, and the timing NVRMAGDC (NVRM's group) and the
+// panel's own AGDC answer WindowServer's K5 questions with for this slot
+void NMIntelFB::usbcAdopt(unsigned i)
+{
+    const Tc1Mode &m = fModes[i];
+    const uint64_t tot = (uint64_t)m.ht * m.vt;
+    fWidth = m.w; fHeight = m.h; fHT = m.ht; fVT = m.vt; fHSS = m.hss; fHSE = m.hse; fVSS = m.vss; fVSE = m.vse;
+    fPclk = (uint64_t)m.clock * 1000;
+    fRefresh16 = (uint32_t)((fPclk << 16) / tot);
+    fFrameNs = tot * 1000000ull / m.clock;
+    fCurMode = i + 1; gIfbUsbcCur = fCurMode;
+    const uint32_t k5[NVK5_TIMING_WORDS] = { NVK5_TIMING_TAG, (uint32_t)fPclk, m.w, m.hss, m.hse, m.ht, m.h, m.vss, m.vse, m.vt,
+                                             ifb_mode_mhz(m), m.phs ? 1u : 0u, m.pvs ? 1u : 0u };
+    if (OSData *d = OSData::withBytes(k5, sizeof k5)) { setProperty("NVRMTiming", d); d->release(); }
+    memcpy(gIfbUsbcK5, k5, sizeof k5);
+}
+
+// the index of CEA 1080p60 at HBR, the mode the first versions lit, added to the list when the EDID lacks it
+unsigned NMIntelFB::usbcCea60()
+{
+    unsigned k = 0;
+    while (k < fNModes && !ifb_mode_same(fModes[k], kTc1Cea1080p60)) k++;
+    if (k == fNModes && fNModes < kUsbcMaxModes) fModes[fNModes++] = kTc1Cea1080p60;
+    return k;
+}
+
+// Lights mode i (gTc1Lock held, port off); a mode that fails is marked bad and CEA 1080p60 is lit instead. Returns the
+// index of the mode lit, or -1.
+int NMIntelFB::usbcLight(unsigned i)
+{
+    gTc1Mode = fModes[i];
+    if (tc1Set(1, fSurf, fRowBytes) == 0) return (int)i;
+    const unsigned k = usbcCea60();   // never marked bad: it is the mode every other one falls back to
+    if (k != i) fBadModes |= 1u << i;
+    if (k == i || k >= fNModes) return -1;
+    gTc1Mode = fModes[k];
+    return tc1Set(1, fSurf, fRowBytes) == 0 ? (int)k : -1;
+}
+
+// A mode chosen in System Settings: pipe B goes down and up again with the new timing and link rate, on the same memory
+// and stride; the PHY stays connected (tc1Set 4). A mode that does not light gives the old one back.
+IOReturn NMIntelFB::usbcSetMode(IODisplayModeID id)
+{
+    const Tc1Mode *m = usbcMode(id);
+    if (!m) return kIOReturnUnsupportedMode;
+    if ((unsigned)id == fCurMode) return kIOReturnSuccess;
+    if (fBadModes & (1u << (id - 1))) return kIOReturnUnsupportedMode;   // it failed once: the hardware is left alone
+    if (!gTc1Lock || !fRegs) return kIOReturnNotReady;
+    const unsigned was = fCurMode;
+    IOLockLock(gTc1Lock);
+    if (!gTc1ForUsbc) { IOLockUnlock(gTc1Lock); return kIOReturnNotReady; }
+    const bool on = (rd(TRANSCONF(1)) & kEnable) != 0;   // off after a system sleep, until setPowerState lights it
+    if (!on) { if (fRam[0]) ramPtes(0, true); tc1Set(-1); }
+    gTc1Mode = *m;
+    const int r = tc1Set(on ? 4 : 1, fSurf, fRowBytes);
+    int back = 0;
+    if (r < 0) {
+        if (!ifb_mode_same(*m, kTc1Cea1080p60)) fBadModes |= 1u << (id - 1);
+        gTc1Mode = fModes[was - 1]; back = tc1Set(1, fSurf, fRowBytes);
+    }
+    IOLockUnlock(gTc1Lock);
+    char t[32];
+    if (r < 0) {
+        IFBLOG("usbc: mode %d (%ux%u, %u kHz) did not light (step %d); mode %u again: %s", (int)id, m->w, m->h, m->clock, -r,
+               was, back < 0 ? "FAILED too" : "lit");
+        snprintf(t, sizeof t, "usbc-mode%d-fail", (int)id); ifb_trail(t);
+        return kIOReturnUnsupportedMode;
+    }
+    usbcAdopt((unsigned)id - 1);
+    IFBLOG("usbc: mode %d: %ux%u at %u mHz, %u kHz on %s x2", (int)id, m->w, m->h, ifb_mode_mhz(*m), m->clock,
+           m->rate == 540000 ? "HBR2" : "HBR");
+    snprintf(t, sizeof t, "usbc-mode%d", (int)id); ifb_trail(t);
+    return kIOReturnSuccess;
+}
+
 bool NMIntelFB::usbcStart(IOService *provider)
 {
-    bool ptes = false, lit = false;
+    bool ptes = false, lit = false, connected = false;
     auto decline = [&](const char *why) {
         IFBLOG("usbc: %s - no USB-C screen this boot", why);
         ifb_trail("usbc-declined");
         gIfbUsbcExpected = false;
         if (fVblRunning) { fStopping = true; fVblOn = false; thread_wakeup((event_t)&fVblNext); while (fVblRunning) IOSleep(5); }
-        if (lit && gTc1Lock) { IOLockLock(gTc1Lock); tc1Set(0); gTc1ForUsbc = false; IOLockUnlock(gTc1Lock); }
+        if ((lit || connected) && gTc1Lock) { IOLockLock(gTc1Lock); tc1Set(0); gTc1ForUsbc = false; IOLockUnlock(gTc1Lock); }
         if (ptes) ramPtes(0, false);
         if (fRam[0]) { fRam[0]->complete(); OSSafeReleaseNULL(fRam[0]); }
         if (fRamPages[0]) IODelete(fRamPages[0], unsigned long long, fRamCount);
@@ -907,11 +1195,10 @@ bool NMIntelFB::usbcStart(IOService *provider)
     if (!fMMIO || !ap) return decline("BAR0 or BAR2 is not mapped");
     fRegs = (volatile uint8_t *)fMMIO->getVirtualAddress();
     fApertureBase = ap->getPhysicalAddress(); fApertureLen = ap->getLength();
-    // CEA-861 1920x1080@60 (VIC 16), the mode tc1Set programs
-    fPipe = 1; fWidth = 1920; fHeight = 1080; fRowBytes = 7680;
-    fHT = 2200; fVT = 1125; fHSS = 2008; fHSE = 2052; fVSS = 1084; fVSE = 1089;
-    fPclk = 148500000ull; fRefresh16 = 60u << 16; fFrameNs = 16666667ull;
-    const unsigned long long len = (unsigned long long)fRowBytes * fHeight;
+    // memory for 1920x1080 at 4 bytes a pixel; every mode (none larger) keeps the stride of 7680 bytes
+    fPipe = 1; fRowBytes = 7680; fMaxHeight = 1080;
+    fModes[0] = kTc1Cea1080p60; fNModes = 1; usbcAdopt(0);
+    const unsigned long long len = (unsigned long long)fRowBytes * fMaxHeight;
     fRamCount = (unsigned)((len + 4095) >> 12);
     fRamGgtt[0] = 0x2000000u;
     if (fApertureLen < fRamGgtt[0] + len || fMMIO->getLength() < 0x800000ull + ((fRamGgtt[0] >> 12) + (unsigned long long)fRamCount) * 8)
@@ -943,12 +1230,49 @@ bool NMIntelFB::usbcStart(IOService *provider)
     }
     if (!fSurfMap) return decline("the screen would not map write-combined");
     ifb_trail("usbc-mem");
+    // the PHY connected and kept (tc1Set 3) for the sink's EDID and link rates, then the modes; without an
+    // EDID, or with nullmoth-intelfb-usbc-edid=0, CEA 1080p60 alone, as before
+    uint32_t maxClock = panel->fPclk ? (uint32_t)(panel->fPclk / 1000) : kTc1Cea1080p60.clock;
+    uint8_t maxBw = 0;
+    if (ifb_knob("nullmoth-intelfb-usbc-edid", 1)) {
+        IOLockLock(gTc1Lock);
+        gTc1Mode = kTc1Cea1080p60;   // a valid rate for the connect, whatever the sysctl clone left
+        connected = tc1Set(3) == 0;
+        if (connected && gTc1EdidLen >= 128 && gTc1EdidLen <= sizeof fEdid) { memcpy(fEdid, gTc1Edid, gTc1EdidLen); fEdidLen = gTc1EdidLen; }
+        maxBw = gTc1MaxBw;
+        if (connected && gTc1DfpMaxKhz && gTc1DfpMaxKhz < maxClock) maxClock = gTc1DfpMaxKhz;   // a DP-to-HDMI/DVI branch's limit
+        IOLockUnlock(gTc1Lock);
+        if (fEdidLen) { const unsigned n = ifb_edid_modes(fEdid, fEdidLen, fModes, kUsbcMaxModes, maxClock, maxBw); if (n) fNModes = n; }
+        usbcCea60();   // the boot and fallback mode is in the list even when the EDID does not name it
+        ifb_trail(!connected ? "usbc-noconn" : fEdidLen ? "usbc-edid" : "usbc-noedid");
+    }
+    {
+        size_t o = 0;
+        auto put = [&](const char *fmt, auto... a) {
+            if (o < sizeof gIfbUsbcModes) { int w = snprintf(gIfbUsbcModes + o, sizeof gIfbUsbcModes - o, fmt, a...); if (w > 0) o += (size_t)w; }
+        };
+        if (fEdidLen) {
+            char name[16]; ifb_edid_name(fEdid, name, sizeof name);
+            const unsigned v = (unsigned)fEdid[8] << 8 | fEdid[9];
+            put("EDID %u bytes, %c%c%c %04x \"%s\"", fEdidLen, '@' + ((v >> 10) & 31), '@' + ((v >> 5) & 31), '@' + (v & 31),
+                (unsigned)(fEdid[10] | fEdid[11] << 8), name);
+        } else put("no EDID");
+        put("; sink rate %02x, panel %u kHz; %u modes:", maxBw, maxClock, fNModes);
+        for (unsigned i = 0; i < fNModes; i++)
+            put(" %u=%ux%u@%u.%02u/%u/%s", i + 1, fModes[i].w, fModes[i].h, ifb_mode_mhz(fModes[i]) / 1000, ifb_mode_mhz(fModes[i]) % 1000 / 10,
+                fModes[i].clock, fModes[i].rate == 540000 ? "HBR2" : "HBR");
+        IFBLOG("usbc: %s", gIfbUsbcModes);
+    }
+    // the boot lights CEA 1080p60 at HBR, the mode the first versions lit (or the only mode, if the list lacks it):
+    // the faster modes, HBR2 among them, are first tried by macOS through setDisplayMode, which falls back when one fails
     IOLockLock(gTc1Lock);
-    const int r = tc1Set(1, fSurf, fRowBytes);
-    if (r == 0) gTc1ForUsbc = true;
+    const unsigned boot = usbcCea60() < fNModes ? usbcCea60() : 0;
+    const int r = usbcLight(boot);
+    if (r >= 0) gTc1ForUsbc = true;
     IOLockUnlock(gTc1Lock);
     if (r < 0) return decline("TC1 did not light (sysctl debug.nmintelfb_tc1_log)");
     lit = true;
+    usbcAdopt((unsigned)r);
     ifb_trail("usbc-lit");
     fOwnGroup = !gIfbDepNvrm;   // the panel's group
     setProperty("IOFBDependentID", fOwnGroup ? 0x4E4D494E00000001ull : 0x4E56524D00000001ull, 64);
@@ -959,11 +1283,7 @@ bool NMIntelFB::usbcStart(IOService *provider)
     setProperty("NMIntelFBPipe", fPipe, 32);
     setProperty("NMIntelFBDisplayVersion", fVer, 32);
     setProperty("NMIntelFBUSBC", kOSBooleanTrue);
-    // the timing NVRMAGDC answers WindowServer's K5 questions with for this slot (as the panel publishes its own)
-    const uint32_t k5[NVK5_TIMING_WORDS] = { NVK5_TIMING_TAG, (uint32_t)fPclk, fWidth, fHSS, fHSE, fHT, fHeight, fVSS, fVSE, fVT,
-                                             60000u, 1, 1 };
-    if (OSData *d = OSData::withBytes(k5, sizeof k5)) { setProperty("NVRMTiming", d); d->release(); }
-    memcpy(gIfbUsbcK5, k5, sizeof k5);
+    // (NVRMTiming, the K5 timing NVRMAGDC answers with for this slot, is set by usbcAdopt with the mode lit)
     kapiInit();   // its own VRAM block stands for its scanout (intelfb-0016), as the panel's does
     fVblAlways = ifb_knob("nullmoth-intelfb-vbl", 1) != 0;
     armVbl();
@@ -975,8 +1295,8 @@ bool NMIntelFB::usbcStart(IOService *provider)
     if (kernel_thread_start(ifb_usbc_guard, nullptr, &t) == KERN_SUCCESS) thread_deallocate(t);
     else ifb_nv_set("nullmoth-intelfb-usbc-attaching", nullptr);
     ifb_trail("usbc-up");
-    IFBLOG("usbc: USB-C screen published (1920x1080@60, pipe B, GGTT 0x%x, %s)", fSurf,
-           fOwnGroup ? "head 1 of the panel's own group" : "head 5 in NVRM's group");
+    IFBLOG("usbc: USB-C screen published (mode %u of %u: %ux%u at %u mHz, pipe B, GGTT 0x%x, %s)", fCurMode, fNModes, fWidth,
+           fHeight, ifb_mode_mhz(fModes[fCurMode - 1]), fSurf, fOwnGroup ? "head 1 of the panel's own group" : "head 5 in NVRM's group");
     return true;
 }
 
@@ -1233,12 +1553,24 @@ IODeviceMemory *NMIntelFB::getApertureRange(IOPixelAperture aperture)
 {
     IFB_ONCE("apr");
     if (aperture != kIOFBSystemAperture) return nullptr;
-    return IODeviceMemory::withRange(fApertureBase + fSurf, (IOPhysicalLength)fRowBytes * fHeight);
+    return IODeviceMemory::withRange(fApertureBase + fSurf, (IOPhysicalLength)fRowBytes * (fMaxHeight ? fMaxHeight : fHeight));
 }
 
 IOReturn NMIntelFB::getInformationForDisplayMode(IODisplayModeID mode, IODisplayModeInformation *info)
 {
     IFB_ONCE("info");
+    if (fUsbc && fNModes) {   // mode 1 is the sink's preferred timing, its size the native one
+        const Tc1Mode *m = usbcMode(mode);
+        if (!m || !info) return kIOReturnBadArgument;
+        bzero(info, sizeof(*info));
+        info->maxDepthIndex = 0; info->nominalWidth = m->w; info->nominalHeight = m->h;
+        info->refreshRate = (IOFixed1616)(((uint64_t)m->clock * 1000 << 16) / ((uint64_t)m->ht * m->vt));
+        const bool bad = (fBadModes & (1u << (mode - 1))) != 0;
+        info->flags = (bad ? 0 : kDisplayModeValidFlag | kDisplayModeSafeFlag) | (mode == usbcDefault() ? kDisplayModeDefaultFlag : 0) |
+                      (m->w == fModes[0].w && m->h == fModes[0].h ? kDisplayModeNativeFlag : 0);
+        if (fEdidLen) { info->imageWidth = (UInt16)(fEdid[21] * 10); info->imageHeight = (UInt16)(fEdid[22] * 10); }   // cm in the EDID
+        return kIOReturnSuccess;
+    }
     if (mode != 1 || !info) return kIOReturnBadArgument;
     bzero(info, sizeof(*info));
     info->maxDepthIndex = 0; info->nominalWidth = fWidth; info->nominalHeight = fHeight;
@@ -1249,13 +1581,14 @@ IOReturn NMIntelFB::getInformationForDisplayMode(IODisplayModeID mode, IODisplay
 IOReturn NMIntelFB::getPixelInformation(IODisplayModeID mode, IOIndex depth, IOPixelAperture aperture, IOPixelInformation *pi)
 {
     IFB_ONCE("pix");
-    if (mode != 1 || depth != 0 || aperture != kIOFBSystemAperture || !pi) return kIOReturnUnsupportedMode;
+    const Tc1Mode *um = fUsbc && fNModes ? usbcMode(mode) : nullptr;   // each mode its own size, one stride
+    if ((fUsbc && fNModes ? !um : mode != 1) || depth != 0 || aperture != kIOFBSystemAperture || !pi) return kIOReturnUnsupportedMode;
     bzero(pi, sizeof(*pi));
     pi->bytesPerRow = fRowBytes; pi->bytesPerPlane = 0; pi->bitsPerPixel = 32; pi->pixelType = kIORGBDirectPixels;
     pi->componentCount = 3; pi->bitsPerComponent = 8;
     pi->componentMasks[0] = 0x00FF0000; pi->componentMasks[1] = 0x0000FF00; pi->componentMasks[2] = 0x000000FF;
     strlcpy(pi->pixelFormat, IO32BitDirectPixels, sizeof(pi->pixelFormat));
-    pi->activeWidth = fWidth; pi->activeHeight = fHeight;
+    pi->activeWidth = um ? um->w : fWidth; pi->activeHeight = um ? um->h : fHeight;
     return kIOReturnSuccess;
 }
 
@@ -1296,7 +1629,7 @@ IOReturn NMIntelFB::callPlatformFunction(const OSSymbol *fn, bool wait, void *p1
         if (fDev && ifb_knob("nullmoth-intelfb-scanres", 1)) {
             if (!fScanRes.phys) {
                 NVRMVramRequest q = {};
-                q.version = NVRM_VRAM_ABI_VERSION; q.size = (unsigned long long)fRowBytes * fHeight;
+                q.version = NVRM_VRAM_ABI_VERSION; q.size = (unsigned long long)fRowBytes * (fMaxHeight ? fMaxHeight : fHeight);   // the largest mode
                 if (vramGrant(&q) == kIOReturnSuccess) { fScanRes = q; ifb_trail("scanres"); IFBLOG("scanout resource: VRAM phys 0x%llx (%llu bytes)", q.phys, q.actualSize); }
                 else ifb_trail("scanres-fail");
             }
@@ -1908,6 +2241,9 @@ SYSCTL_PROC(_debug, OID_AUTO, nmintelfb_regs, CTLTYPE_STRING | CTLFLAG_RD | CTLF
 // laptop shows the same TC PLL 1, DDI_CLK_SEL MG, DPCLKA bit 12 and AUX/DDI IO wells (index 3).
 // debug.nmintelfb_tc1_rate picks the link rate (270000 = default, 540000; i915 port_clock units) and
 // debug.nmintelfb_tc1_log keeps the steps. A failed step undoes what was done and leaves debug.nmintelfb_tc1 < 0.
+// the timing and link rate come from gTc1Mode (the sysctl sets CEA 1080p60 at
+// debug.nmintelfb_tc1_rate); 2 and 3 also read the sink's EDID over I2C-over-AUX, and 3 keeps the PHY connected
+// (state 3) for the 1 that follows; 4 takes a lit link down, keeps the PHY connected and lights gTc1Mode.
 static char gTc1Log[4096];
 static size_t gTc1LogLen;
 // what this code turned on, so that off() undoes exactly that and nothing the firmware owns
@@ -1925,7 +2261,8 @@ int NMIntelFB::tc1Set(int mode, uint32_t surf, uint32_t stride)
 {
     if (!fRegs) { gTc1Clone = false; gTc1State = 0; bzero(&gTc1Own, sizeof gTc1Own); return -1; }
     if (mode < 0) { gTc1Clone = false; gTc1State = 0; bzero(&gTc1Own, sizeof gTc1Own); return 0; }   // after a reset
-    const int rate = gTc1Rate;   // one value for the whole run, whatever the sysctl does meanwhile
+    const Tc1Mode tm = gTc1Mode;   // one mode for the whole run
+    const int rate = tm.rate;
     // TC1 = tc_port 0: port D, PHY TC1, AUX USBC1, FIA1 index 0. Pipe and transcoder B sit 0x1000 above A.
     enum : uint32_t {
         DDI_BUF = 0x64300, AUX_CTL = 0x64310, AUX_DATA = 0x64314, DDI_CLK_SEL = 0x4610C, TCSS = 0x161500,
@@ -2019,8 +2356,9 @@ int NMIntelFB::tc1Set(int mode, uint32_t surf, uint32_t stride)
             dklm(0x02C8 + o, (1u << 2) | (3u << 3) | (3u << 5), 0);         // DPCNTL2: no 20-bit mode, DP load generators
         }
     };
-    // undo, in i915's disable order, only what this code turned on
-    auto off = [&]() {
+    // undo, in i915's disable order, only what this code turned on; link = the pipe, port and PLL only, the
+    // PHY stays connected (ownership, AUX well, FIA lanes), so TC-cold cannot take it between two modes
+    auto off = [&](bool link = false) {
         gTc1Clone = false;
         if (gTc1Own.trans) {
             wr(PLANE_CTL(1), 0); wr(PLANE_SURF(1), 0); IOSleep(20);
@@ -2044,6 +2382,7 @@ int NMIntelFB::tc1Set(int mode, uint32_t surf, uint32_t stride)
             wr(PLL_EN, rd(PLL_EN) & ~(1u << 27)); waitBits(PLL_EN, 1u << 26, 0, 1000);
             gTc1Own.pll = false;
         }
+        if (link) return;
         if (gTc1Own.mle1) { wr(FIA1_MLE1, gTc1Own.mle1Was); gTc1Own.mle1 = false; }
         if (gTc1Own.aux) { wr(PW_AUX2, rd(PW_AUX2) & ~(1u << 7)); gTc1Own.aux = false; }
         if (gTc1Own.owner) { wr(DDI_BUF, rd(DDI_BUF) & ~(1u << 6)); gTc1Own.owner = false; }
@@ -2064,14 +2403,22 @@ int NMIntelFB::tc1Set(int mode, uint32_t surf, uint32_t stride)
         if (any) { TC1LOG("off"); ifb_trail("tc1-off"); }
         return 0;
     }
+    if (mode == 4 && gTc1State == 1) {   // a new mode on the lit port
+        gTc1LogLen = 0; gTc1Log[0] = 0;
+        off(true); gTc1State = 3;
+        TC1LOG("relight: the link is down for a new mode, the PHY stays connected");
+    }
+    if (mode == 4) mode = 1;
     if (gTc1State == 1) { TC1LOG("already lit: write 0 first"); return 0; }
-    gTc1LogLen = 0; gTc1Log[0] = 0;
+    if (gTc1State != 3) { gTc1LogLen = 0; gTc1Log[0] = 0; }   // after a connect (3) its steps stay in the log
     const bool own = surf != ~0u;   // the USB-C framebuffer's memory; otherwise a clone of the panel
-    if (!fRegs || (!own && (fPipe != 0 || fWidth != 1920 || fHeight != 1080)) || (own && (stride < 7680 || (stride & 63) || (surf & 0xFFF))))
-        return fail(1, own ? "the USB-C surface is not a 1920x1080 linear buffer" : "the panel is not a 1920x1080 pipe A");
+    if (!fRegs || (mode == 1 && ((!own && (fPipe != 0 || fWidth != tm.w || fHeight != tm.h)) ||
+                                 (own && (stride < tm.w * 4 || (stride & 63) || (surf & 0xFFF))))))
+        return fail(1, own ? "the USB-C surface does not hold the mode as a linear buffer" : "the panel is not a pipe A of the mode's size");
     const uint32_t tcss = rd(TCSS), isr = rd(HPD_ISR), pa1 = rd(FIA1_PA1);
-    TC1LOG("start: mode %d rate %d %s; TCSS %08x HPD %08x PA1 %08x DDI_BUF %08x PLL %08x PW2 %08x AUX2 %08x DDI2 %08x MBUS %08x",
-           mode, rate, own ? "own surface" : "clone", tcss, isr, pa1, rd(DDI_BUF), rd(PLL_EN), rd(PW_CTL2), rd(PW_AUX2), rd(PW_DDI2), rd(MBUS_CTL));
+    TC1LOG("start: mode %d rate %d %s %ux%u %u kHz; TCSS %08x HPD %08x PA1 %08x DDI_BUF %08x PLL %08x PW2 %08x AUX2 %08x DDI2 %08x MBUS %08x",
+           mode, rate, own ? "own surface" : "clone", tm.w, tm.h, tm.clock, tcss, isr, pa1, rd(DDI_BUF), rd(PLL_EN), rd(PW_CTL2),
+           rd(PW_AUX2), rd(PW_DDI2), rd(MBUS_CTL));
     TC1LOG("pipe A for reference: VBLANK %08x SCL %08x PLANE_CTL %08x STRIDE %08x WM0 %08x BUF %08x DBOX %08x; "
            "ERR_FATAL_MASK %08x CHICKEN_DCPR_2 %08x", rd(VBLANK(0)), rd(SCL_A), rd(PLANE_CTL(0)), rd(PLANE_STRIDE(0)),
            rd(WM_A), rd(WM_A + 0x3C), rd(DBOX_A), rd(0x4421C), rd(0x46434));
@@ -2085,7 +2432,8 @@ int NMIntelFB::tc1Set(int mode, uint32_t surf, uint32_t stride)
         return fail(6, "DBUF S3-S4 are not powered and free (MBUS joined?)");
     if (!(rd(PW_CTL2) & (1u << 2))) return fail(7, "PW_2 is off");
     if (rate != 270000 && rate != 540000)
-        return fail(8, "debug.nmintelfb_tc1_rate must be 270000 or 540000 (1.62 Gbit/s x2 cannot carry 1080p60)");
+        return fail(8, "the link rate must be 270000 or 540000 (debug.nmintelfb_tc1_rate; 1.62 Gbit/s x2 cannot carry 1080p60)");
+    if (mode == 1 && (uint64_t)tm.clock * 3 > (uint64_t)rate * 2) return fail(8, "the mode needs more than 2 lanes carry at this rate");
     if (!(rd(PW_CTL2) & (1u << 12))) {
         wr(PW_CTL2, rd(PW_CTL2) | (1u << 13)); gTc1Own.pwB = true;
         if (!waitBits(PW_CTL2, 1u << 12, 1u << 12, 1000)) return fail(9, "PW_B did not come up");
@@ -2119,13 +2467,90 @@ int NMIntelFB::tc1Set(int mode, uint32_t surf, uint32_t stride)
     uint8_t lttpr[8] = {};
     if (dpcd(false, 0xF0000, lttpr, 8)) {
         TC1LOG("LTTPR caps %02x %02x count %02x mode %02x", lttpr[0], lttpr[1], lttpr[2], lttpr[3]);
-        if (mode == 1 && lttpr[2] && lttpr[3] != 0x55) {
+        if (mode != 2 && lttpr[2] && lttpr[3] != 0x55) {
             uint8_t t = 0x55; dpcd(true, 0xF0003, &t, 1); TC1LOG("LTTPR set to transparent mode");
         }
     }
-    if (mode == 2) { off(); gTc1State = 2; TC1LOG("probe done, port released"); ifb_trail("tc1-probed"); return 0; }
-
     const uint8_t *dp = (haveExt && (caps[0x0E] & 0x80)) ? ext : caps;
+    gTc1MaxBw = dp[1];
+    if (mode != 2 && mstCtl) { uint8_t z = 0; dpcd(true, 0x111, &z, 1); mstCtl = 0; TC1LOG("MST was on in the branch: set to SST"); }
+    if (mode == 2 || mode == 3) {
+        // a DP-to-HDMI/DVI branch caps the pixel clock of its downstream port (DPCD 0x080, detailed caps when
+        // DPCD 0x005 has bits 0 and 4; drm_dp_downstream_max_tmds_clock)
+        gTc1DfpMaxKhz = 0;
+        uint8_t dfp[4] = {};
+        if ((caps[5] & 0x11) == 0x11 && dpcd(false, 0x080, dfp, 4)) {
+            const unsigned type = dfp[0] & 7u;   // 0 DP, 1 VGA, 2 DVI, 3 HDMI, 4 other, 5 DP++
+            if ((type == 2 || type == 3) && dfp[1]) gTc1DfpMaxKhz = dfp[1] * 2500u;
+            TC1LOG("downstream port 0: type %u, caps %02x %02x %02x %02x, max TMDS %u kHz", type, dfp[0], dfp[1], dfp[2], dfp[3],
+                   gTc1DfpMaxKhz);
+        }
+        // the sink's EDID over I2C-over-AUX (drm_dp_i2c_xfer): each message opens with a bare address with
+        // MOT and moves its bytes in chunks of up to 16, MOT set; one bare address without MOT ends the transfer (the
+        // stop, which also resets the E-DDC segment pointer). Native and I2C DEFER are retried, short reads continued.
+        struct I2cMsg { uint8_t addr; bool read; uint8_t *buf; int len; };
+        auto i2cMsg = [&](uint8_t req, uint8_t addr, uint8_t *b, int n) -> int {   // bytes moved, < 0 refused
+            uint8_t tx[20], rx[20];
+            const bool read = (req & 1) != 0;
+            tx[0] = (uint8_t)(req << 4); tx[1] = 0; tx[2] = addr; tx[3] = (uint8_t)(n - 1);
+            if (n && !read) for (int i = 0; i < n; i++) tx[4 + i] = b[i];
+            for (int r = 0; r < 32; r++) {
+                const int got = auxXfer(tx, !n ? 3 : read ? 4 : 4 + n, rx, read ? 1 + n : 1);
+                if (got < 1) { IODelay(500); continue; }
+                // a write the sink deferred or took in part is asked about with WRITE_STATUS_UPDATE, the same bytes again
+                // (drm_dp_i2c_msg_write_status_update)
+                const bool partial = !read && n && !(rx[0] & 0xF0) && got >= 2 && rx[1] < n;
+                if (!read && n && ((rx[0] & 0xC0) == 0x80 || partial)) { tx[0] = (uint8_t)(((req & 0x4) | 0x2) << 4); IODelay(500); continue; }
+                if ((rx[0] & 0x30) == 0x20 || (rx[0] & 0xC0) == 0x80) { IODelay(500); continue; }   // native or I2C DEFER
+                if (rx[0] & 0xF0) return -1;                                                      // a NACK
+                if (!n || !read) return n;
+                if (got < 2) return -1;
+                const int k = got - 1 < n ? got - 1 : n;
+                for (int i = 0; i < k; i++) b[i] = rx[1 + i];
+                return k;
+            }
+            return -1;
+        };
+        auto i2cXfer = [&](const I2cMsg *m, int num) -> bool {
+            bool ok = true;
+            uint8_t stop = 0x1, addr = 0x50;
+            for (int i = 0; ok && i < num; i++) {
+                const uint8_t req = (uint8_t)((m[i].read ? 0x1 : 0x0) | 0x4);   // I2C read/write, MOT
+                stop = (uint8_t)(req & ~0x4); addr = m[i].addr;
+                ok = i2cMsg(req, m[i].addr, nullptr, 0) >= 0;
+                for (int j = 0; ok && j < m[i].len; ) {
+                    const int k = i2cMsg(req, m[i].addr, m[i].buf + j, m[i].len - j < 16 ? m[i].len - j : 16);
+                    if (k <= 0) ok = false; else j += k;
+                }
+            }
+            i2cMsg(stop, addr, nullptr, 0);
+            return ok;
+        };
+        // drm_do_get_edid: the base block, then the extensions it counts (at most 3 here), each read again up to twice
+        // when its checksum fails; blocks 2-3 through segment pointer 0x30
+        gTc1EdidLen = 0;
+        for (unsigned blk = 0; blk < 4; blk++) {
+            uint8_t *b = gTc1Edid + blk * 128, seg = (uint8_t)(blk / 2), ofs = (uint8_t)((blk & 1) * 128);
+            bool ok = false;
+            for (int t = 0; t < 3 && !ok; t++) {
+                const I2cMsg m[3] = { { 0x30, false, &seg, 1 }, { 0x50, false, &ofs, 1 }, { 0x50, true, b, 128 } };
+                ok = seg ? i2cXfer(m, 3) : i2cXfer(m + 1, 2);
+                uint8_t sum = 0;
+                for (int i = 0; ok && i < 128; i++) sum = (uint8_t)(sum + b[i]);
+                ok = ok && sum == 0;
+                if (ok && !blk) for (int i = 0; i < 8; i++) ok = ok && b[i] == ((i == 0 || i == 7) ? 0x00 : 0xFF);
+            }
+            if (!ok) { TC1LOG("EDID block %u not read", blk); break; }
+            gTc1EdidLen = (blk + 1) * 128;
+            if (blk >= gTc1Edid[126]) break;
+        }
+        TC1LOG("EDID %u bytes: version %u.%u, %u extensions, block tags %02x %02x %02x", gTc1EdidLen, gTc1EdidLen ? gTc1Edid[18] : 0,
+               gTc1EdidLen ? gTc1Edid[19] : 0, gTc1EdidLen ? gTc1Edid[126] : 0, gTc1EdidLen > 128 ? gTc1Edid[128] : 0,
+               gTc1EdidLen > 256 ? gTc1Edid[256] : 0, gTc1EdidLen > 384 ? gTc1Edid[384] : 0);
+    }
+    if (mode == 2) { off(); gTc1State = 2; TC1LOG("probe done, port released"); ifb_trail("tc1-probed"); return 0; }
+    if (mode == 3) { gTc1State = 3; TC1LOG("connected: the PHY is kept for the light"); ifb_trail("tc1-connected"); return 0; }
+
     const uint8_t bw = rate == 270000 ? 0x0A : 0x14;
     if (dp[1] < bw || (dp[2] & 0x1F) < 2) return fail(14, "the sink does not take this rate on 2 lanes");
     const bool enh = (dp[2] & 0x80) != 0, tps3 = (dp[2] & 0x40) != 0;
@@ -2133,11 +2558,10 @@ int NMIntelFB::tc1Set(int mode, uint32_t surf, uint32_t stride)
     const unsigned rdi = dp[0x0E] & 0x7Fu;
     const unsigned crUs = (dp[0] >= 0x14 || !rdi) ? 100u : rdi * 4000u, eqUs = rdi ? rdi * 4000u : 400u;
     const int crTries = dp[0] >= 0x14 ? 10 : 80;
-    if (mstCtl) { uint8_t z = 0; dpcd(true, 0x111, &z, 1); TC1LOG("MST was on in the branch: set to SST"); }
 
     // FIA lanes (intel_tc_port_set_fia_lane_count: 2 lanes, no reversal) and TC PLL 1 (mg_pll_enable): for DP the DCO
     // is always 8.1 GHz, so with the 38.4 MHz reference only HSDIV/DSDIV/A_DIVRATIO change with the rate
-    gTc1Own.mle1Was = rd(FIA1_MLE1); gTc1Own.mle1 = true;
+    if (!gTc1Own.mle1) { gTc1Own.mle1Was = rd(FIA1_MLE1); gTc1Own.mle1 = true; }   // kept from a connect or the last mode
     wr(FIA1_MLE1, (gTc1Own.mle1Was & ~0xFu) | 0x3u);
     const uint32_t div2 = rate == 540000 ? 1u : 2u;                                   // HSDIV 3 for both rates
     const uint32_t hsdiv = 1u, adiv = div2 >= 2 ? 10u : 5u, tline = div2 >= 2 ? 1u : 0u;
@@ -2167,8 +2591,8 @@ int NMIntelFB::tc1Set(int mode, uint32_t surf, uint32_t stride)
     for (uint32_t ln = 0; ln < 2; ln++)                                              // WA_14018221282
         if ((dkl(0x00A0 + ln * 0x1000) & 0xC0u) != 0x80u) dklm(0x00A0 + ln * 0x1000, 0xC0u, 0x80u);
     wr(TRANS_CLK_SEL_B, 6u << 28); gTc1Own.clkSel = true;                            // PHY TC1 (5) + 1
-    const uint32_t func = kEnable | (4u << 27) /* port D */ | (2u << 24) /* DP SST */ | (1u << 17) | (1u << 16) |
-                          (1u << 1) /* 2 lanes */;
+    const uint32_t func = kEnable | (4u << 27) /* port D */ | (2u << 24) /* DP SST */ | (tm.pvs ? 1u << 17 : 0u) |
+                          (tm.phs ? 1u << 16 : 0u) /* sync polarities (the mode's) */ | (1u << 1) /* 2 lanes */;
     wr(FUNC2_B, 0); wr(FUNC_B, func & ~kEnable); gTc1Own.trans = true;
     levels(0, 0);
     { uint8_t d0 = 1; bool ok = false; for (int i = 0; i < 3 && !(ok = dpcd(true, 0x600, &d0, 1)); i++) IOSleep(1);
@@ -2234,8 +2658,8 @@ int NMIntelFB::tc1Set(int mode, uint32_t surf, uint32_t stride)
     TC1LOG("link trained: rate %d x2, swing %u pre-emphasis %u, lanes %02x align %02x", rate, vs, pe, st[0], st[2]);
     wr(MSA_B, (1u << 0) | (1u << 5));                                                // synchronous clock, 8 bpc RGB
 
-    // pipe and transcoder B (hsw_crtc_enable): 1920x1080, 2200x1125 totals, 148.5 MHz, +hsync +vsync
-    wr(PIPESRC_B, (1919u << 16) | 1079u);
+    // pipe and transcoder B (hsw_crtc_enable, intel_set_transcoder_timings): gTc1Mode's size, totals and clock
+    wr(PIPESRC_B, ((tm.w - 1) << 16) | (tm.h - 1));
     wr(PIPE_MISC_B, (1u << 8) | (1u << 23));             // pixel rounding truncate, HDR-plane precision; 8 bpc
     auto mn = [](uint64_t m, uint64_t n, uint32_t cn, uint32_t &om, uint32_t &on) {
         uint64_t M = m * cn / n, N = cn;
@@ -2243,21 +2667,24 @@ int NMIntelFB::tc1Set(int mode, uint32_t surf, uint32_t stride)
         om = (uint32_t)M; on = (uint32_t)N;
     };
     uint32_t dm, dn, lm, lnn;
-    mn(148500ull * 24 / 8, (uint64_t)rate * 10 * 2 * 800000 / (1000000ull * 8), 0x8000000u, dm, dn);   // kB/s
-    mn(148500, (uint64_t)rate, 0x80000u, lm, lnn);                               // pixel clock / symbol clock
+    mn((uint64_t)tm.clock * 24 / 8, (uint64_t)rate * 10 * 2 * 800000 / (1000000ull * 8), 0x8000000u, dm, dn);   // kB/s
+    mn(tm.clock, (uint64_t)rate, 0x80000u, lm, lnn);                             // pixel clock / symbol clock
     wr(DATA_M1_B, (63u << 25) | dm); wr(DATA_N1_B, dn); wr(LINK_M1_B, lm); wr(LINK_N1_B, lnn);
     wr(SCL_B, 0); wr(VSYNCSHIFT_B, 0);
-    wr(HTOTAL(1), (2199u << 16) | 1919u); wr(HBLANK(1), (2199u << 16) | 1919u); wr(HSYNC(1), (2051u << 16) | 2007u);
-    wr(VTOTAL(1), (1124u << 16) | 1079u); wr(VBLANK(1), 1124u << 16);              // display 13: vblank start field 0
-    wr(VSYNC(1), (1088u << 16) | 1083u);
+    wr(HTOTAL(1), ((tm.ht - 1) << 16) | (tm.w - 1)); wr(HBLANK(1), ((tm.ht - 1) << 16) | (tm.w - 1));
+    wr(HSYNC(1), ((tm.hse - 1) << 16) | (tm.hss - 1));
+    wr(VTOTAL(1), ((tm.vt - 1) << 16) | (tm.h - 1)); wr(VBLANK(1), (tm.vt - 1) << 16);   // display 13: vblank start field 0
+    wr(VSYNC(1), ((tm.vse - 1) << 16) | (tm.vss - 1));
     wr(TRANS_MULT_B, 0);
     wr(CHICKEN_TRANS_B, rd(CHICKEN_TRANS_B) & ~(3u << 27));                          // frame start delay 1
     wr(TRANSCONF(1), 0);                                                             // progressive, still off
     wr(PIPE_CHICKEN_B, rd(PIPE_CHICKEN_B) | (1u << 7) | (1u << 15) | (1u << 30));   // icl_set_pipe_chicken
-    wr(LINETIME_B, (2200u * 8000u + 148500u / 2) / 148500u);                         // line time in 1/8 us
+    { const uint32_t lt = (tm.ht * 8000u + tm.clock / 2) / tm.clock;                 // line time in 1/8 us (max 0x1FF)
+      wr(LINETIME_B, lt > 0x1FFu ? 0x1FFu : lt); }
     wr(GAMMA_MODE_B, 0); wr(CSC_MODE_B, 0);                                          // pixels pass unchanged
     // plane 1 watermarks, its DBUF allocation and the MBUS credits as the firmware set them for the panel on pipe A:
-    // pipe B's S3-S4 pair holds the same 2048 blocks, and 1080p60 needs less than the panel
+    // pipe B's S3-S4 pair holds the same 2048 blocks, and a plane no wider than the panel's at a pixel clock no faster
+    // than the panel's (the only modes the USB-C screen lists) needs no more than it
     for (uint32_t o = 0; o <= 0x1C; o += 4) wr(WM_B + o, rd(WM_A + o));
     wr(WM_B + 0x28, rd(WM_A + 0x28)); wr(WM_B + 0x3C, rd(WM_A + 0x3C)); wr(DBOX_B, rd(DBOX_A));
 
@@ -2272,7 +2699,7 @@ int NMIntelFB::tc1Set(int mode, uint32_t surf, uint32_t stride)
       if (!moving) return fail(30, "the scanline of pipe B does not move"); }
     wr(PLANE_COLOR_B, 1u << 13);
     wr(PLANE_STRIDE(1), own ? stride / 64 : rd(PLANE_STRIDE(0)));
-    wr(PLANE_POS_B, 0); wr(PLANE_SIZE(1), (1079u << 16) | 1919u); wr(PLANE_OFFSET_B, 0);
+    wr(PLANE_POS_B, 0); wr(PLANE_SIZE(1), ((tm.h - 1) << 16) | (tm.w - 1)); wr(PLANE_OFFSET_B, 0);
     wr(PLANE_KEYVAL_B, 0); wr(PLANE_KEYMSK_B, 0); wr(PLANE_KEYMAX_B, 0); wr(PLANE_AUX_DIST_B, 0); wr(PLANE_AUX_OFF_B, 0);
     wr(PLANE_CTL(1), kEnable | (1u << 28) | (4u << 24));
     gTc1Clone = !own;
@@ -2298,10 +2725,24 @@ static int ifb_tc1_sysctl SYSCTL_HANDLER_ARGS
     if (gTc1ForUsbc) return EBUSY;   // pipe B is the USB-C screen's
     IOLockLock(gTc1Lock);
     const bool busy = gTc1ForUsbc;
+    if (!busy && v) { gTc1Mode = kTc1Cea1080p60; gTc1Mode.rate = gTc1Rate; }   // the clone's mode and rate
     const int r = busy || gIfbRamFB != fb ? -1 : fb->tc1Set(v);
     IOLockUnlock(gTc1Lock);
     return busy ? EBUSY : r < 0 ? EIO : 0;
 }
+// the USB-C screen's EDID summary and modes (no serial), and the mode on screen
+static int ifb_usbc_modes_sysctl SYSCTL_HANDLER_ARGS
+{
+    const size_t n = sizeof gIfbUsbcModes + 32;
+    char *b = (char *)IOMallocZero(n);
+    if (!b) return ENOMEM;
+    snprintf(b, n, "%s; current %u", gIfbUsbcModes[0] ? gIfbUsbcModes : "no USB-C screen", (unsigned)gIfbUsbcCur);
+    const int err = sysctl_handle_string(oidp, b, n, req);
+    IOFree(b, n);
+    return err;
+}
+SYSCTL_PROC(_debug, OID_AUTO, nmintelfb_usbc_modes, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED, nullptr, 0,
+            ifb_usbc_modes_sysctl, "A", "the USB-C screen's EDID summary, modes (id=WxH@Hz/kHz/link) and current mode");
 SYSCTL_PROC(_debug, OID_AUTO, nmintelfb_tc1, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, nullptr, 0, ifb_tc1_sysctl, "I",
             "2 = probe the USB-C sink over AUX, 1 = light the USB-C port as a 1080p60 clone of the panel, 0 = off; < 0 = failed step");
 SYSCTL_INT(_debug, OID_AUTO, nmintelfb_tc1_rate, CTLFLAG_RW | CTLFLAG_LOCKED, &gTc1Rate, 0,
@@ -2335,7 +2776,8 @@ static void ifb_ram_register(NMIntelFB *fb)
 {
     sysctl_oid *o[] = { &sysctl__debug_nmintelfb_ram, &sysctl__debug_nmintelfb_regs, &sysctl__debug_nmintelfb_tcdiag, &sysctl__debug_nmintelfb_tc1,
                         &sysctl__debug_nmintelfb_tc1_rate, &sysctl__debug_nmintelfb_tc1_log, &sysctl__debug_nmintelfb_flips,
-                        &sysctl__debug_nmintelfb_flip_waits, &sysctl__debug_nmintelfb_flip_wait_us, &sysctl__debug_nmintelfb_flip_late };
+                        &sysctl__debug_nmintelfb_flip_waits, &sysctl__debug_nmintelfb_flip_wait_us, &sysctl__debug_nmintelfb_flip_late,
+                        &sysctl__debug_nmintelfb_usbc_modes };
     if (fb && !gTc1Lock) gTc1Lock = IOLockAlloc();
     if (fb && !gIfbRamFB) { gIfbRamFB = fb; for (sysctl_oid *x : o) sysctl_register_oid(x); }
     else if (!fb && gIfbRamFB) { for (sysctl_oid *x : o) sysctl_unregister_oid(x); gIfbRamFB = nullptr; }
