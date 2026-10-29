@@ -1039,6 +1039,88 @@ static void nvmtl_vkmsg_arm(void)
     }
 }
 
+/* b214 (speed): a VkPipelineCache kept on disk per process. Mesa's own shader disk cache stays off in WindowServer
+   (10-29: its nvmtl-mesa folder is empty - Mesa turns its disk cache off when the real and effective user differ, and
+   WindowServer runs as uid 0 / euid 88), so after every boot WindowServer compiled all of its pipelines again - the
+   slow first frames and the first-open pauses. This cache is ours: loaded when the device comes up, written back a few
+   seconds after new pipelines were made (and when the process exits), in the per-user cache folder:
+   <DARWIN_USER_CACHE_DIR>/nvmtl-pcache/<process>.bin. The driver checks the header itself (device, driver UUID) and
+   ignores data from another build. Off: touch /Library/GPUBundles/nvmtl-nopcache. */
+static VkPipelineCache g_pcache = VK_NULL_HANDLE;
+static PFN_vkGetPipelineCacheData pvkGetPipelineCacheDataX;
+static char g_pcache_path[PATH_MAX];
+static volatile int g_pcache_new, g_pcache_saving;
+static size_t g_pcache_loaded;
+static void nvmtl_pcache_save(const char *why)
+{
+    if (!g_pcache || !pvkGetPipelineCacheDataX || !g_pcache_path[0]) return;
+    size_t n = 0;
+    if (pvkGetPipelineCacheDataX(g_dev, g_pcache, &n, NULL) != VK_SUCCESS || !n || n > (128u << 20)) return;
+    void *buf = malloc(n);
+    if (!buf) return;
+    if (pvkGetPipelineCacheDataX(g_dev, g_pcache, &n, buf) == VK_SUCCESS) {
+        char tmp[PATH_MAX + 8]; snprintf(tmp, sizeof tmp, "%s.%d", g_pcache_path, (int)getpid());
+        FILE *f = fopen(tmp, "wb");
+        if (f) {
+            const int ok = fwrite(buf, 1, n, f) == n;
+            fclose(f);
+            if (ok && rename(tmp, g_pcache_path) == 0) { static int said; if (said++ < 3) nvlog("pcache: %zu B written (%s)", n, why); }
+            else unlink(tmp);
+        }
+    }
+    free(buf);
+}
+static void *nvmtl_pcache_saver(void *arg)
+{
+    (void)arg;
+    sleep(5);   /* let a burst of new pipelines finish first */
+    __atomic_store_n(&g_pcache_new, 0, __ATOMIC_RELAXED);
+    nvmtl_pcache_save("new pipelines");
+    __atomic_store_n(&g_pcache_saving, 0, __ATOMIC_RELEASE);
+    return NULL;
+}
+static void nvmtl_pcache_note_new(void)
+{
+    if (!g_pcache) return;
+    __atomic_fetch_add(&g_pcache_new, 1, __ATOMIC_RELAXED);
+    if (__atomic_exchange_n(&g_pcache_saving, 1, __ATOMIC_ACQ_REL)) return;
+    pthread_t t; pthread_attr_t a; pthread_attr_init(&a); pthread_attr_setdetachstate(&a, PTHREAD_CREATE_DETACHED);
+    if (pthread_create(&t, &a, nvmtl_pcache_saver, NULL)) __atomic_store_n(&g_pcache_saving, 0, __ATOMIC_RELEASE);
+    pthread_attr_destroy(&a);
+}
+static void nvmtl_pcache_atexit(void) { if (__atomic_load_n(&g_pcache_new, __ATOMIC_RELAXED)) nvmtl_pcache_save("exit"); }
+static void nvmtl_pcache_init(void)
+{
+    if (access("/Library/GPUBundles/nvmtl-nopcache", F_OK) == 0) { nvlog("pcache: off (nvmtl-nopcache)"); return; }
+    PFN_vkCreatePipelineCache cpc = (PFN_vkCreatePipelineCache)pvkGetDeviceProcAddr(g_dev, "vkCreatePipelineCache");
+    pvkGetPipelineCacheDataX = (PFN_vkGetPipelineCacheData)pvkGetDeviceProcAddr(g_dev, "vkGetPipelineCacheData");
+    if (!cpc || !pvkGetPipelineCacheDataX) return;
+    char ucd[PATH_MAX]; const size_t un = confstr(_CS_DARWIN_USER_CACHE_DIR, ucd, sizeof ucd);
+    const char *me = getprogname();
+    if (un > 0 && un <= sizeof ucd && me && *me) {
+        char dir[PATH_MAX]; snprintf(dir, sizeof dir, "%snvmtl-pcache", ucd); mkdir(dir, 0700);
+        if (access(dir, W_OK) == 0) snprintf(g_pcache_path, sizeof g_pcache_path, "%s/%s.bin", dir, me);
+    }
+    void *data = NULL; size_t n = 0;
+    if (g_pcache_path[0]) {
+        FILE *f = fopen(g_pcache_path, "rb");
+        if (f) {
+            if (fseek(f, 0, SEEK_END) == 0) { long l = ftell(f); if (l > 0 && l < (128L << 20)) n = (size_t)l; }
+            rewind(f);
+            if (n && (data = malloc(n)) != NULL && fread(data, 1, n, f) != n) { free(data); data = NULL; n = 0; }
+            fclose(f);
+        }
+    }
+    VkPipelineCacheCreateInfo ci = { VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO, NULL, 0, data ? n : 0, data };
+    VkResult r = cpc(g_dev, &ci, NULL, &g_pcache);
+    if (r != VK_SUCCESS && data) { ci.initialDataSize = 0; ci.pInitialData = NULL; r = cpc(g_dev, &ci, NULL, &g_pcache); n = 0; }
+    free(data);
+    if (r != VK_SUCCESS) { g_pcache = VK_NULL_HANDLE; return; }
+    g_pcache_loaded = data ? n : 0;
+    if (g_pcache_path[0]) atexit(nvmtl_pcache_atexit);
+    nvlog("pcache: %s - %zu B loaded from %s", me ?: "?", g_pcache_loaded, g_pcache_path[0] ? g_pcache_path : "(nowhere: not saved)");
+}
+
 // DLSS needs two NVX extensions on the device. They are requested only when the user installed the DLSS files (and
 // NVMTL_DLSS is not 0), and only if the device offers both. Returns 1 when both were appended to exts.
 // VK_KHR_push_descriptor rides along when offered: the DLSS runtime's own compute passes bind their resources with
@@ -1522,6 +1604,7 @@ static int nvmtl_vk_initialize(void)
     VKCK(pvkCreateDevice(g_pdev, &dci, NULL, &g_dev), "vkCreateDevice");
     nvmtl_live_start(g_live_pre.raise_sw, g_live_pre.lower_sw, g_live_pre.is_game, g_live_pre.pinned);
     DEVICE_FNS(LOAD_D)
+    nvmtl_pcache_init();   /* b214 */
     g_storage_raw_create_view = pvkCreateImageView; pvkCreateImageView = nvmtl_storage_CreateImageView;
     g_storage_raw_destroy_image = pvkDestroyImage; pvkDestroyImage = nvmtl_storage_DestroyImage;
     if (g_pstat) { p_pstat_props = (PFN_vkGetPipelineExecutablePropertiesKHR)pvkGetDeviceProcAddr(g_dev, "vkGetPipelineExecutablePropertiesKHR");
@@ -6043,7 +6126,8 @@ static int nvmtl_vk_pipeline_create_impl_lifetime_body(const void *vs, size_t vn
         VK_TRUE, VK_TRUE, VK_COMPARE_OP_LESS, VK_FALSE, VK_FALSE, { 0 }, { 0 }, 0.0f, 1.0f };
     VkGraphicsPipelineCreateInfo gp = { VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO, NULL, 0, nstages, stages,
         &vi, &ia, td ? &tss : NULL, &vps, &rs, &ms, hasDepth ? &ds : NULL, &cb, &dsci, out->layout, out->rp, 0, VK_NULL_HANDLE, -1 };
-    NVMTL_PIPELINE_STAGE(nvmtl_opaque_CreateGraphicsPipelines(g_dev, VK_NULL_HANDLE, 1, &gp, NULL, &out->pipe), "vkCreateGraphicsPipelines");
+    NVMTL_PIPELINE_STAGE(nvmtl_opaque_CreateGraphicsPipelines(g_dev, g_pcache, 1, &gp, NULL, &out->pipe), "vkCreateGraphicsPipelines");
+    nvmtl_pcache_note_new();
     if (tcm) pvkDestroyShaderModule(g_dev, tcm, NULL);
     if (tvm) pvkDestroyShaderModule(g_dev, tvm, NULL);
     pvkDestroyShaderModule(g_dev, fmod, NULL);
@@ -6186,7 +6270,8 @@ static int nvmtl_vk_compute_pipeline_create_g_lifetime_body(const void *cs, size
     VkComputePipelineCreateInfo cpi = { VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO, NULL, 0,
         { VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, NULL, 0, VK_SHADER_STAGE_COMPUTE_BIT, mod, "main", NULL },
         out->layout, VK_NULL_HANDLE, -1 };
-    VKCK(nvmtl_opaque_CreateComputePipelines(g_dev, VK_NULL_HANDLE, 1, &cpi, NULL, &out->pipe), "vkCreateComputePipelines");
+    VKCK(nvmtl_opaque_CreateComputePipelines(g_dev, g_pcache, 1, &cpi, NULL, &out->pipe), "vkCreateComputePipelines");
+    nvmtl_pcache_note_new();
     out->mod = mod;
     return 0;
 }
