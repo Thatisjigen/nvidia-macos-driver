@@ -448,6 +448,48 @@ pub extern "C" fn nvmtl_link_runtime(
     0
 }
 
+/// b210: specialize one AIR module's function constants and return the AIR text (not SPIR-V). Used for linked visible
+/// functions: each Metal function has its own function-constant index space, so a linked function's constants must be
+/// folded into its own module before it is linked into the caller - one merged table by index gives the caller's values
+/// to the linked function's constants that share an index.
+#[no_mangle]
+pub extern "C" fn nvmtl_specialize_air(
+    ll: *const c_char,
+    indices: *const u32, sizes: *const u32, payloads: *const *const u8, n: usize,
+    out: *mut *mut u8, out_len: *mut usize,
+    err: *mut c_char, err_len: usize,
+) -> i32 {
+    let set_err = |msg: &str| unsafe {
+        if !err.is_null() && err_len > 0 {
+            let b = msg.as_bytes();
+            let k = b.len().min(err_len - 1);
+            std::ptr::copy_nonoverlapping(b.as_ptr(), err as *mut u8, k);
+            *err.add(k) = 0;
+        }
+    };
+    if ll.is_null() || out.is_null() || out_len.is_null() { return -1; }
+    if n > 0 && (indices.is_null() || sizes.is_null() || payloads.is_null()) { return -1; }
+    let ll = match unsafe { CStr::from_ptr(ll) }.to_str() { Ok(s) => s, Err(_) => { set_err("ll is not utf-8"); return -1; } };
+    let mut values: Vec<(u32, Vec<u8>)> = Vec::with_capacity(n);
+    for i in 0..n {
+        let idx = unsafe { *indices.add(i) };
+        let len = unsafe { *sizes.add(i) } as usize;
+        let ptr = unsafe { *payloads.add(i) };
+        if ptr.is_null() { set_err("null payload"); return -1; }
+        values.push((idx, unsafe { std::slice::from_raw_parts(ptr, len) }.to_vec()));
+    }
+    let specialized = match metal2vulkan::specialize_air_function_constants(ll, &values) {
+        Ok(v) => v,
+        Err(e) => { set_err(&format!("AIR specialization: {e}")); return -1; }
+    };
+    let mut v = specialized.as_bytes().to_vec();
+    v.push(0);
+    let mut b = v.into_boxed_slice();
+    unsafe { *out = b.as_mut_ptr(); *out_len = b.len(); }
+    std::mem::forget(b);
+    0
+}
+
 #[no_mangle]
 pub extern "C" fn nvmtl_translate_fc(
     ll: *const c_char, stage: *const c_char,
