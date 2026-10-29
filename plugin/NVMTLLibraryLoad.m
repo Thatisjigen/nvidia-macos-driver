@@ -10,6 +10,7 @@
 #include <dirent.h>
 #import "NVMTLObjects.h"
 #include <dlfcn.h>
+#include <syslog.h>
 #include <stdatomic.h>
 #include <spawn.h>
 #include <sys/wait.h>
@@ -121,6 +122,9 @@ static nvmtl_link_fn xlate_link;
 typedef int (*nvmtl_link_rt_fn)(const char *, const char *, const char *const *, const char *const *, size_t,
                                 const char *const *, const char *const *, size_t, uint8_t **, size_t *, char *, size_t);
 static nvmtl_link_rt_fn xlate_link_rt;
+/* b210: AIR -> AIR function-constant specialization (nvmtl_specialize_air), for linked visible functions */
+typedef int (*nvmtl_spec_air_fn)(const char *, const uint32_t *, const uint32_t *, const uint8_t *const *, size_t, uint8_t **, size_t *, char *, size_t);
+static nvmtl_spec_air_fn xlate_spec_air;
 typedef int (*nvmtl_link_ext_fn)(const char *, const char *const *, size_t, uint8_t **, size_t *, char *, size_t);
 static nvmtl_link_ext_fn xlate_link_ext;
 typedef int (*nvmtl_lower_mesh_fn)(const char *, const char *, uint8_t **, size_t *, uint8_t **, size_t *, uint32_t *, char *, size_t);
@@ -177,6 +181,7 @@ static int nvmtl_xlate_ready(void) {
         xlate_vrefs = (nvmtl_vrefs_fn)dlsym(h, "nvmtl_visible_refs");
         xlate_link = (nvmtl_link_fn)dlsym(h, "nvmtl_link_visible");
         xlate_link_rt = (nvmtl_link_rt_fn)dlsym(h, "nvmtl_link_runtime");
+        xlate_spec_air = (nvmtl_spec_air_fn)dlsym(h, "nvmtl_specialize_air");
         if (!xlate_link_rt) nvlog("translate: no nvmtl_link_runtime in this translator - visible function tables cannot be linked");
         xlate_link_ext = (nvmtl_link_ext_fn)dlsym(h, "nvmtl_link_externs");
         xlate_tile_rewrite = (nvmtl_tile_rewrite_fn)dlsym(h, "nvmtl_tile_rewrite");
@@ -3018,6 +3023,37 @@ static NSCache *nvmtl_link_failures(void) {
 static id nvmtl_link_failure_key(NVMTLFunction *fn, NSDictionary *mods, NSArray *tc, NSDictionary *fc) {
     return @[fn->_air ?: @"", fn->_stage ?: @"", mods ?: @{}, tc ?: @[], fc ?: @{}];
 }
+/* b210: a linked function's own function constants, folded into its own AIR before linking. Metal gives every function
+   its own constant index space; b209 and before merged all of them into one table by index (the caller's values won),
+   so a linked function whose constant shares an index with the caller's - or with another linked function's - ran
+   with the wrong values. Tahoe's icon renderer links its Core Image effects into custom_effect_fragment this way, and
+   icons came out as a solid square in the style colour (10-28 capture: the shape layer drawn by custom_effect is
+   opaque everywhere). NULL = leave the module as it was (no constants, or the translator lacks the call). */
+static NSString *nvmtl_link_specialize_candidate(NVMTLFunction *cf, NSString *air) {
+    if (!cf->_fc.count || !air.length) return air;
+    if (!xlate_spec_air || !xlate_free) { nvlog("link: \"%s\" has %lu constant(s) of its own but this translator has no nvmtl_specialize_air - merged by index as before",
+                                               cf->_fname.UTF8String, (unsigned long)cf->_fc.count); return nil; }
+    size_t n = cf->_fc.count, k = 0;
+    uint32_t *idx = calloc(n, sizeof *idx), *sz = calloc(n, sizeof *sz);
+    uint8_t (*bytes)[16] = calloc(n, 16); const uint8_t **pay = calloc(n, sizeof *pay);
+    if (!idx || !sz || !bytes || !pay) { free(idx); free(sz); free(bytes); free(pay); return nil; }
+    for (NSString *ki in cf->_fc) {
+        NSArray *a = cf->_fc[ki];
+        if (![a isKindOfClass:[NSArray class]] || !a.count || a.count > 16) continue;
+        idx[k] = (uint32_t)ki.integerValue; sz[k] = (uint32_t)a.count;
+        for (NSUInteger j = 0; j < a.count; j++) bytes[k][j] = (uint8_t)[a[j] unsignedCharValue];
+        pay[k] = bytes[k]; k++;
+    }
+    uint8_t *out = NULL; size_t len = 0; char e[512] = {0};
+    int rc = xlate_spec_air(air.UTF8String, idx, sz, pay, k, &out, &len, e, sizeof e);
+    free(idx); free(sz); free(bytes); free(pay);
+    if (rc != 0 || !out) { syslog(LOG_NOTICE, "NullMoth: link: \"%s\": its own %zu constant(s) could not be folded in (%s) - merged by index as before",
+                                  cf->_fname.UTF8String, k, e[0] ? e : "?"); return nil; }
+    NSString *r = [[NSString alloc] initWithBytes:out length:(len && out[len-1] == 0) ? len - 1 : len encoding:NSUTF8StringEncoding];
+    xlate_free(out, len);
+    if (r) { static int said; if (said++ < 40) syslog(LOG_NOTICE, "NullMoth: link: \"%s\": its own %zu constant(s) folded into its module before linking (b210)", cf->_fname.UTF8String, k); }
+    return r;
+}
 id<MTLFunction> nvmtl_link_stage(id<MTLFunction> kIn, MTLLinkedFunctions *lfIn, NSArray *dylibs, NSError **err)
 {
     if (err) *err = nil;
@@ -3107,9 +3143,13 @@ id<MTLFunction> nvmtl_link_stage(id<MTLFunction> kIn, MTLLinkedFunctions *lfIn, 
             (unsigned long)cf->_air.length, (unsigned long)cf->_fc.count];
         if (!cf->_air.length) continue;
         NSString *air = nvmtl_link_candidate_air(cf, NULL);
+        NSString *sp = nvmtl_link_specialize_candidate(cf, air);
+        const BOOL folded = sp && sp != air;
+        if (sp) air = sp;
         /* Only names the module really defines: validate_linkage() refuses the whole link otherwise. */
         for (NSString *nm in @[cf->_specName ?: @"", cf.name ?: @"", cf->_fname ?: @""])
             if (nm.length && !mods[nm] && nvmtl_air_defines(air, nm)) mods[nm] = air;
+        if (folded) continue;   /* b210: its constants live in its own module now - not in the caller's table */
         for (NSString *ki in cf->_fc) {
             if (fc[ki] && ![fc[ki] isEqual:cf->_fc[ki]]) nvlog("link: constant %s differs between linked functions - first kept", ki.UTF8String);
             else fc[ki] = cf->_fc[ki];
@@ -3175,7 +3215,7 @@ id<MTLFunction> nvmtl_link_stage(id<MTLFunction> kIn, MTLLinkedFunctions *lfIn, 
         const char **cs = calloc(tc.count ? tc.count : 1, sizeof *cs), **cm = calloc(tc.count ? tc.count : 1, sizeof *cm);
         size_t j = 0; for (NSString *s in refs) if (mods[s]) { rs[j] = s.UTF8String; rm[j] = [mods[s] UTF8String]; j++; }
         NSMutableArray *keep = [NSMutableArray arrayWithCapacity:tc.count * 2];
-        for (NSUInteger i = 0; i < tc.count; i++) { NVMTLFunction *cf = tc[i]; NSString *cn = nil; NSString *ca = nvmtl_link_candidate_air(cf, &cn);
+        for (NSUInteger i = 0; i < tc.count; i++) { NVMTLFunction *cf = tc[i]; NSString *cn = nil; NSString *ca = nvmtl_link_candidate_air(cf, &cn); { NSString *sp = nvmtl_link_specialize_candidate(cf, ca); if (sp) ca = sp; }
             [keep addObject:cn ?: @""]; [keep addObject:ca ?: @""];
             cs[i] = [keep[2 * i] UTF8String]; cm[i] = [keep[2 * i + 1] UTF8String]; }
         nvlog("link: \"%s\" reads a visible function table - %lu table candidate(s), %zu direct reference(s)", fn->_fname.UTF8String, (unsigned long)tc.count, nr);
