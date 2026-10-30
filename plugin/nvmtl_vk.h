@@ -108,6 +108,13 @@ typedef struct { void *cb; void *fb; void *pool; void *dset[2]; void *depth_view
                  /* Vulkan graphics bindings persist until changed; compute has its own bind point. */
                  void *graphics_pipeline, *graphics_layout, *graphics_sets[3];
                  uint32_t graphics_set_count, graphics_offset_count, graphics_offsets[4], gl_uniform_dyn[2];
+                 void *fetch_bound_layout, *fetch_bound_set;
+                 /* Separate compute state, including internal dispatches. Zeroed at every recording begin. */
+                 void *compute_pipeline, *compute_layout, *compute_sets[3];
+                 uint32_t compute_set_count, compute_offset_count, compute_offsets[2];
+                 /* Successful variants only. Their owning pipelines are retained by the recording's resources. */
+                 struct { const nvk_pipeline *owner; void *pipe; uint32_t local[3]; } compute_variants[8];
+                 uint32_t compute_variant_next;
                  uint32_t gl_uniform_result; /* optional diagnostics for the next recorded draw */
                  /* hazard model inputs (nvmtl_hazard.h): writable buffer slots and storage textures per stage, the
                     sampled textures each stage's SPIR-V names; hz_dyn = the open pass began with vkCmdBeginRendering */
