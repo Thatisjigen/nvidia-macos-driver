@@ -7323,8 +7323,8 @@ int nvmtl_vk_cmd_begin_pass(nvk_cmdbuf *c, const nvk_pass *ps, nvk_pipeline *p)
     c->in_rp = 1;
     for (uint32_t i = 0; i < NVMTL_NCOL; i++) c->fetchview[i] = (i < ncol && cf[i]) ? ps->colview[i] : NULL;
     if (p->pipe) nvmtl_vk_cmd_bind_pipeline(c, p);
-    VkViewport vp = { 0, (float)ps->h, (float)ps->w, -(float)ps->h, 0, 1 }; VkRect2D sc = { { 0, 0 }, { ps->w, ps->h } };
-    pvkCmdSetViewport(c->cb, 0, 1, &vp); pvkCmdSetScissor(c->cb, 0, 1, &sc);
+    nvmtl_vk_cmd_set_viewport(c, 0, 0, (float)ps->w, (float)ps->h, 0, 1);
+    nvmtl_vk_cmd_set_scissor(c, 0, 0, ps->w, ps->h);
     return 0;
 }
 int nvmtl_vk_cmd_begin_render_ms(nvk_cmdbuf *c, nvk_image *img, nvk_pipeline *p, const float clear[4], uint32_t load, nvk_image *resolve)
@@ -7648,6 +7648,11 @@ int nvmtl_vk_cmd_empty_pass(nvk_cmdbuf *c, const nvk_pass *ps)
 }
 int nvmtl_vk_cmd_begin_render(nvk_cmdbuf *c, nvk_image *img, nvk_pipeline *p, const float clear[4])
 { return nvmtl_vk_cmd_begin_render_ex(c, img, p, clear, 0); }
+#define NVMTL_DYN_VIEWPORT (1u << 0)
+#define NVMTL_DYN_SCISSOR  (1u << 1)
+#define NVMTL_DYN_TOPOLOGY (1u << 2)
+#define NVMTL_DYN_CULL    (1u << 3)
+#define NVMTL_DYN_BLEND   (1u << 4)
 void nvmtl_vk_cmd_set_viewport(nvk_cmdbuf *c, float x, float y, float w, float h, float zn, float zf)
 {
     /* Vulkan requires minDepth/maxDepth in [0,1] and NVK asserts it (nvk_emit_viewport "0.0 <= zmin && zmin <= 1.0");
@@ -7655,7 +7660,10 @@ void nvmtl_vk_cmd_set_viewport(nvk_cmdbuf *c, float x, float y, float w, float h
        every run. The !(>=) form also sends NaN to Metal's defaults, 0 and 1. */
     if (!(zn >= 0.0f)) zn = 0.0f; else if (zn > 1.0f) zn = 1.0f;
     if (!(zf >= 0.0f)) zf = isnan(zf) ? 1.0f : 0.0f; else if (zf > 1.0f) zf = 1.0f;
-    VkViewport vp = { x, y + h, w, -h, zn, zf }; pvkCmdSetViewport(c->cb, 0, 1, &vp);
+    VkViewport vp = { x, y + h, w, -h, zn, zf };
+    if ((c->dyn_valid & NVMTL_DYN_VIEWPORT) && !memcmp(&c->dyn_viewport, &vp, sizeof vp)) return;
+    pvkCmdSetViewport(c->cb, 0, 1, &vp);
+    c->dyn_viewport = vp; c->dyn_valid |= NVMTL_DYN_VIEWPORT;
 }
 static void nvmtl_vk_zero_dummies(void)
 {
@@ -7794,7 +7802,12 @@ void nvmtl_vk_cmd_draw(nvk_cmdbuf *c, uint32_t first, uint32_t count, uint32_t i
     NVMTL_SEMU_DRAW(c, pvkCmdDraw(c->cb, count, n, first, baseInstance));
 }
 void nvmtl_vk_cmd_set_scissor(nvk_cmdbuf *c, int32_t x, int32_t y, uint32_t w, uint32_t h)
-{ VkRect2D r = { { x, y }, { w, h } }; pvkCmdSetScissor(c->cb, 0, 1, &r); }
+{
+    VkRect2D r = { { x, y }, { w, h } };
+    if ((c->dyn_valid & NVMTL_DYN_SCISSOR) && !memcmp(&c->dyn_scissor, &r, sizeof r)) return;
+    pvkCmdSetScissor(c->cb, 0, 1, &r);
+    c->dyn_scissor = r; c->dyn_valid |= NVMTL_DYN_SCISSOR;
+}
 void nvmtl_vk_cmd_bind_pipeline(nvk_cmdbuf *c, nvk_pipeline *p) {
     p = nvmtl_uniform_cbuf_pick(c, p);
     if (p->pipe && c->graphics_pipeline == p->pipe) return;
@@ -7813,8 +7826,11 @@ int nvmtl_vk_cmd_set_topology(nvk_cmdbuf *c, unsigned mtlType) {
     if (mtlType < 3 && !g_topo_any) { static int said2; if (said2++ < 4) nvlog("G14 draw: point/line primitives need "
         "dynamicPrimitiveTopologyUnrestricted, which this device does not report — NOT drawn (was: rasterised as triangles)"); return -1; }
     c->topo = mtlType;
+    const uint32_t restart = (mtlType == 2 || mtlType == 4) && !c->restart_off ? VK_TRUE : VK_FALSE;
+    if ((c->dyn_valid & NVMTL_DYN_TOPOLOGY) && c->dyn_topology == map[mtlType] && c->dyn_restart == restart) return 0;
     pvkCmdSetPrimitiveTopology(c->cb, map[mtlType]);
-    pvkCmdSetPrimitiveRestartEnable(c->cb, (mtlType == 2 || mtlType == 4) && !c->restart_off ? VK_TRUE : VK_FALSE);
+    pvkCmdSetPrimitiveRestartEnable(c->cb, restart);
+    c->dyn_topology = map[mtlType]; c->dyn_restart = restart; c->dyn_valid |= NVMTL_DYN_TOPOLOGY;
     if (mtlType != 3) { static int told[5]; if (!told[mtlType]++) nvlog("G14 first draw of MTLPrimitiveType %u in this process", mtlType); }
     return 0;
 }
@@ -7843,8 +7859,12 @@ int nvmtl_vk_cmd_vertex_inputs(nvk_cmdbuf *c, const nvk_pipeline *p, const uint3
 void nvmtl_vk_cmd_set_cull(nvk_cmdbuf *c, int mode)
 {
     int m = mode & 3;
-    pvkCmdSetCullMode(c->cb, m == 1 ? VK_CULL_MODE_FRONT_BIT : m == 2 ? VK_CULL_MODE_BACK_BIT : VK_CULL_MODE_NONE);
-    pvkCmdSetFrontFace(c->cb, (mode & 4) ? VK_FRONT_FACE_COUNTER_CLOCKWISE : VK_FRONT_FACE_CLOCKWISE);
+    const uint32_t cull = m == 1 ? VK_CULL_MODE_FRONT_BIT : m == 2 ? VK_CULL_MODE_BACK_BIT : VK_CULL_MODE_NONE;
+    const uint32_t front = (mode & 4) ? VK_FRONT_FACE_COUNTER_CLOCKWISE : VK_FRONT_FACE_CLOCKWISE;
+    if ((c->dyn_valid & NVMTL_DYN_CULL) && c->dyn_cull == cull && c->dyn_front == front) return;
+    pvkCmdSetCullMode(c->cb, cull);
+    pvkCmdSetFrontFace(c->cb, front);
+    c->dyn_cull = cull; c->dyn_front = front; c->dyn_valid |= NVMTL_DYN_CULL;
 }
 // An index offset at or past the end of the index buffer: Vulkan's whole-size bind then underflows to a range over
 // 4 GB and NVK's assert aborted the app (1.13 crash report, a video app drawing through OpenGL). Metal treats such a draw
@@ -7873,7 +7893,12 @@ void nvmtl_vk_cmd_draw_indexed(nvk_cmdbuf *c, nvk_buffer *idx, size_t offset, ui
     NVMTL_SEMU_DRAW(c, pvkCmdDrawIndexed(c->cb, count, n, 0, baseVertex, baseInstance));
 }
 
-void nvmtl_vk_cmd_set_blend_color(nvk_cmdbuf *c, const float rgba[4]) { pvkCmdSetBlendConstants(c->cb, rgba); }
+void nvmtl_vk_cmd_set_blend_color(nvk_cmdbuf *c, const float rgba[4])
+{
+    if ((c->dyn_valid & NVMTL_DYN_BLEND) && !memcmp(c->dyn_blend, rgba, 4 * sizeof *rgba)) return;
+    pvkCmdSetBlendConstants(c->cb, rgba);
+    memcpy(c->dyn_blend, rgba, 4 * sizeof *rgba); c->dyn_valid |= NVMTL_DYN_BLEND;
+}
 void nvmtl_vk_cmd_set_stencil_ref(nvk_cmdbuf *c, uint32_t front, uint32_t back)
 {
     c->st_ref[0] = front; c->st_ref[1] = back;
@@ -9215,8 +9240,11 @@ int nvmtl_vk_cmd_draw_patches(nvk_cmdbuf *c, const nvk_pipeline *p, uint64_t fac
             "4-byte aligned — NOT drawn (the TESC loads whole words)", i); return -1; }
     }
     pvkCmdPushConstants(c->cb, (VkPipelineLayout)p->layout, VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT, 0, sizeof pc, &pc);
-    pvkCmdSetPrimitiveTopology(c->cb, VK_PRIMITIVE_TOPOLOGY_PATCH_LIST);
-    pvkCmdSetPrimitiveRestartEnable(c->cb, VK_FALSE);
+    if (!(c->dyn_valid & NVMTL_DYN_TOPOLOGY) || c->dyn_topology != VK_PRIMITIVE_TOPOLOGY_PATCH_LIST || c->dyn_restart != VK_FALSE) {
+        pvkCmdSetPrimitiveTopology(c->cb, VK_PRIMITIVE_TOPOLOGY_PATCH_LIST);
+        pvkCmdSetPrimitiveRestartEnable(c->cb, VK_FALSE);
+        c->dyn_topology = VK_PRIMITIVE_TOPOLOGY_PATCH_LIST; c->dyn_restart = VK_FALSE; c->dyn_valid |= NVMTL_DYN_TOPOLOGY;
+    }
     if (ind) pvkCmdDrawIndirect(c->cb, (VkBuffer)ind->buf, indoff, 1, 0);
     else pvkCmdDraw(c->cb, count, instances ? instances : 1, start, baseInstance);
     { static int told; if (!told++) nvlog("tess: first patch draw in this process (%s)", ind ? "indirect" : "direct"); }

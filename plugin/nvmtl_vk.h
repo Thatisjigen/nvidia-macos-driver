@@ -109,6 +109,12 @@ typedef struct { void *cb; void *fb; void *pool; void *dset[2]; void *depth_view
                  void *graphics_pipeline, *graphics_layout, *graphics_sets[3];
                  uint32_t graphics_set_count, graphics_offset_count, graphics_offsets[4], gl_uniform_dyn[2];
                  void *fetch_bound_layout, *fetch_bound_set;
+                 /* Dynamic graphics state also persists for the command buffer.  Keep the last normalized values so
+                    WindowServer's repeated quad setup does not record identical Vulkan commands. */
+                 uint32_t dyn_valid, dyn_topology, dyn_restart, dyn_cull, dyn_front;
+                 VkViewport dyn_viewport;
+                 VkRect2D dyn_scissor;
+                 float dyn_blend[4];
                  /* Separate compute state, including internal dispatches. Zeroed at every recording begin. */
                  void *compute_pipeline, *compute_layout, *compute_sets[3];
                  uint32_t compute_set_count, compute_offset_count, compute_offsets[2];
