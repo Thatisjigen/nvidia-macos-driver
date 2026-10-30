@@ -5231,9 +5231,20 @@ static void nvmtl_bind_graphics_sets(nvk_cmdbuf *c, VkPipelineLayout layout, uin
     for (uint32_t i = 0; same && i < offset_count; i++) same = c->graphics_offsets[i] == offsets[i];
     if (same) return;
     pvkCmdBindDescriptorSets(c->cb, VK_PIPELINE_BIND_POINT_GRAPHICS, layout, 0, count, sets, offset_count, offsets);
+    // Binding lower sets with a different layout can disturb the higher fetch set.
+    if (c->fetch_bound_layout != (void *)layout) c->fetch_bound_set = NULL;
     c->graphics_layout = (void *)layout; c->graphics_set_count = count; c->graphics_offset_count = offset_count;
     for (uint32_t i = 0; i < count; i++) c->graphics_sets[i] = (void *)sets[i];
     for (uint32_t i = 0; i < offset_count; i++) c->graphics_offsets[i] = offsets[i];
+}
+
+static void nvmtl_bind_fetch_set(nvk_cmdbuf *c, VkPipelineLayout layout, VkDescriptorSet set)
+{
+    if (c->fetch_bound_layout == (void *)layout && c->fetch_bound_set == (void *)set) return;
+    pvkCmdBindDescriptorSets(c->cb, VK_PIPELINE_BIND_POINT_GRAPHICS, layout, NVMTL_FETCH_SET, 1, &set, 0, NULL);
+    // Conversely, a fetch bind with an incompatible layout disturbs the lower sets.
+    if (c->graphics_layout != (void *)layout) c->graphics_layout = NULL;
+    c->fetch_bound_layout = (void *)layout; c->fetch_bound_set = (void *)set;
 }
 
 void nvmtl_vk_cmd_bind_set(nvk_cmdbuf *c, nvk_pipeline *p)
@@ -5264,13 +5275,13 @@ void nvmtl_vk_cmd_bind_set(nvk_cmdbuf *c, nvk_pipeline *p)
     }
     if (p->fetch_zero) {
         VkDescriptorSet zs = nvmtl_fetch_zero_set();
-        if (zs) pvkCmdBindDescriptorSets(c->cb, VK_PIPELINE_BIND_POINT_GRAPHICS, (VkPipelineLayout)p->layout, NVMTL_FETCH_SET, 1, &zs, 0, NULL);
+        if (zs) nvmtl_bind_fetch_set(c, (VkPipelineLayout)p->layout, zs);
         else { static int said; if (said++ < 4) nvlog("vk: no descriptor set for the [[color(n)]] reads of a pipeline with fetch off - they stay undefined"); }
     }
     if (p->fetch_mask && c->in_rp) {
         VkDescriptorSet fs = nvmtl_fetch_set(c, p->fetch_mask);
         if (!fs) { static int said; if (said++ < 4) nvlog("vk: framebuffer fetch set could not be made (mask 0x%x) - this draw is skipped", p->fetch_mask); c->nobind = 1; return; }
-        pvkCmdBindDescriptorSets(c->cb, VK_PIPELINE_BIND_POINT_GRAPHICS, (VkPipelineLayout)p->layout, NVMTL_FETCH_SET, 1, &fs, 0, NULL);
+        nvmtl_bind_fetch_set(c, (VkPipelineLayout)p->layout, fs);
         nvmtl_fetch_barrier(c);
         c->fetch_draw = 1;
     }
@@ -6513,6 +6524,52 @@ static VkPipeline nvmtl_compute_variant(nvk_pipeline *p, const uint32_t l[3])
     return found;
 }
 
+static VkPipeline nvmtl_compute_variant_cached(nvk_cmdbuf *c, nvk_pipeline *p, const uint32_t local[3])
+{
+    // A recording retains its pipelines, including their module and all successful variants.
+    // Check recent threadgroup sizes without taking the process-wide variant compilation mutex.
+    // Never cache a failed build, so allocation failures remain retryable.
+    for (uint32_t n = 0; n < 8; n++) {
+        uint32_t i = (c->compute_variant_next - 1 - n) & 7;
+        if (c->compute_variants[i].owner == p &&
+            !memcmp(c->compute_variants[i].local, local, sizeof c->compute_variants[i].local))
+            return (VkPipeline)c->compute_variants[i].pipe;
+    }
+    VkPipeline found = nvmtl_compute_variant(p, local);
+    if (found) {
+        uint32_t i = c->compute_variant_next++ & 7;
+        c->compute_variants[i].owner = p; c->compute_variants[i].pipe = (void *)found;
+        memcpy(c->compute_variants[i].local, local, sizeof c->compute_variants[i].local);
+    }
+    return found;
+}
+
+static void nvmtl_bind_compute_pipeline(nvk_cmdbuf *c, VkPipeline pipeline)
+{
+    if (pipeline && c->compute_pipeline == (void *)pipeline) return;
+    pvkCmdBindPipeline(c->cb, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
+    c->compute_pipeline = (void *)pipeline;
+}
+
+static void nvmtl_bind_compute_sets(nvk_cmdbuf *c, VkPipelineLayout layout, uint32_t count,
+                                   const VkDescriptorSet *sets, uint32_t offset_count, const uint32_t *offsets)
+{
+    int same = c->compute_layout == (void *)layout && c->compute_set_count == count
+        && c->compute_offset_count == offset_count;
+    for (uint32_t i = 0; same && i < count; i++) same = c->compute_sets[i] == (void *)sets[i];
+    for (uint32_t i = 0; same && i < offset_count; i++) same = c->compute_offsets[i] == offsets[i];
+    if (same) return;
+    pvkCmdBindDescriptorSets(c->cb, VK_PIPELINE_BIND_POINT_COMPUTE, layout, 0, count, sets, offset_count, offsets);
+    c->compute_layout = (void *)layout; c->compute_set_count = count; c->compute_offset_count = offset_count;
+    for (uint32_t i = 0; i < count; i++) c->compute_sets[i] = (void *)sets[i];
+    for (uint32_t i = 0; i < offset_count; i++) c->compute_offsets[i] = offsets[i];
+}
+
+static void nvmtl_compute_bindings_invalidate(nvk_cmdbuf *c)
+{
+    c->compute_pipeline = NULL; c->compute_layout = NULL;
+}
+
 int nvmtl_vk_cmd_dispatch_sass(nvk_cmdbuf *c,
                                const void *sass, uint32_t sass_len,
                                uint32_t regs, uint32_t smem, uint32_t barriers, uint32_t nparams,
@@ -6566,6 +6623,8 @@ int nvmtl_vk_cmd_dispatch_sass(nvk_cmdbuf *c,
         params[i] = s->address + (uint64_t)s->off;
     }
 
+    // The native hook bypasses Vulkan binding calls. Even a failed hook may have changed backend state.
+    nvmtl_compute_bindings_invalidate(c);
     int rc = hook(c->cb, sass, sass_len, regs, smem, barriers, params, nparams, tg, grid);
     if (rc) { nvlog("sass dispatch: NVK refused it, rc=%d", rc); return -8; }
     if (nvmtl_trace_on())
@@ -7316,10 +7375,10 @@ void nvmtl_vk_cmd_dispatch_threads(nvk_cmdbuf *c, nvk_pipeline *p, const uint32_
             if (!gc[d]) nonempty = 0;
         }
         if (!nonempty) continue;
-        VkPipeline vp = nvmtl_compute_variant(p, local);
+        VkPipeline vp = nvmtl_compute_variant_cached(c, p, local);
         if (!vp) { c->skipped++; continue; }
-        pvkCmdBindPipeline(c->cb, VK_PIPELINE_BIND_POINT_COMPUTE, vp);
-        if (!bound) { pvkCmdBindDescriptorSets(c->cb, VK_PIPELINE_BIND_POINT_COMPUTE, (VkPipelineLayout)p->layout, 0, g_heapSet ? 3 : 2, s, nvmtl_table_ubo() ? 2 : 0, c->dyn_out); bound = 1; }
+        nvmtl_bind_compute_pipeline(c, vp);
+        if (!bound) { nvmtl_bind_compute_sets(c, (VkPipelineLayout)p->layout, g_heapSet ? 3 : 2, s, nvmtl_table_ubo() ? 2 : 0, c->dyn_out); bound = 1; }
         // Metal allows any group count per axis; Vulkan caps it (NVK: 0x7fffffff x 65535 x 65535, the width of the QMD
         // grid fields). Geekbench's OpenCL Face Detection dispatched past 65535 on y and NAK's nak_fill_qmd aborted the
         // process. Split into chunks and advance thread_base/threadgroup_base, which the translated kernel adds to
@@ -7408,14 +7467,14 @@ void nvmtl_vk_cmd_dispatch_indirect_tg(nvk_cmdbuf *c, nvk_pipeline *p, nvk_buffe
     uint32_t tg[3], g[3] = { 0, 0, 0 };
     for (int d = 0; d < 3; d++) { if (!tgIn[d]) return; tg[d] = tgIn[d]; }
     if (!(p = nvmtl_align_guard_pick(c, p))) { c->skipped++; return; }
-    VkPipeline vp = nvmtl_compute_variant(p, tg);
+    VkPipeline vp = nvmtl_compute_variant_cached(c, p, tg);
     if (!vp) { c->skipped++; return; }
     VkDescriptorSet s[3] = { nvmtl_snapshot_set_c(c, 0, p), nvmtl_snapshot_set_c(c, 1, p), g_heapSet };
     if (!s[0] || !s[1]) { c->nobind = 1; return; }
     c->nobind = 0;
     (void)g;   // the grid is the GPU's to write: never read at record time (it was stale or 0, Eevee's light culling)
-    pvkCmdBindPipeline(c->cb, VK_PIPELINE_BIND_POINT_COMPUTE, vp);
-    pvkCmdBindDescriptorSets(c->cb, VK_PIPELINE_BIND_POINT_COMPUTE, (VkPipelineLayout)p->layout, 0, g_heapSet ? 3 : 2, s, nvmtl_table_ubo() ? 2 : 0, c->dyn_out);
+    nvmtl_bind_compute_pipeline(c, vp);
+    nvmtl_bind_compute_sets(c, (VkPipelineLayout)p->layout, g_heapSet ? 3 : 2, s, nvmtl_table_ubo() ? 2 : 0, c->dyn_out);
     // 0x80000000 | threadgroup size: the shader takes threads_per_grid and threadgroups_per_grid from NumWorkgroups
     // (translator stage_input/kernel_grid.rs), the grid the GPU actually dispatched
     const uint32_t F = 0x80000000u;
@@ -7429,12 +7488,12 @@ void nvmtl_vk_cmd_dispatch_indirect_tg(nvk_cmdbuf *c, nvk_pipeline *p, nvk_buffe
 }
 void nvmtl_vk_cmd_dispatch(nvk_cmdbuf *c, nvk_pipeline *p, uint32_t gx, uint32_t gy, uint32_t gz)
 {
-    pvkCmdBindPipeline(c->cb, VK_PIPELINE_BIND_POINT_COMPUTE, (VkPipeline)p->pipe);
+    nvmtl_bind_compute_pipeline(c, (VkPipeline)p->pipe);
     VkDescriptorSet s[3] = { nvmtl_snapshot_set_t(c, 0, p->stex_hi[0], p->tbany ? p->tbm[0] : NULL),
                              nvmtl_snapshot_set_t(c, 1, p->stex_hi[1], p->tbany ? p->tbm[1] : NULL), g_heapSet };
     if (!s[0] || !s[1]) { c->nobind = 1; return; }
     c->nobind = 0;
-    pvkCmdBindDescriptorSets(c->cb, VK_PIPELINE_BIND_POINT_COMPUTE, (VkPipelineLayout)p->layout, 0, g_heapSet ? 3 : 2, s, nvmtl_table_ubo() ? 2 : 0, c->dyn_out);
+    nvmtl_bind_compute_sets(c, (VkPipelineLayout)p->layout, g_heapSet ? 3 : 2, s, nvmtl_table_ubo() ? 2 : 0, c->dyn_out);
     // This path reads WorkgroupId raw (no base push constants), so it cannot be chunked. Past the device's group
     // count NAK aborts the whole app inside nak_fill_qmd; refuse the one dispatch loudly instead.
     if ((g_lim.maxComputeWorkGroupCount[1] && gy > g_lim.maxComputeWorkGroupCount[1]) ||
@@ -9864,7 +9923,7 @@ void nvmtl_vk_cmd_draw_indexed_indirect(nvk_cmdbuf *c, nvk_buffer *idx, size_t i
 }
 void nvmtl_vk_cmd_dispatch_indirect(nvk_cmdbuf *c, nvk_pipeline *p, nvk_buffer *b, size_t off)
 {
-    pvkCmdBindPipeline(c->cb, VK_PIPELINE_BIND_POINT_COMPUTE, (VkPipeline)p->pipe);
+    nvmtl_bind_compute_pipeline(c, (VkPipeline)p->pipe);
     if (c->nobind) return;
     nvmtl_fx_note_dispatch(c, p);
     pvkCmdDispatchIndirect(c->cb, (VkBuffer)b->buf, off);
@@ -10446,7 +10505,7 @@ int nvmtl_vk_cmd_sum_occlusion(nvk_cmdbuf *c, nvk_buffer *src, size_t first, uin
     };
     if (!args.src || !args.dst) return -1;
     nvmtl_vk_cmd_barrier(c);
-    pvkCmdBindPipeline(c->cb, VK_PIPELINE_BIND_POINT_COMPUTE, g_visibility_sum_pipeline);
+    nvmtl_bind_compute_pipeline(c, g_visibility_sum_pipeline);
     pvkCmdPushConstants(c->cb, g_visibility_sum_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof args, &args);
     pvkCmdDispatch(c->cb, 1, 1, 1);
     nvmtl_vk_cmd_barrier(c);
