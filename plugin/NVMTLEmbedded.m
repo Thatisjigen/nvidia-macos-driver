@@ -130,7 +130,7 @@ static NSUInteger nvmtl_ss_enum(NSDictionary *st, NSString *key, NSDictionary<NS
     if (!n) { *bad = YES; nvlog("static sampler: %s = %s has no Metal equivalent here", key.UTF8String, [v UTF8String]); return fallback; }
     return n.unsignedIntegerValue;
 }
-static id<MTLSamplerState> nvmtl_static_sampler_from(NSDictionary *st)
+static id<MTLSamplerState> nvmtl_static_sampler_from(NSDictionary *st, id<MTLDevice> device)
 {
     NSDictionary *filt = @{ @"Nearest": @(MTLSamplerMinMagFilterNearest), @"Linear": @(MTLSamplerMinMagFilterLinear) };
     NSDictionary *mip = @{ @"None": @(MTLSamplerMipFilterNotMipmapped), @"Nearest": @(MTLSamplerMipFilterNearest),
@@ -164,7 +164,7 @@ static id<MTLSamplerState> nvmtl_static_sampler_from(NSDictionary *st)
     // The device that draws, not MTLCreateSystemDefaultDevice(): with a second GPU the default can be that one, and its sampler
     // state read as an NVMTLSamplerState has no VkSampler. The slot then held the dummy sampler, which repeats and stays on level 0:
     // in WindowServer next to an Iris Xe, CoreAnimation's glass read its SDF past the edge and drew the shape again on the other side.
-    return [gNVMTLMainDevice newSamplerStateWithDescriptor:d];
+    return [device newSamplerStateWithDescriptor:d];
 }
 static const void *NVMTL_SSAMP_KEY = &NVMTL_SSAMP_KEY;
 static NSArray<NSArray *> *nvmtl_static_samplers(NVMTLFunction *fn)
@@ -184,7 +184,7 @@ static NSArray<NSArray *> *nvmtl_static_samplers(NVMTLFunction *fn)
             if (![b isKindOfClass:[NSDictionary class]] || ![b[@"kind"] isEqual:@"StaticSampler"]) continue;
             NSNumber *slot = b[@"metal_index"]; NSDictionary *st = b[@"static_sampler"];
             if (![slot isKindOfClass:[NSNumber class]] || ![st isKindOfClass:[NSDictionary class]]) continue;
-            id<MTLSamplerState> s = nvmtl_static_sampler_from(st);
+            id<MTLSamplerState> s = nvmtl_static_sampler_from(st, fn.device);
             if (s) [out addObject:@[slot, s]];
             else nvlog("static sampler: %s slot %@ NOT created - it keeps the dummy sampler", fn->_fname.UTF8String, slot);
         }
@@ -286,8 +286,18 @@ static void nvmtl_clear_embedded_slot(NVMTLCommandBuffer *cb, uint32_t set, uint
 void nvmtl_bind_embedded(NVMTLCommandBuffer *cb, uint32_t set, NVMTLFunction *fn, NVMTLBuffer *__strong const *bufAt, const NSUInteger *offAt)
 {
     if (!cb || !fn) return;
+    // Cached metadata is immutable, but sampler restoration is recording-local and still required.
+    if (__atomic_load_n(&fn->_bindingMetadataEmpty, __ATOMIC_ACQUIRE)) {
+        nvmtl_vk_parked_samplers_keep(&cb->_c, set, 0);
+        return;
+    }
     NSArray<NSArray *> *statics = nvmtl_static_samplers_on() ? nvmtl_static_samplers(fn) : nil;
     NSArray<NVMTLEmbeddedPlan *> *embedded = nvmtl_embedded_plan(fn);
+    if (!statics.count && !embedded.count) {
+        __atomic_store_n(&fn->_bindingMetadataEmpty, 1, __ATOMIC_RELEASE);
+        nvmtl_vk_parked_samplers_keep(&cb->_c, set, 0);
+        return;
+    }
     // give the app back any sampler slot an earlier shader parked its own sampler in and this one leaves alone
     uint32_t keep = 0;
     for (NSArray *pair in statics) { uint32_t i = [pair[0] unsignedIntValue]; if (i < 32) keep |= 1u << i; }
@@ -393,7 +403,7 @@ void nvmtl_bind_embedded(NVMTLCommandBuffer *cb, uint32_t set, NVMTLFunction *fn
 void nvmtl_bind_embedded_enc(NVMTLCommandBuffer *cb, uint32_t set, NVMTLFunction *fn, NVMTLComputeCommandEncoder *e)
 {
     NVMTLBuffer *bufs[NVMTL_NBUFAT] = { nil }; NSUInteger offs[NVMTL_NBUFAT] = { 0 };
-    if (e && fn && nvmtl_embedded_plan(fn).count)
+    if (e && fn && !__atomic_load_n(&fn->_bindingMetadataEmpty, __ATOMIC_ACQUIRE) && nvmtl_embedded_plan(fn).count)
         for (NSUInteger i = 0; i < NVMTL_NBUFAT; i++)
             if (e->_baN[i] && e->_baObj[i]) { bufs[i] = e->_baObj[i]; offs[i] = e->_baOff[i]; }
     nvmtl_bind_embedded(cb, set, fn, bufs, offs);

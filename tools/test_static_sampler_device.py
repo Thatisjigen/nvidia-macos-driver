@@ -8,7 +8,8 @@ made = embedded[embedded.index('static id<MTLSamplerState> nvmtl_static_sampler_
 made = made[:made.index('\n}\n')]
 code = [l for l in made.splitlines() if not l.strip().startswith('//')]
 assert not any('MTLCreateSystemDefaultDevice' in l for l in code)
-assert any('[gNVMTLMainDevice newSamplerStateWithDescriptor:d]' in l for l in code)
+assert any('[device newSamplerStateWithDescriptor:d]' in l for l in code)
+assert 'nvmtl_static_sampler_from(st, fn.device)' in embedded
 assert not any('MTLCreateSystemDefaultDevice' in l and 'Sampler' in l for l in embedded.splitlines() if not l.strip().startswith('//'))
 vk = (root / 'plugin/nvmtl_vk.c').read_text()
 dummy = vk[vk.index('The sampler a shader gets at a slot nothing was bound to'):]
