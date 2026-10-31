@@ -62,7 +62,9 @@ void nvmtl_vk_pipeline_destroy(nvk_pipeline *p);
 typedef struct { void *pool; nvk_buffer stage; } nvk_queue;
 #include "nvmtl_sampler_desc.h"
 typedef struct { void *s; int linear, repeat; float lod_min, lod_max; nvmtl_sampler_desc desc; int full_state; } nvk_sampler;
-typedef struct { void *pool, *set; } nvk_setref;
+/* kind: 0 = freed to its pool at retire; 1 = snapshot set (g_setLayout), 2 = GL uniform set (g_glUniformLayout),
+   both kept for reuse by later command buffers. */
+typedef struct { void *pool, *set; unsigned kind; } nvk_setref;
 typedef struct {
     uint64_t gpu_tick, uptime_ns, uncertainty_ns;
     uint32_t valid_bits;
@@ -82,7 +84,7 @@ typedef struct { void *cb; void *fb; void *pool; void *dset[2]; void *depth_view
                  nvk_setref *sets; unsigned nsets, capsets;
                  void *address_pages; unsigned address_count;
                  unsigned nobind, skipped;
-                 void *dcache[32]; void *dcachepool; unsigned ndcache, dcache_gl_uniform;
+                 void *dcache[32]; void *dcachepools[32]; unsigned ndcache, dcache_gl_uniform;
                  unsigned in_rp, occlusion_reset; uint32_t wseq;
                  void *fetchview[NVMTL_NCOL];   /* the open pass's colour views, read by [[color(n)]] framebuffer fetch */
                  unsigned fetch_draw, topo;   /* the bound pipeline reads [[color(n)]] in this pass; last MTLPrimitiveType set */
