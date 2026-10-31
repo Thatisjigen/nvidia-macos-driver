@@ -284,8 +284,18 @@ static void nvmtl_clear_embedded_slot(NVMTLCommandBuffer *cb, uint32_t set, uint
 void nvmtl_bind_embedded(NVMTLCommandBuffer *cb, uint32_t set, NVMTLFunction *fn, NVMTLBuffer *__strong const *bufAt, const NSUInteger *offAt)
 {
     if (!cb || !fn) return;
+    // Cached metadata is immutable, but sampler restoration is recording-local and still required.
+    if (__atomic_load_n(&fn->_bindingMetadataEmpty, __ATOMIC_ACQUIRE)) {
+        nvmtl_vk_parked_samplers_keep(&cb->_c, set, 0);
+        return;
+    }
     NSArray<NSArray *> *statics = nvmtl_static_samplers_on() ? nvmtl_static_samplers(fn) : nil;
     NSArray<NVMTLEmbeddedPlan *> *embedded = nvmtl_embedded_plan(fn);
+    if (!statics.count && !embedded.count) {
+        __atomic_store_n(&fn->_bindingMetadataEmpty, 1, __ATOMIC_RELEASE);
+        nvmtl_vk_parked_samplers_keep(&cb->_c, set, 0);
+        return;
+    }
     // give the app back any sampler slot an earlier shader parked its own sampler in and this one leaves alone
     uint32_t keep = 0;
     for (NSArray *pair in statics) { uint32_t i = [pair[0] unsignedIntValue]; if (i < 32) keep |= 1u << i; }
@@ -391,7 +401,7 @@ void nvmtl_bind_embedded(NVMTLCommandBuffer *cb, uint32_t set, NVMTLFunction *fn
 void nvmtl_bind_embedded_enc(NVMTLCommandBuffer *cb, uint32_t set, NVMTLFunction *fn, NVMTLComputeCommandEncoder *e)
 {
     NVMTLBuffer *bufs[NVMTL_NBUFAT] = { nil }; NSUInteger offs[NVMTL_NBUFAT] = { 0 };
-    if (e && fn && nvmtl_embedded_plan(fn).count)
+    if (e && fn && !__atomic_load_n(&fn->_bindingMetadataEmpty, __ATOMIC_ACQUIRE) && nvmtl_embedded_plan(fn).count)
         for (NSUInteger i = 0; i < NVMTL_NBUFAT; i++)
             if (e->_baN[i] && e->_baObj[i]) { bufs[i] = e->_baObj[i]; offs[i] = e->_baOff[i]; }
     nvmtl_bind_embedded(cb, set, fn, bufs, offs);

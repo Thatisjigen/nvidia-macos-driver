@@ -71,6 +71,7 @@ static inline void *nvmtl_buf_cpu(NVMTLBuffer *b) { nvmtl_buf_settle(b); if (b->
 @end
 @interface NVMTLFunction : NSObject <MTLFunction> { @public NSData *_spirv; NSString *_fname; NSString *_stage; NSString *_air; NSDictionary *_fc; NSArray *_embedded; unsigned char _bcHash[32]; BOOL _bcHashed;
   NSDictionary *_refl; NSDictionary *_airNames; NSArray *_arguments;
+  uint8_t _bindingMetadataEmpty; // Atomic, monotonic cache of empty immutable binding metadata.
   id _lib; id _fcv; NSString *_specName; BOOL _needsLink; } @end
 NSDictionary *nvmtl_function_reflection(NVMTLFunction *function);
 NSDictionary *nvmtl_air_names(NVMTLFunction *function);
