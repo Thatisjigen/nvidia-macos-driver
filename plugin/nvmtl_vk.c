@@ -2836,6 +2836,7 @@ int nvmtl_vk_image_create(uint32_t w, uint32_t h, nvk_image *out) { return nvmtl
 #define NVMTL_STEX_BASE (NVMTL_ADDRESS_BINDING + 1)
 #define NVMTL_STEX_BINDING_NUMBER 480
 #define NVMTL_NBIND (NVMTL_STEX_BASE + NVMTL_NSTEX)
+#define NVMTL_BINDING_WORDS ((NVMTL_NBIND + 63) / 64)
 #define NVMTL_DISPATCH_PC_BYTES 48
 _Static_assert(NVMTL_STEX_BINDING_NUMBER == 480 && NVMTL_NSTEX == 128, "nvmtl_spirv_stex_hi() scans for this band by value");
 
@@ -2992,7 +2993,8 @@ static int nvmtl_dirty_only_on(void)
 typedef struct { void *mem; uint64_t lo, hi; uint8_t w, src, skip; } hz_ent;   // nvmtl_hazard.h: one access; mem NULL = any memory
 typedef struct { nvmtl_slot s[2][NVMTL_NBIND];
                  uint8_t dirty[2]; VkDescriptorSet last[2]; unsigned last_idx[2]; uint32_t last_hi[2]; uint64_t lastw[2][4];
-                 uint64_t chg[2][4]; uint64_t texgen[2]; const void *emb_fn[2]; uint64_t emb_gen[2]; uint32_t emb_n[2];
+                 uint64_t chg[2][NVMTL_BINDING_WORDS]; uint64_t texgen[2]; const void *emb_fn[2]; uint64_t emb_gen[2]; uint32_t emb_n[2];
+                 uint64_t address_tex[2][NVMTL_NTEX]; uint8_t address_tex_valid[2];
                  uint64_t emb_key[2][NVMTL_EMB_KEYMAX];
                  uint32_t lastdyn[2]; void *lasttab[2];
                  uint64_t lasttb[2][4];   /* the texel-buffer mask the last set was written with */
@@ -3702,6 +3704,7 @@ static int nvmtl_bind_slot(nvk_cmdbuf *c, uint32_t set, uint32_t binding, uint8_
         t->dirty[set] = 1;
         t->chg[set][binding >> 6] |= 1ull << (binding & 63);
         if (kind != NVMTL_SLOT_BUF || sl->kind != NVMTL_SLOT_BUF) t->texgen[set]++;
+        if (binding >= NVMTL_NBUF && binding < NVMTL_NBUF + NVMTL_NTEX) t->address_tex_valid[set] = 0;
     }
     if (sl->kind != kind || sl->h != h) nvmtl_hz_slot_bound(c, t, set, binding, kind, h);   // hazard keys change only with the handle
     sl->kind = kind; sl->h = h; sl->off = off;
@@ -4047,18 +4050,31 @@ static int nvmtl_address_snapshot(nvk_cmdbuf *c, uint32_t which, VkDescriptorBuf
     }
     uint64_t *addresses = (uint64_t *)((uint8_t *)page->buffer.map + slot * NVMTL_TABLE_BYTES);
     nvmtl_bindtable *t = c->table;
+    // Every unbound buffer uses the same address. Query it once, rather than
+    // calling through NVK for each of the usual 31 empty slots on every draw.
+    const uint64_t dummy = nvmtl_vk_buffer_address(&g_dummyBuf);
     for (unsigned i = 0; i < NVMTL_NBUF; ++i) {
         nvmtl_slot *s = t ? &t->s[which][i] : NULL;
-        addresses[i] = s && s->kind == NVMTL_SLOT_BUF ? s->address + s->off : nvmtl_vk_buffer_address(&g_dummyBuf);
+        addresses[i] = s && s->kind == NVMTL_SLOT_BUF ? s->address + s->off : dummy;
     }
     uint64_t self = nvmtl_vk_buffer_address(&page->buffer);
     if (!self) nvlog("address table: page has no device address - array_ref<void> arguments will read 0");
     else self += slot * NVMTL_TABLE_BYTES;
     for (unsigned i = 0; i < NVMTL_NBUF; ++i) addresses[NVMTL_NBUF + i] = self ? self + i * sizeof(uint64_t) : 0;
-    for (unsigned i = 0; i < NVMTL_NTEX; ++i) {
-        const nvmtl_slot *s = t ? &t->s[which][NVMTL_NBUF + i] : NULL;
-        addresses[2 * NVMTL_NBUF + i] = (s && s->kind == NVMTL_SLOT_TEX && s->h) ? (uint64_t)s->size : 0;
-    }
+    // Buffer offsets change much more often than texture bindings. Cache the
+    // texture-index portion in this recording's bind table, then copy it into
+    // each immutable GPU snapshot. Texture/view/texel transitions invalidate it
+    // in nvmtl_bind_slot; nvmtl_vk_bind_texture_view fills size before a snapshot.
+    if (t) {
+        if (!t->address_tex_valid[which]) {
+            for (unsigned i = 0; i < NVMTL_NTEX; ++i) {
+                const nvmtl_slot *s = &t->s[which][NVMTL_NBUF + i];
+                t->address_tex[which][i] = s->kind == NVMTL_SLOT_TEX && s->h ? (uint64_t)s->size : 0;
+            }
+            t->address_tex_valid[which] = 1;
+        }
+        memcpy(addresses + 2 * NVMTL_NBUF, t->address_tex[which], sizeof t->address_tex[which]);
+    } else memset(addresses + 2 * NVMTL_NBUF, 0, NVMTL_NTEX * sizeof(uint64_t));
     *out = (VkDescriptorBufferInfo){ page->buffer.buf, slot * NVMTL_TABLE_BYTES, NVMTL_TABLE_BYTES };
     c->address_count++;
     return 0;
@@ -4334,8 +4350,10 @@ static VkDescriptorSet nvmtl_snapshot_set_c(nvk_cmdbuf *c, uint32_t which, const
     // what changed is the table. On the same table page that is a new dynamic offset, not a new set.
     const int was = sametb && t->last[which] && t->dirty[which] && t->last_idx[which] < c->nsets
                     && (VkDescriptorSet)c->sets[t->last_idx[which]].set == t->last[which];
+    uint64_t nonbuffer_changes = t->chg[which][0] >> NVMTL_NBUF;
+    for (unsigned k = 1; k < NVMTL_BINDING_WORDS; k++) nonbuffer_changes |= t->chg[which][k];
     if (was && nvmtl_table_ubo() && hi <= t->last_hi[which] && !(pm[0] & 0xffffffffull)
-        && !(t->chg[which][0] >> 32) && !t->chg[which][1] && !t->chg[which][2] && !t->chg[which][3]) {
+        && !nonbuffer_changes) {
         int covered = 1;
         for (int k = 0; k < 4; k++) if (pm[k] & ~t->lastw[which][k]) covered = 0;
         const int table = NVMTL_E78_HAS(pm, NVMTL_ADDRESS_BINDING);
@@ -4354,15 +4372,15 @@ static VkDescriptorSet nvmtl_snapshot_set_c(nvk_cmdbuf *c, uint32_t which, const
     uint64_t m[4];
     for (int k = 0; k < 4; k++) m[k] = pm[k] | (live ? t->lastw[which][k] : 0);
     if (live && t->last_hi[which] > hi) hi = t->last_hi[which];
-    VkDescriptorSet from = VK_NULL_HANDLE; uint64_t cm[4] = { 0, 0, 0, 0 };
+    VkDescriptorSet from = VK_NULL_HANDLE; uint64_t cm[NVMTL_BINDING_WORDS] = { 0 };
     if (live && nvmtl_dirty_only_on()) {
         from = t->last[which];
         for (int k = 0; k < 4; k++) cm[k] = t->lastw[which][k];
-        for (uint32_t j = 0; j < NVMTL_NSTEX && NVMTL_STEX_BASE + j < 256; j++) {
+        for (uint32_t j = 0; j < NVMTL_NSTEX; j++) {
             const uint32_t i = NVMTL_STEX_BASE + j;
             if (j < t->last_hi[which]) cm[i >> 6] |= 1ull << (i & 63); else cm[i >> 6] &= ~(1ull << (i & 63));
         }
-        for (int k = 0; k < 4; k++) cm[k] &= ~t->chg[which][k];
+        for (unsigned k = 0; k < NVMTL_BINDING_WORDS; k++) cm[k] &= ~t->chg[which][k];
     }
     VkDescriptorSet s = nvmtl_snapshot_set_md(c, which, hi, m, p->tbany ? tb : NULL, from, from ? cm : NULL, uniform);
     if (!s) return s;
