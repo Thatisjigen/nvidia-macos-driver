@@ -65,7 +65,9 @@ void nvmtl_vk_pipeline_destroy(nvk_pipeline *p);
 typedef struct { void *pool; nvk_buffer stage; } nvk_queue;
 #include "nvmtl_sampler_desc.h"
 typedef struct { void *s; int linear, repeat; float lod_min, lod_max; nvmtl_sampler_desc desc; int full_state; } nvk_sampler;
-typedef struct { void *pool, *set; } nvk_setref;
+/* kind: 0 = freed to its pool at retire; 1 = snapshot set (g_setLayout), 2 = GL uniform set (g_glUniformLayout),
+   both kept for reuse by later command buffers. */
+typedef struct { void *pool, *set; unsigned kind; } nvk_setref;
 typedef struct {
     uint64_t gpu_tick, uptime_ns, uncertainty_ns;
     uint32_t valid_bits;
@@ -86,7 +88,7 @@ typedef struct { void *cb; void *fb; void *pool; void *dset[2]; void *depth_view
                  void *address_pages; unsigned address_count;
                  uint64_t *icb_tabs[2]; unsigned icb_ntabs, icb_slot;   /* GPU-encoded ICB replay: per-slot address table copies (vertex, fragment) and the one in use, 1-based, 0 = none */
                  unsigned nobind, skipped;
-                 void *dcache[32]; void *dcachepool; unsigned ndcache, dcache_gl_uniform;
+                 void *dcache[32]; void *dcachepools[32]; unsigned ndcache, dcache_gl_uniform;
                  unsigned in_rp, occlusion_reset; uint32_t wseq;
                  void *fetchview[NVMTL_NCOL];   /* the open pass's colour views, read by [[color(n)]] framebuffer fetch */
                  void *fcopyview[NVMTL_NCOL];   /* copies of the colour attachments, for fetch_copy pipelines */
