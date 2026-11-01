@@ -148,6 +148,14 @@ private:
     bool pciRestoreAfterWake();
     bool gpuAnswers();
     void notifyFramebuffers(uintptr_t state);
+    // on this Acer HDAU's MSI address reads 0xfee60000 after RM resume (destination APIC ID 0x60,
+    // which no CPU has; the MADT lists 0x00-0x3e), where IOPCIFamily had restored 0xfee00000 just before. The codec's
+    // responses then raise interrupts nobody receives, AppleHDA's power-on waits out every verb, and NVRMFB's wake
+    // waits behind it. The MSI address and data IOPCIFamily restored are put back after RM resume. -nvrmhdanomsifix
+    // only logs. The data member is at the end of the class, so the other members keep their offsets.
+    IOPCIDevice *hdaFunction();
+    bool hdaMsiRead(IOPCIDevice *d, UInt32 *cap, bool *is64, bool *pvm, UInt32 *lo, UInt32 *hi, UInt32 *data);
+    void hdaMsiAfterResume();
     IOPCIDevice *fPCI = NULL;
     nv_state_t   fNv = {};
     bool         fPrivateState = false;
@@ -163,6 +171,7 @@ private:
     bool placeLargeBar1();
     bool interruptFilter(IOFilterInterruptEventSource *src);
     void interruptOccurred(IOInterruptEventSource *src, int count);
+    struct HdaMsi { bool valid; UInt32 lo, hi, data; } fHdaMsiPre = {};
 };
 extern "C" { extern volatile int nv_xnu_in_isr; extern volatile thread_t nv_xnu_isr_thread; void nv_xnu_dump_live_allocs(void); }
 static volatile unsigned long gNvIsrCount = 0, gNvIsrHandled = 0;
@@ -1586,11 +1595,18 @@ void NVRM::gpuResume()
 {
     uint64_t t0 = mach_absolute_time();
     LOG("wake #%u: resuming the GPU", fPmCycles);
+    fHdaMsiPre.valid = false;
+    if (IOPCIDevice *d = hdaFunction()) {   // what IOPCIFamily restored
+        UInt32 cap; bool is64, pvm;
+        fHdaMsiPre.valid = hdaMsiRead(d, &cap, &is64, &pvm, &fHdaMsiPre.lo, &fHdaMsiPre.hi, &fHdaMsiPre.data);
+        d->release();
+    }
     nv_xnu_pm_take();
     bool ok = pciRestoreAfterWake() && gpuAnswers();
     if (fIntSrc) fIntSrc->enable();
     NV_STATUS st = ok ? rm_power_management(NULL, &fNv, NV_PM_ACTION_RESUME) : NV_ERR_GPU_IS_LOST;
     ok = st == NV_OK;
+    hdaMsiAfterResume();
     NV_STATUS cst = ok ? rm_restart_user_channels(NULL, &fNv) : NV_ERR_GPU_IS_LOST;   // nv_restore_user_channels()
     OSCompareAndSwap(kGpuPmSuspended, ok ? kGpuPmRunning : kGpuPmLost, &fGpuPm);
     nvkms_xnu_resume(fNv.gpu_id, ok);
@@ -1629,6 +1645,69 @@ void NVRM::pciSaveForSleep()
     s.valid = true;
     LOG("sleep: saved config - cmd 0x%04x BAR1 0x%08x%08x, %u ReBAR control(s), root port %s pref 0x%08x %08x/%08x",
         s.cmd, s.bar[2], s.bar[1] & ~0xFU, s.rbCount, s.rp ? s.rp->getName() : "(none)", s.rpWin[3], s.rpWin[4], s.rpWin[5]);
+}
+
+// function 1 of the GPU's own device (HDAU), retained, or NULL.
+IOPCIDevice *NVRM::hdaFunction()
+{
+    IOService *bridge = fPCI ? fPCI->getProvider() : NULL;
+    OSIterator *it = bridge ? bridge->getChildIterator(gIOServicePlane) : NULL;
+    IOPCIDevice *found = NULL;
+    while (it && !found) {
+        OSObject *o = it->getNextObject();
+        if (!o) break;
+        IOPCIDevice *d = OSDynamicCast(IOPCIDevice, o);
+        if (!d) continue;
+        if (d != fPCI && d->getBusNumber() == fPCI->getBusNumber() && d->getDeviceNumber() == fPCI->getDeviceNumber() &&
+            d->getFunctionNumber() == 1) { d->retain(); found = d; }
+    }
+    OSSafeReleaseNULL(it);
+    return found;
+}
+
+// The MSI capability of HDAU: offset, 64-bit address, per-vector masking, address and data. False without one.
+bool NVRM::hdaMsiRead(IOPCIDevice *d, UInt32 *cap, bool *is64, bool *pvm, UInt32 *lo, UInt32 *hi, UInt32 *data)
+{
+    for (UInt32 off = d->configRead8(0x34) & 0xfc, n = 0; off >= 0x40 && off < 0x100 && n < 16; n++) {
+        const UInt32 h = d->configRead32(off);
+        if ((h & 0xff) == 0x05) {
+            *cap = off; *is64 = (h >> 23) & 1; *pvm = (h >> 24) & 1;
+            *lo = d->configRead32(off + 4); *hi = *is64 ? d->configRead32(off + 8) : 0;
+            *data = d->configRead16(off + (*is64 ? 12 : 8));
+            return true;
+        }
+        off = (h >> 8) & 0xfc;
+    }
+    return false;
+}
+
+void NVRM::hdaMsiAfterResume()
+{
+    IOPCIDevice *d = hdaFunction();
+    if (!d) return;
+    UInt32 cap, lo, hi, data; bool is64, pvm;
+    if (!fHdaMsiPre.valid || !hdaMsiRead(d, &cap, &is64, &pvm, &lo, &hi, &data)) { d->release(); return; }
+    if (lo == fHdaMsiPre.lo && hi == fHdaMsiPre.hi && data == fHdaMsiPre.data) {
+        LOG("hda: MSI after RM resume as IOPCIFamily restored it (addr %08x data %04x)", lo, data);
+        d->release(); return;
+    }
+    char nb[8] = { 0 };
+    const bool fix = (fHdaMsiPre.lo & 0xfff00000) == 0xfee00000 && !PE_parse_boot_argn("-nvrmhdanomsifix", nb, sizeof nb);
+    if (fix) {
+        const UInt32 maskOff = cap + (is64 ? 0x10 : 0x0c);
+        const UInt32 mask = pvm ? d->configRead32(maskOff) : 0;
+        if (pvm) d->configWrite32(maskOff, mask | 1);   // vector 0 masked while its address changes
+        d->configWrite32(cap + 4, fHdaMsiPre.lo);
+        if (is64) d->configWrite32(cap + 8, fHdaMsiPre.hi);
+        d->configWrite16(cap + (is64 ? 12 : 8), (UInt16)fHdaMsiPre.data);
+        if (pvm) d->configWrite32(maskOff, mask);
+    }
+    UInt32 c2, lo2, hi2, data2; bool b1, b2;
+    hdaMsiRead(d, &c2, &b1, &b2, &lo2, &hi2, &data2);
+    LOG("hda: MSI after RM resume addr %08x%08x data %04x, IOPCIFamily had restored %08x%08x data %04x -> %s (now %08x%08x data %04x)",
+        hi, lo, data, fHdaMsiPre.hi, fHdaMsiPre.lo, fHdaMsiPre.data,
+        fix ? "put back" : "left as is (-nvrmhdanomsifix, or no valid address to put back)", hi2, lo2, data2);
+    d->release();
 }
 
 bool NVRM::pciRestoreAfterWake()
