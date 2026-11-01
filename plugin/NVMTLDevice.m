@@ -1638,7 +1638,7 @@ static int nvmtl_surface_image_create(NVMTLTexture *t, IOSurfaceRef surf, NSUInt
                     t->_vramBuf = vb; t->_vramOn = YES; g_surf_vram++;
                     uint32_t seed = IOSurfaceGetSeed(surf);
                     int current = nvmtl_vram_tag_current(surf, 0, seed);
-                    if (current) { t->_surfSeed = seed; t->_surfSynced = YES; }
+                    if (current) { __atomic_store_n(&t->_surfSeed, seed, __ATOMIC_RELEASE); __atomic_store_n(&t->_surfSynced, YES, __ATOMIC_RELEASE); }
                     static unsigned n; if (n++ < 8 || n % 2000 == 0)
                         nvlog("item 7: surface %u %ux%u pitch %zu -> the family's VRAM%s (vram %llu, private %llu)", (unsigned)IOSurfaceGetID(surf),
                               w, h, row, current ? ", already current (no upload)" : "", g_surf_vram, g_surf_private);
@@ -2319,6 +2319,7 @@ static void nvmtl_pipeline_key_log(id f, const char *stage, const void *pipe)
             (unsigned long)ad.offset, (unsigned long)ld.stride, (unsigned long)ld.stepFunction, (unsigned long)ld.stepRate];
     }
     ps->_vdesc = vdesc; ps->_descriptor = [d copy];
+    ps->_descVert = (NVMTLFunction *)ps->_descriptor.vertexFunction; ps->_descFrag = (NVMTLFunction *)ps->_descriptor.fragmentFunction;
     /* _descriptor keeps the caller's (unlinked) functions; a pixel-sampler variant re-translates from these, the
      * stages the pipeline was actually built from (RenderBox's custom_fn fragments only translate once linked). */
     ps->_linkedVert = vf; ps->_linkedFrag = noFrag ? nil : ff;
