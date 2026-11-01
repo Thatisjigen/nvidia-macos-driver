@@ -795,7 +795,9 @@ static void nvmtl_gsub_ahead_pass1(void) {
             NSMutableArray *settled = [NSMutableArray new];
             for (NVMTLTexture *texture in nvmtl_ws_part_landed(self, _nextPart, settled)) if (![texture nvmtlSurfaceOut]) published = NO;
             if (!nvmtl_ws_publish_settled(settled, self)) published = NO;
-            for (NVMTLBuffer *buffer in nvmtl_submission_copies(part->resources, YES)) nvmtl_buffer_sync_out(buffer);
+            // the written copy-backed buffers are a subset of the part's copy inputs, prepared before every submission
+            if (part->copyInputs.count)
+                for (NVMTLBuffer *buffer in nvmtl_submission_copies(part->resources, YES)) nvmtl_buffer_sync_out(buffer);
         }
         if (!published) {
             // -3: the command buffer was made after the GPU was lost. Metal reports a removed GPU as DeviceRemoved (11).
