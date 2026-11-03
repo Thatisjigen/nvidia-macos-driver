@@ -204,6 +204,28 @@ private:
     bool pciRestoreAfterWake();
     bool gpuAnswers();
     void notifyFramebuffers(uintptr_t state);
+    // on this Acer HDAU's MSI address reads 0xfee60000 after RM resume (destination APIC ID 0x60,
+    // which no CPU has; the MADT lists 0x00-0x3e), where IOPCIFamily had restored 0xfee00000 just before. The codec's
+    // responses then raise interrupts nobody receives, AppleHDA's power-on waits out every verb, and NVRMFB's wake
+    // waits behind it. The MSI address and data IOPCIFamily restored are put back after RM resume. -nvrmhdanomsifix
+    // only logs. The data member is at the end of the class, so the other members keep their offsets.
+    // putting it back afterwards is not enough on a wake that goes straight to full power (a key press):
+    // AppleHDA then sends its first commands while RM resumes, a response's interrupt goes to the wrong address, and
+    // no later response raises another one while INTSTS stays set. So the vector stays masked through RM's work, which
+    // leaves what the codec raises pending in the device, and an interrupt still pending afterwards is raised again.
+    // the address can also move after RM resume returned (fee00000 at +0.9 s, fee60000 at +3 s, AppleHDA and all
+    // the framebuffers stuck behind it). So a guard looks at it every 50 ms for 20 s after RM's work and every 5 s from
+    // then on, puts it back and raises what was lost. It stops before the GPU goes to standby.
+    IOPCIDevice *hdaFunction();
+    bool hdaMsiRead(IOPCIDevice *d, UInt32 *cap, bool *is64, bool *pvm, UInt32 *lo, UInt32 *hi, UInt32 *data);
+    void hdaMsiAfterResume();
+    void hdaMsiAfterInit();
+    bool hdaRaiseAgain(IOPCIDevice *d, UInt32 *before, UInt32 *after);
+    void hdaGuardStart();
+    void hdaGuardStop();
+    void hdaGuardTick();
+    void hdaGuardArm();
+    static void hdaGuardFire(thread_call_param_t p0, thread_call_param_t p1);
     IOPCIDevice *fPCI = NULL;
     nv_state_t   fNv = {};
     bool         fPrivateState = false;
@@ -219,6 +241,11 @@ private:
     bool placeLargeBar1();
     bool interruptFilter(IOFilterInterruptEventSource *src);
     void interruptOccurred(IOInterruptEventSource *src, int count);
+    struct HdaMsi { bool valid; UInt32 lo, hi, data; } fHdaMsiPre = {};
+    bool fHdaMsiHeld = false; UInt32 fHdaMsiMask = 0;
+    thread_call_t fHdaGuardCall = nullptr;
+    volatile bool fHdaGuardRun = false;
+    UInt32 fHdaGuardTicks = 0;
 };
 extern "C" { extern volatile int nv_xnu_in_isr; extern volatile thread_t nv_xnu_isr_thread; void nv_xnu_dump_live_allocs(void); }
 static volatile unsigned long gNvIsrCount = 0, gNvIsrHandled = 0;
@@ -1920,6 +1947,7 @@ IOReturn NVRM::go(uint32_t pass)
         nv_xnu_dump_gsp_regs(nv);
         if (!ok) return kIOReturnError;
         fAdapter = true;
+        hdaMsiAfterInit();
         LOG("PASS 2 REACHED: the adapter is up — GSP-RM is running on the card under macOS");
         fPassDone = 2;
         enableAspmL1();
@@ -1963,6 +1991,9 @@ void NVRM::interruptOccurred(IOInterruptEventSource *src, int count)
 void NVRM::stop(IOService *provider)
 {
     nvrm_power_stop();
+    // thread_call_cancel_wait is in com.apple.kpi.private, which this kext does not link against
+    hdaGuardStop();
+    if (fHdaGuardCall) { thread_call_free(fHdaGuardCall); fHdaGuardCall = nullptr; }
     // Keep the lock until free(): another service can retain this object and
     // call its platform interface after stop(), when it must answer NotReady.
     if (fUtilizationLock) {
@@ -2171,6 +2202,7 @@ void NVRM::gpuSuspend()
     uint64_t t0 = mach_absolute_time();
     fPmCycles++;
     nvrm_power_suspend();
+    hdaGuardStop();
     OSCompareAndSwap(kGpuPmRunning, kGpuPmSuspended, &fGpuPm);
     setProperty("nvrm-pm", "suspended");
     LOG("sleep #%u: suspending the GPU (NVKMS, then RM standby)", fPmCycles);
@@ -2198,12 +2230,27 @@ void NVRM::gpuResume()
 {
     uint64_t t0 = mach_absolute_time();
     LOG("wake #%u: resuming the GPU", fPmCycles);
+    fHdaMsiPre.valid = false;
+    fHdaMsiHeld = false;
+    if (IOPCIDevice *d = hdaFunction()) {   // what IOPCIFamily restored
+        UInt32 cap; bool is64, pvm;
+        fHdaMsiPre.valid = hdaMsiRead(d, &cap, &is64, &pvm, &fHdaMsiPre.lo, &fHdaMsiPre.hi, &fHdaMsiPre.data);
+        char nb[8] = { 0 };
+        if (fHdaMsiPre.valid && pvm && !PE_parse_boot_argn("-nvrmhdanomsifix", nb, sizeof nb)) {
+            const UInt32 maskOff = cap + (is64 ? 0x10 : 0x0c);
+            fHdaMsiMask = d->configRead32(maskOff);
+            d->configWrite32(maskOff, fHdaMsiMask | 1);   // until hdaMsiAfterResume
+            fHdaMsiHeld = true;
+        }
+        d->release();
+    }
     nv_xnu_pm_take();
     bool ok = pciRestoreAfterWake() && gpuAnswers();
     if (ok) enableAspmL1();   // the link comes back with whatever IOPCIFamily restored
     if (fIntSrc) fIntSrc->enable();
     NV_STATUS st = ok ? rm_power_management(NULL, &fNv, NV_PM_ACTION_RESUME) : NV_ERR_GPU_IS_LOST;
     ok = st == NV_OK;
+    hdaMsiAfterResume();
     NV_STATUS cst = ok ? rm_restart_user_channels(NULL, &fNv) : NV_ERR_GPU_IS_LOST;   // nv_restore_user_channels()
     OSCompareAndSwap(kGpuPmSuspended, ok ? kGpuPmRunning : kGpuPmLost, &fGpuPm);
     nvkms_xnu_resume(fNv.gpu_id, ok);
@@ -2295,6 +2342,192 @@ void NVRM::pciSaveForSleep()
     s.valid = true;
     LOG("sleep: saved config - cmd 0x%04x BAR1 0x%08x%08x, %u ReBAR control(s), root port %s pref 0x%08x %08x/%08x",
         s.cmd, s.bar[2], s.bar[1] & ~0xFU, s.rbCount, s.rp ? s.rp->getName() : "(none)", s.rpWin[3], s.rpWin[4], s.rpWin[5]);
+}
+
+// function 1 of the GPU's own device (HDAU), retained, or NULL.
+IOPCIDevice *NVRM::hdaFunction()
+{
+    IOService *bridge = fPCI ? fPCI->getProvider() : NULL;
+    OSIterator *it = bridge ? bridge->getChildIterator(gIOServicePlane) : NULL;
+    IOPCIDevice *found = NULL;
+    while (it && !found) {
+        OSObject *o = it->getNextObject();
+        if (!o) break;
+        IOPCIDevice *d = OSDynamicCast(IOPCIDevice, o);
+        if (!d) continue;
+        if (d != fPCI && d->getBusNumber() == fPCI->getBusNumber() && d->getDeviceNumber() == fPCI->getDeviceNumber() &&
+            d->getFunctionNumber() == 1) { d->retain(); found = d; }
+    }
+    OSSafeReleaseNULL(it);
+    return found;
+}
+
+// The MSI capability of HDAU: offset, 64-bit address, per-vector masking, address and data. False without one.
+bool NVRM::hdaMsiRead(IOPCIDevice *d, UInt32 *cap, bool *is64, bool *pvm, UInt32 *lo, UInt32 *hi, UInt32 *data)
+{
+    for (UInt32 off = d->configRead8(0x34) & 0xfc, n = 0; off >= 0x40 && off < 0x100 && n < 16; n++) {
+        const UInt32 h = d->configRead32(off);
+        if ((h & 0xff) == 0x05) {
+            *cap = off; *is64 = (h >> 23) & 1; *pvm = (h >> 24) & 1;
+            *lo = d->configRead32(off + 4); *hi = *is64 ? d->configRead32(off + 8) : 0;
+            *data = d->configRead16(off + (*is64 ? 12 : 8));
+            return true;
+        }
+        off = (h >> 8) & 0xfc;
+    }
+    return false;
+}
+
+// INTSTS still set after the vector had its chance: the message that went with it was lost, and none goes out again
+// while it stays set. Dropping GIE and setting it again makes the controller raise its line, so AppleHDA's handler runs.
+bool NVRM::hdaRaiseAgain(IOPCIDevice *d, UInt32 *before, UInt32 *after)
+{
+    *before = *after = 0;
+    if (!(d->configRead16(kIOPCIConfigCommand) & kIOPCICommandMemorySpace)) return false;
+    IOMemoryMap *m = d->mapDeviceMemoryWithRegister(kIOPCIConfigBaseAddress0);
+    if (!m) return false;
+    bool pulsed = false;
+    if (m->getLength() >= 0x28) {
+        volatile UInt32 *r = (volatile UInt32 *)m->getVirtualAddress();
+        IOSleep(2);   // a released message has been handled by now
+        const UInt32 ctl = r[0x20 / 4];
+        *before = *after = r[0x24 / 4];
+        if (*before != 0xffffffffU && (*before & (1u << 31)) && (ctl & (1u << 31))) {
+            r[0x20 / 4] = ctl & ~(1u << 31);
+            (void)r[0x20 / 4];
+            r[0x20 / 4] = ctl;
+            pulsed = true;
+            IOSleep(2);
+            *after = r[0x24 / 4];
+        }
+    }
+    m->release();
+    return pulsed;
+}
+
+void NVRM::hdaMsiAfterResume()
+{
+    IOPCIDevice *d = hdaFunction();
+    if (!d) return;
+    UInt32 cap, lo, hi, data; bool is64, pvm;
+    if (!fHdaMsiPre.valid || !hdaMsiRead(d, &cap, &is64, &pvm, &lo, &hi, &data)) { d->release(); return; }
+    char nb[8] = { 0 };
+    const bool nofix = PE_parse_boot_argn("-nvrmhdanomsifix", nb, sizeof nb);
+    const UInt32 maskOff = cap + (is64 ? 0x10 : 0x0c);
+    // IOPCIFamily's address has destination 0. One that differs was RM's, already there when the sleep saved it
+    // (seen once: "as IOPCIFamily restored it", fee60000), so what was restored is no reference.
+    const bool msiRange = (fHdaMsiPre.lo & 0xfff00000) == 0xfee00000;
+    const UInt32 wantLo = msiRange ? 0xfee00000 : fHdaMsiPre.lo;
+    const bool moved = lo != wantLo || hi != fHdaMsiPre.hi || data != fHdaMsiPre.data;
+    const bool fix = moved && msiRange && !nofix;
+    const UInt32 maskAfterRm = pvm ? d->configRead32(maskOff) : 0;
+    if (fix) {
+        if (pvm) d->configWrite32(maskOff, maskAfterRm | 1);   // vector 0 masked while its address changes
+        d->configWrite32(cap + 4, wantLo);
+        if (is64) d->configWrite32(cap + 8, fHdaMsiPre.hi);
+        d->configWrite16(cap + (is64 ? 12 : 8), (UInt16)fHdaMsiPre.data);
+    }
+    if (pvm && (fix || fHdaMsiHeld)) d->configWrite32(maskOff, fHdaMsiHeld ? fHdaMsiMask : maskAfterRm);
+    fHdaMsiHeld = false;
+    UInt32 st = 0, st2 = 0;
+    const bool pulsed = !nofix && hdaRaiseAgain(d, &st, &st2);
+    UInt32 c2, lo2, hi2, data2; bool b1, b2;
+    hdaMsiRead(d, &c2, &b1, &b2, &lo2, &hi2, &data2);
+    LOG("hda: MSI after RM resume addr %08x%08x data %04x, IOPCIFamily had restored %08x%08x data %04x -> %s (now %08x%08x data %04x); "
+        "mask after RM %x; intsts %08x%s, then %08x",
+        hi, lo, data, fHdaMsiPre.hi, fHdaMsiPre.lo, fHdaMsiPre.data,
+        fix ? "put back" : moved ? "left as is (-nvrmhdanomsifix, or no valid address to put back)" : "as it should be",
+        hi2, lo2, data2, maskAfterRm, st, pulsed ? " pending, raised again" : "", st2);
+    d->release();
+    hdaGuardStart();
+}
+
+// RM's boot of the GSP does to the address what its resume does, if AppleHDA already enabled MSI by then.
+void NVRM::hdaMsiAfterInit()
+{
+    IOPCIDevice *d = hdaFunction();
+    if (!d) return;
+    UInt32 cap, lo, hi, data; bool is64, pvm;
+    if (hdaMsiRead(d, &cap, &is64, &pvm, &lo, &hi, &data)) {
+        char nb[8] = { 0 };
+        const bool wrong = (d->configRead16(cap + 2) & 1) && (lo & 0xfff00000) == 0xfee00000 && lo != 0xfee00000;
+        const bool fix = wrong && !PE_parse_boot_argn("-nvrmhdanomsifix", nb, sizeof nb);
+        if (fix) {
+            const UInt32 maskOff = cap + (is64 ? 0x10 : 0x0c);
+            const UInt32 mask = pvm ? d->configRead32(maskOff) : 0;
+            if (pvm) d->configWrite32(maskOff, mask | 1);
+            d->configWrite32(cap + 4, 0xfee00000);
+            if (pvm) d->configWrite32(maskOff, mask);
+        }
+        UInt32 st = 0, st2 = 0;
+        const bool pulsed = fix && hdaRaiseAgain(d, &st, &st2);
+        LOG("hda: MSI after RM init addr %08x%08x data %04x enabled %u -> %s; intsts %08x%s, then %08x", hi, lo, data,
+            d->configRead16(cap + 2) & 1, fix ? "put back" : wrong ? "left as is" : "as it should be", st, pulsed ? " pending, raised again" : "", st2);
+    }
+    d->release();
+    hdaGuardStart();
+}
+
+void NVRM::hdaGuardStart()
+{
+    if (!fHdaGuardCall) fHdaGuardCall = thread_call_allocate(&NVRM::hdaGuardFire, this);
+    fHdaGuardTicks = 0;
+    fHdaGuardRun = true;
+    hdaGuardArm();
+}
+
+void NVRM::hdaGuardStop()
+{
+    fHdaGuardRun = false;
+    if (fHdaGuardCall) thread_call_cancel(fHdaGuardCall);
+}
+
+void NVRM::hdaGuardArm()
+{
+    if (!fHdaGuardRun || !fHdaGuardCall) return;
+    uint64_t dl;
+    clock_interval_to_deadline(fHdaGuardTicks < 400 ? 50 : 5000, kMillisecondScale, &dl);
+    thread_call_enter_delayed(fHdaGuardCall, dl);
+}
+
+void NVRM::hdaGuardTick()
+{
+    if (!fHdaGuardRun) return;
+    const UInt32 tick = ++fHdaGuardTicks;
+    IOPCIDevice *d = hdaFunction();
+    UInt32 cap, lo, hi, data; bool is64, pvm;
+    if (d && hdaMsiRead(d, &cap, &is64, &pvm, &lo, &hi, &data)) {
+        char nb[8] = { 0 };
+        const bool nofix = PE_parse_boot_argn("-nvrmhdanomsifix", nb, sizeof nb);
+        const UInt32 maskOff = cap + (is64 ? 0x10 : 0x0c);
+        const bool wrong = (d->configRead16(cap + 2) & 1) && (lo & 0xfff00000) == 0xfee00000 && lo != 0xfee00000;
+        if (wrong && !nofix) {
+            const UInt32 mask = pvm ? d->configRead32(maskOff) : 0;
+            if (pvm) d->configWrite32(maskOff, mask | 1);   // vector 0 masked while its address changes
+            d->configWrite32(cap + 4, 0xfee00000);
+            if (pvm) d->configWrite32(maskOff, mask);
+            UInt32 st = 0, st2 = 0;
+            const bool pulsed = hdaRaiseAgain(d, &st, &st2);
+            LOG("hda: MSI moved to %08x, guard tick %u -> put back (now %08x); intsts %08x%s, then %08x", lo, tick,
+                d->configRead32(cap + 4), st, pulsed ? " pending, raised again" : "", st2);
+        } else if (tick == 60 || tick == 200) {   // what the codec's traffic looks like at +3 and +10 s, for the log
+            UInt32 st = 0, st2 = 0, wp = 0xffffffffU;
+            const bool pulsed = !nofix && hdaRaiseAgain(d, &st, &st2);
+            if (IOMemoryMap *m = d->mapDeviceMemoryWithRegister(kIOPCIConfigBaseAddress0)) {
+                if (m->getLength() >= 0x60) wp = ((volatile UInt32 *)m->getVirtualAddress())[0x58 / 4];
+                m->release();
+            }
+            LOG("hda wake +%u s: addr %08x data %04x mask %x; intsts %08x%s, then %08x; rirb wp %08x", tick == 60 ? 3 : 10, lo, data,
+                pvm ? d->configRead32(maskOff) : 0, st, pulsed ? " pending, raised again" : "", st2, wp);
+        }
+    }
+    if (d) d->release();
+    hdaGuardArm();
+}
+
+void NVRM::hdaGuardFire(thread_call_param_t p0, thread_call_param_t)
+{
+    static_cast<NVRM *>(p0)->hdaGuardTick();
 }
 
 bool NVRM::pciRestoreAfterWake()
