@@ -23,6 +23,7 @@
 #include <vulkan/vulkan.h>
 #include <mach-o/loader.h>
 #include "nvmtl_vk.h"
+#include "nvmtl_rt_shadow.h"
 #include "nvmtl_dlss.h"
 #include "nvmtl_tex_upload.h"
 #include "nvmtl_fetch_copy.h"
@@ -11226,6 +11227,7 @@ static int nvmtl_vk_image_create_buffer_alias_lifetime_body(uint32_t w, uint32_t
     VkMemoryRequirements mr; pvkGetImageMemoryRequirements(g_dev, (VkImage)out->img, &mr);
     uint32_t all = g_memp.memoryTypeCount >= 32 ? 0xffffffffu : ((1u << g_memp.memoryTypeCount) - 1u);
     size_t at = b->moff + offset;
+    out->lin = nvmtl_lin_kind(row_pitch, at);
     // every buffer records its memory type; a linear image need only accept that one (ANV's take types 0-1 of 0-3)
     const uint32_t need = b->mtype1 ? 1u << (b->mtype1 - 1) : all;
     const char *why = (mr.memoryTypeBits & need) != need ? "memory types" : (mr.alignment && at % mr.alignment) ? "alignment" : NULL;
