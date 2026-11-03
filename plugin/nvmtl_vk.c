@@ -2619,11 +2619,37 @@ int nvmtl_vk_surface_dirty(uint32_t surfaceID, uint32_t plane) { return nvmtl_vk
 /* the same mark, given up instead of waiting when the accelerator lock is taken (NVRM_SS_PLANE_TRYLOCK; only an NVAccel
    that publishes NVAccelSurfaceWait is asked): 0 marked, 1 the lock was taken, -1 refused */
 int nvmtl_vk_surface_dirty_try(uint32_t surfaceID, uint32_t plane) { return nvmtl_vk_surface_mark_newest(surfaceID, plane, 0x40000000u); }
-// WindowServer completion mark (NVAccel nvSurfGpuEscape), on NVK's surface escape: 0 = the kernel took it
+// WindowServer's completion marks have an NVRM client of their own. A dirty mark holds its client's gate in NVRMUserClient::esc
+// while it waits for the accelerator lock, and that lock can be held by something waiting for a mark: a page-off, or a display
+// transaction queued behind a flip that waits. On NVK's ctl client, which every dirty mark uses, the mark it waits for would
+// queue behind that gate until the kernel's 100 ms limit: a stall for everything on this GPU, then a copy or a flip that does
+// not know whether the write landed. The escape's layout is nvrm_surfshare_abi.h's; the kernel takes no lock for a mark.
+struct nvmtl_surfshare_esc { uint32_t version, surfaceID, plane, hClient, hSrcClient, hSrcMemory, status, pad; uint64_t size; };
+_Static_assert(sizeof(struct nvmtl_surfshare_esc) == 40, "NVRMSurfShareEsc");
+enum { NVMTL_SS_VERSION = 2, NVMTL_ESC_SURF_DIRTY = 0xE3, NVMTL_SEL_ESC = 1, NVMTL_RM_CLIENT_CTL = 0x4E560000 };
+static io_connect_t g_marks_client;
+static pthread_once_t g_marks_client_once = PTHREAD_ONCE_INIT;
+static void nvmtl_marks_client_open(void)
+{
+    io_service_t s = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("NVAccel"));
+    if (!s) return;
+    if (IOServiceOpen(s, mach_task_self(), NVMTL_RM_CLIENT_CTL, &g_marks_client) != KERN_SUCCESS) g_marks_client = 0;
+    IOObjectRelease(s);
+    if (!g_marks_client) nvlog("WindowServer marks: no NVRM client of their own, they share the one of the dirty marks");
+}
+// 0 = the kernel took it. NVK's surface escape only if the client could not be opened.
 uint32_t nvmtl_vk_surface_gpu_mark(uint32_t surfaceID, int pending)
 {
+    const uint32_t plane = 0x80000000u | (pending ? 1u : 0u);
+    pthread_once(&g_marks_client_once, nvmtl_marks_client_open);
+    if (g_marks_client) {
+        struct nvmtl_surfshare_esc e = { .version = NVMTL_SS_VERSION, .surfaceID = surfaceID, .plane = plane, .status = 0x80000002u };
+        const uint64_t cmd = NVMTL_ESC_SURF_DIRTY;
+        size_t out = sizeof e;
+        if (IOConnectCallMethod(g_marks_client, NVMTL_SEL_ESC, &cmd, 1, &e, sizeof e, NULL, NULL, &e, &out) == KERN_SUCCESS) return e.status;
+    }
     if (!pnvk_surface_dirty || !g_dev) return 0x80000002u;
-    return pnvk_surface_dirty(g_dev, surfaceID, 0x80000000u | (pending ? 1u : 0u));
+    return pnvk_surface_dirty(g_dev, surfaceID, plane);
 }
 /* 1 when NVAccel publishes NVAccelSurfaceWait: its page-off waits for a surface WindowServer's GPU is still writing */
 int nvmtl_vk_accel_surface_wait(void)
