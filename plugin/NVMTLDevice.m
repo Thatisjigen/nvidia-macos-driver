@@ -29,6 +29,7 @@
 #include "nvmtl_avail.h"
 #include "nvmtl_sample_positions.h"
 #include "nvmtl_log_failure.h"
+#include "nvmtl_rt_shadow.h"
 #include "nvmtl_failed_air.h"
 #include "nvmtl_env_knobs.h"
 #include "nvmtl_shared_wc.h"
