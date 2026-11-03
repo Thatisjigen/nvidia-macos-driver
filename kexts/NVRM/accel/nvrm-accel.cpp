@@ -1783,7 +1783,7 @@ void *_ZN13IOSurfaceRoot13lookupSurfaceEjP4task(void *root, unsigned int id, tas
 void *_ZN22IOGraphicsAccelerator223deviceCacheForIOSurfaceEP9IOSurfacej(void *accel, void *surface, unsigned int plane);
 void  _ZN16IOAccelVidMemory4wireEv(void *vidmem);
 void  _ZN20IOSurfaceDeviceCache10setCurrentEv(void *cache);
-void *_ZNK9IOSurface21getCurrentDeviceCacheEv(void *surface);
+unsigned int _ZNK9IOSurface13getUnlockSeedEv(void *surface);
 int   _ZN9IOSurface10bind_accelEjj(void *surface, unsigned int accelerator, unsigned int plane);
 void *_ZNK9IOSurface19getMemoryDescriptorEv(void *surface);
 unsigned int _ZNK9IOSurface12getSurfaceIDEv(void *surface);
@@ -1861,16 +1861,19 @@ static bool nvSVDiag() { return gSVDiag > 0 && OSDecrementAtomic(&gSVDiag) > 0; 
 // stays and the CPU and that accelerator go on reading their own old pixels, while this GPU reads what it wrote. Apple's
 // drivers avoid it by binding a surface when they encode a use of it (ioAccelResourceGroupAddNewResource). The plugin
 // does not bind, so a surface another accelerator wrote last is still that accelerator's at this mark.
-// sysctl debug.nvaccel_sv_take: 2 = bind it here, as Apple's do at encode; 1 = only report the refusal, and the plugin
-// copies the pixels out under a CPU lock; 0 = ignore the refusal, as before.
-static int gSVTake = 2;
-SYSCTL_INT(_debug, OID_AUTO, nvaccel_sv_take, CTLFLAG_RW | CTLFLAG_LOCKED, &gSVTake, 0, "2 = a surface another accelerator owns is bound at the dirty mark, 1 = the refusal goes back to the plugin, 0 = ignored");
+// sysctl debug.nvaccel_sv_take: 1 = report the refusal, and the plugin copies the pixels out under a CPU lock, which waits
+// in user space; 2 = bind here, as Apple's do at encode, which keeps the VRAM copy but waits for the owner's GPU inside this
+// escape, with the NVRM client's gate and power use held; 0 = ignore the refusal, as before.
+static int gSVTake = 1;
+SYSCTL_INT(_debug, OID_AUTO, nvaccel_sv_take, CTLFLAG_RW | CTLFLAG_LOCKED, &gSVTake, 0, "a dirty mark on a surface another accelerator owns: 1 = the refusal goes back to the plugin, 2 = bound here, 0 = ignored");
 static SInt64 gCntSVTaken, gCntSVOtherOwner;
-SYSCTL_QUAD(_debug, OID_AUTO, nvaccel_sv_taken, CTLFLAG_RD | CTLFLAG_LOCKED, (SInt64 *)&gCntSVTaken, "dirty marks that took the surface from another accelerator");
-SYSCTL_QUAD(_debug, OID_AUTO, nvaccel_sv_other_owner, CTLFLAG_RD | CTLFLAG_LOCKED, (SInt64 *)&gCntSVOtherOwner, "dirty marks refused because another accelerator owned the surface");
-// No owner at all means the mark was taken and a CPU lock or a bind has since cleared it: its page-off is waiting for the
-// accelerator lock this mark holds, and it will find VRAM newest.
-static inline bool nvAccelSurfOtherOwner(const void *current, const void *cache) { return current && current != cache; }
+SYSCTL_QUAD(_debug, OID_AUTO, nvaccel_sv_taken, CTLFLAG_RD | CTLFLAG_LOCKED, (SInt64 *)&gCntSVTaken, "dirty marks that bound the surface away from another accelerator");
+SYSCTL_QUAD(_debug, OID_AUTO, nvaccel_sv_other_owner, CTLFLAG_RD | CTLFLAG_LOCKED, (SInt64 *)&gCntSVOtherOwner, "dirty marks that went back refused because another accelerator owned the surface");
+// set_current_device_cache leaves its answer in the cache, where IOSurfaceDeviceCache::sync reads it: the new unlock seed if
+// it took the mark, that seed minus one if it refused. Reading the owner back would not do: a CPU lock can clear it right
+// after a refusal, and the write would again be lost. An unlock right after a taken mark makes it look refused: the plugin's
+// copy or a second mark puts that right, but not on a re-mark, a try, which only the next draw corrects.
+static inline bool nvAccelSurfOtherOwner(unsigned markedSeed, unsigned unlockSeed) { return markedSeed != unlockSeed; }
 static unsigned nvAccelSurfDirty(void *cache, NVResource *res, unsigned plane)
 {
     volatile unsigned char *r = (volatile unsigned char *)res;
@@ -1882,7 +1885,8 @@ static unsigned nvAccelSurfDirty(void *cache, NVResource *res, unsigned plane)
     void *surf = *(void *volatile *)((unsigned char *)cache + 0x10);
     if (!nvSVPend(_ZNK9IOSurface12getSurfaceIDEv(surf), 1, res)) return NVRM_SS_NO_CACHE;
     _ZN20IOSurfaceDeviceCache10setCurrentEv(cache);
-    if (gSVTake && nvAccelSurfOtherOwner(_ZNK9IOSurface21getCurrentDeviceCacheEv(surf), cache)) return NVRM_SS_OTHER_OWNER;
+    if (gSVTake && nvAccelSurfOtherOwner(*(const volatile unsigned *)((unsigned char *)cache + 0x50), _ZNK9IOSurface13getUnlockSeedEv(surf)))
+        return NVRM_SS_OTHER_OWNER;
     valid[6] |= (unsigned short)(1u << plane);
     valid[0] &= (unsigned short)~(1u << plane);
     { NVVidMemory *vm = nvres_vidmem(res); res->fPluginWroteCookie = vm ? vm->fAllocationCookie : 0; }
@@ -1960,7 +1964,7 @@ static IOReturn nvAccelSurfVram(struct NVRMSurfShareEsc *p, task_t task, unsigne
             ? nvAccelSurfDirty(cache, res, p->plane) : NVRM_SS_NO_CACHE;
         if (p->status == NVRM_SS_OTHER_OWNER && !tryOnly && gSVTake > 1) {
             // bind_accel pages the owner off under that owner's accelerator lock and waits for its GPU, so this lock is let
-            // go first: the owner can be a cache of ours, for another plane. A try must not wait at all: the commit's mark stands.
+            // go first: the owner can be a cache of ours, for another plane. A try does not wait for it: the commit's mark stands.
             const unsigned accelerator = *(const volatile unsigned *)((unsigned char *)cache + 0x48);
             const unsigned plane = *(const volatile unsigned *)((unsigned char *)cache + 0x54);
             nvFamUnlock(a);
