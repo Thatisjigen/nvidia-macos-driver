@@ -1711,6 +1711,13 @@ static void nvmtl_mip_autofill(NVMTLTexture *t, const void *bytes, size_t row, M
         case MTLPixelFormatA8Unorm: case MTLPixelFormatR8Unorm: case MTLPixelFormatR8Unorm_sRGB: bpp = 1; break;
         case MTLPixelFormatRG8Unorm: case MTLPixelFormatRG8Unorm_sRGB: bpp = 2; break;
         case MTLPixelFormatRGBA8Unorm: case MTLPixelFormatRGBA8Unorm_sRGB: case MTLPixelFormatBGRA8Unorm: case MTLPixelFormatBGRA8Unorm_sRGB: bpp = 4; break;
+        // Tahoe's layered app icons are RGBA16Float, drawn trilinear by every NSImageView: without their levels Spotlight's icons
+        // came out empty. A byte average does not fit these formats, so the GPU fills the levels (one submission, not one per level).
+        case MTLPixelFormatRGBA16Float: case MTLPixelFormatRG16Float: case MTLPixelFormatR16Float:
+        case MTLPixelFormatRGBA16Unorm: case MTLPixelFormatRG16Unorm: case MTLPixelFormatR16Unorm:
+        case MTLPixelFormatBGR10A2Unorm: case MTLPixelFormatRGB10A2Unorm: case MTLPixelFormatRG11B10Float:
+            if (nvmtl_vk_image_gen_mipmaps(t->_q, im)) nvlog("mip autofill: level generation FAILED (%ux%u format %lu)", w, h, (unsigned long)t.pixelFormat);
+            return;
         default: return; }
     if (bpp != im->bpp) return;
     size_t cap = (size_t)((w + 1) / 2) * ((h + 1) / 2) * bpp; uint8_t *cur = malloc(cap), *nxt = malloc(cap);
