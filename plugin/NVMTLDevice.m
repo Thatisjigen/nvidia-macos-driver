@@ -26,6 +26,7 @@
 #include <time.h>
 #include "nvmtl_sample_positions.h"
 #include "nvmtl_log_failure.h"
+#include "nvmtl_rt_shadow.h"
 #include "nvmtl_env_knobs.h"
 #include "nvmtl_app_profile.h"
 #include "nvmtl_claims.h"
