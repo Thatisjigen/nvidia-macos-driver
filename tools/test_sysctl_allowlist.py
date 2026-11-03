@@ -19,7 +19,7 @@ SOURCES = ["kexts/NVRM/NVRM.cpp", "kexts/NVRM/os-xnu2.cpp", "kexts/NVRM/os-nvkms
 # Writable sysctls: root-only (no CTLFLAG_ANYBODY), each a display or WindowServer-path switch support asks users to
 # set with sudo. Reviewed 2.6.6.
 WRITABLE = {"nvrmfb_backlight_restore", "nvaccel_igpu", "nvaccel_iop", "nvaccelfb", "nvaccel_vm_sticky", "nvaccel_iop_flip", "nvaccel_surface_gpu_on",
-            "nvaccel_iop_async", "nvaccel_crc_head", "nvaccel_svdiag", "nvrmfb_agdc", "nvrmfb_vram_display_aware",
+            "nvaccel_iop_async", "nvaccel_crc_head", "nvaccel_svdiag", "nvaccel_sv_take", "nvrmfb_agdc", "nvrmfb_vram_display_aware",
             "nvrmfb_vramtest", "nvrmfb_vramtest_mode", "nvrmfb_flip_latch", "nvrmfb_flip_lean", "nvrmfb_flip_interval",
             # Reviewed 2.7.2: the display-link switch the boot guard manages, and the Intel panel's test attach. Both root-only.
             "nvrmfb_agdc_k5", "nmintelfb_attach",
