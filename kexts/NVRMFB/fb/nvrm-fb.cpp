@@ -454,7 +454,7 @@ class NVRMNVDAFramebuffer : public IOFramebuffer {
     static bool audioReady(void *, void *, IOService *, IONotifier *);
     uint64_t fAudioGeneration = 0;
     unsigned fAudioAttempt = 0;
-    bool fAudioValid = false;
+    bool fAudioValid = false, fAudioLastValid = false;
     uint8_t fAudioCodec[4] = {};
     thread_call_t fConnectNotify = nullptr;
     void notifyConnectionChanged(unsigned delayMs);

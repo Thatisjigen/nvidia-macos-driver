@@ -195,7 +195,10 @@ void NVRMNVDAFramebuffer::audioFire(thread_call_param_t p0, thread_call_param_t)
             chosen[1] = 1; chosen[2] = 4; valid = true; source = "fallback-04";
         }
         if (!valid && !error && display.mst) source = "mst-unsupported";
-        bool changed = me->fAudioValid != valid || memcmp(me->fAudioCodec, chosen, 4);
+        // ANV15-52: against the last result, not fAudioValid, which every publish clears first. A display wake found the same
+        // pin and still told the framework the connection had changed: WindowServer re-read and re-installed every timing of the head.
+        bool changed = me->fAudioLastValid != valid || memcmp(me->fAudioCodec, chosen, 4);
+        me->fAudioLastValid = valid;
         me->fAudioValid = valid; memcpy(me->fAudioCodec, chosen, 4);
         me->setProperty("NVRMFBDisplayAudioSource", source);
         me->setProperty("NVRMFBDisplayAudioProbe", topology ? "available" : "unavailable");
