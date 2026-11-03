@@ -5055,7 +5055,34 @@ static NVMTLBuffer *nvmtl_icb_scratch(uint32_t slots) {
 - (void)useHeap:(id<MTLHeap>)h { nvmtl_use_heap(_cb, h); }
 - (void)useHeap:(id<MTLHeap>)h stages:(MTLRenderStages)st { (void)st; nvmtl_use_heap(_cb, h); }
 - (void)sampleCountersInBuffer:(id)sb atSampleIndex:(NSUInteger)i withBarrier:(BOOL)b { nvmtl_sample_counter(_cb, sb, i, self, b); }
-- (void)textureBarrier { nvmtl_vk_barrier_site(NVMTL_BARS_FENCE_API); nvmtl_vk_cmd_barrier(&_cb->_c); }
+// CoreAnimation's generic pipelines read the destination: a render-target barrier, then the attachment bound as a texture. When
+// NVK draws that attachment through a tiled shadow (nvmtl_rt_shadow.h) the texture still holds what the image held when the pass
+// began, so such a draw blended over old or empty pixels: holes in the title bar of a window's capture on the RTX. It hits
+// IOSurface targets whose row is not a multiple of 128 bytes, about half of all window widths. The barrier ends the pass, which
+// copies the shadow to the image, and begins it again from there. Passes with depth, MSAA or a visibility query keep the plain
+// barrier; NVMTL_NO_RT_BARRIER_SPLIT=1 turns this off.
+- (void)nvmtlRenderTargetBarrier {
+    static int off = -1;
+    if (off < 0) { const char *e = getenv("NVMTL_NO_RT_BARRIER_SPLIT"); off = e && e[0] == '1'; }
+    uint32_t kinds[NVMTL_NCOL], n = 0; BOOL split = !off && _begun && _ps && !_passDepth && _passSamples <= 1 && !_resolve && !_visActive && !_pass.ds && !_pass.dsview && _pass.w && _pass.h;
+    for (uint32_t i = 0; split && i < NVMTL_NCOL; i++) { if (_pass.res[i]) split = NO; if (_pass.col[i]) kinds[n++] = _pass.col[i]->lin; }
+    if (!split || !nvmtl_pass_shadowed(kinds, n, 0)) { nvmtl_vk_barrier_site(NVMTL_BARS_FENCE_API); nvmtl_vk_cmd_barrier(&_cb->_c); return; }
+    nvmtl_vk_cmd_end_render(&_cb->_c);
+    nvmtl_vk_barrier_site(NVMTL_BARS_FENCE_API); nvmtl_vk_cmd_barrier(&_cb->_c);
+    const uint32_t keep = _pass.load;
+    for (uint32_t i = 0; i < NVMTL_NCOL; i++) if (_pass.col[i]) _pass.load |= NVMTL_LOAD_COLOUR(i);
+    const int failed = nvmtl_vk_cmd_begin_pass(&_cb->_c, &_pass, &_ps->_p);
+    _pass.load = keep;
+    if (failed) { _begun = NO; nvlog("render target barrier: the pass did not begin again - the draws that follow are not recorded"); return; }
+    _svFor = nil; _svKey = nil; _svSel = nil;   // beginning the pass bound the base pipeline again
+    nvmtl_vk_cmd_set_cull(&_cb->_c, _cull);
+    if (_hasVP) nvmtl_vk_cmd_set_viewport(&_cb->_c, _vp[0], _vp[1], _vp[2], _vp[3], _vp[4], _vp[5]);
+    if (_hasSC) nvmtl_vk_cmd_set_scissor(&_cb->_c, (int32_t)_sc[0], (int32_t)_sc[1], _sc[2], _sc[3]);
+    static _Atomic unsigned count;
+    const unsigned c = atomic_fetch_add(&count, 1) + 1;
+    if (c <= 4 || c % 4096 == 0) nvlog("render target barrier: pass split for an attachment NVK draws through a tiled shadow (%ux%u, %u so far)", _pass.w, _pass.h, c);
+}
+- (void)textureBarrier { [self nvmtlRenderTargetBarrier]; }
 - (void)updateFence:(id<MTLFence>)f afterStages:(MTLRenderStages)st {}
 - (void)waitForFence:(id<MTLFence>)f beforeStages:(MTLRenderStages)st {
     // in a pass begun without a barrier the wait must order what came before the pass: restart it behind one
@@ -5063,7 +5090,9 @@ static NVMTLBuffer *nvmtl_icb_scratch(uint32_t slots) {
     if (nvmtl_hz_mode() == 2) nvmtl_hz_force_full(&_cb->_c, 1);
     nvmtl_vk_barrier_site(NVMTL_BARS_FENCE_API); nvmtl_vk_cmd_barrier(&_cb->_c);
 }
-- (void)memoryBarrierWithScope:(MTLBarrierScope)scope afterStages:(MTLRenderStages)a beforeStages:(MTLRenderStages)b { nvmtl_vk_barrier_site(NVMTL_BARS_FENCE_API); nvmtl_vk_cmd_barrier(&_cb->_c); }
+- (void)memoryBarrierWithScope:(MTLBarrierScope)scope afterStages:(MTLRenderStages)a beforeStages:(MTLRenderStages)b {
+    if (scope & MTLBarrierScopeRenderTargets) [self nvmtlRenderTargetBarrier]; else { nvmtl_vk_barrier_site(NVMTL_BARS_FENCE_API); nvmtl_vk_cmd_barrier(&_cb->_c); }
+}
 - (void)memoryBarrierWithResources:(const id<MTLResource> __unsafe_unretained [])r count:(NSUInteger)n afterStages:(MTLRenderStages)a beforeStages:(MTLRenderStages)b { nvmtl_vk_barrier_site(NVMTL_BARS_FENCE_API); nvmtl_vk_cmd_barrier(&_cb->_c); }
 - (void)drawPrimitives:(MTLPrimitiveType)type indirectBuffer:(id<MTLBuffer>)buf indirectBufferOffset:(NSUInteger)off {
     NVMTLBuffer *nb = (NVMTLBuffer *)buf;
