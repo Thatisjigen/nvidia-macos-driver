@@ -5073,7 +5073,7 @@ static NVMTLBuffer *nvmtl_icb_scratch(uint32_t slots) {
     for (uint32_t i = 0; i < NVMTL_NCOL; i++) if (_pass.col[i]) _pass.load |= NVMTL_LOAD_COLOUR(i);
     const int failed = nvmtl_vk_cmd_begin_pass(&_cb->_c, &_pass, &_ps->_p);
     _pass.load = keep;
-    if (failed) { _begun = NO; nvlog("render target barrier: the pass did not begin again - the draws that follow are not recorded"); return; }
+    if (failed) { _begun = NO; nvlog("render target barrier: the pass FAILED to begin again - draws are being skipped"); return; }
     _svFor = nil; _svKey = nil; _svSel = nil;   // beginning the pass bound the base pipeline again
     nvmtl_vk_cmd_set_cull(&_cb->_c, _cull);
     if (_hasVP) nvmtl_vk_cmd_set_viewport(&_cb->_c, _vp[0], _vp[1], _vp[2], _vp[3], _vp[4], _vp[5]);

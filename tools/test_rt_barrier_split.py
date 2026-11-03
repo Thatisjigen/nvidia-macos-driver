@@ -1,13 +1,17 @@
 #!/usr/bin/env python3
 """A render-target barrier splits the pass only when NVK draws through a tiled shadow, and mipmap autofill covers the wide formats."""
-import pathlib, subprocess, tempfile
+import pathlib, re, subprocess, tempfile
 root = pathlib.Path(__file__).resolve().parents[1]
 objects = (root / 'plugin/NVMTLObjects.m').read_text()
 vk = (root / 'plugin/nvmtl_vk.c').read_text()
+# a release build logs only what nvmtl_log_failure lets through, and a pass that does not begin again loses its draws
+failed = re.search(r'_begun = NO; nvlog\("([^"]+)"\);', objects).group(1)
 fixture = r'''
 #include <assert.h>
+#include "nvmtl_log_failure.h"
 #include "nvmtl_rt_shadow.h"
 int main(void) {
+    assert(nvmtl_log_failure("@FAILED@"));
     // the rule of nvk_image_plane_aligned_for_linear_attachment: row and address multiples of 128 bytes
     assert(nvmtl_lin_kind(7680, 0) == NVMTL_LIN_DIRECT);     // a 1920 wide display surface
     assert(nvmtl_lin_kind(1280, 4096) == NVMTL_LIN_DIRECT);
@@ -29,7 +33,7 @@ int main(void) {
 '''
 with tempfile.TemporaryDirectory() as d:
     src = pathlib.Path(d) / 't.c'
-    src.write_text(fixture)
+    src.write_text(fixture.replace('@FAILED@', failed))
     subprocess.check_call(['clang', '-Wall', '-Werror', '-I', str(root / 'plugin'), str(src), '-o', str(pathlib.Path(d) / 't')])
     subprocess.check_call([str(pathlib.Path(d) / 't')])
 # the wiring the fixture cannot reach
