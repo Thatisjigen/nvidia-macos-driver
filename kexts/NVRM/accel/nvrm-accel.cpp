@@ -1896,6 +1896,15 @@ NVACCEL_CNT(nvaccel_surface_gpu_timeouts, gCntSurfTimeouts, "swaps whose composi
 SYSCTL_INT(_debug, OID_AUTO, nvaccel_surface_gpu_wait_max_us, CTLFLAG_RD | CTLFLAG_LOCKED, &gSurfWaitMaxUs, 0, "longest swap wait for a composite, us");
 static SInt64 gCntIopAsync, gCntIopAsyncRefused, gCntIopAsyncDrop;
 SYSCTL_INT(_debug, OID_AUTO, nvaccel_iop_async, CTLFLAG_RW | CTLFLAG_LOCKED, &gIopAsync, 0, "1 = the swap runs on a thread call and completes through signalTransactionInterrupt (Apple's shape); 0 = the earlier synchronous flip");
+// Three refusals in a row turn the asynchronous swap off, because the synchronous one copies a refused frame. But a display
+// going to sleep or waking refuses every flip for a moment, so one stop was enough to leave the swap synchronous until the next
+// boot: its wait for the composite on the pipe's workloop, and the next transactionEnd behind it holding the accelerator lock.
+// It comes back after debug.nvaccel_iop_async_rearm accepted synchronous flips in a row, 0 = never.
+static bool gIopAsyncAutoOff;
+static SInt32 gIopAsyncGoodRun;
+static int gIopAsyncRearm = 120;
+SYSCTL_INT(_debug, OID_AUTO, nvaccel_iop_async_rearm, CTLFLAG_RW | CTLFLAG_LOCKED, &gIopAsyncRearm, 0, "accepted synchronous flips in a row before an asynchronous swap turned off by refusals comes back, 0 = never");
+static inline bool nvAccelIopAsyncComesBack(bool autoOff, int rearm, SInt32 goodRun) { return autoOff && rearm > 0 && goodRun >= rearm; }
 NVACCEL_CNT(nvaccel_iop_async_flips,   gCntIopAsync,        "swaps completed asynchronously");
 SYSCTL_INT(_debug, OID_AUTO, nvaccel_iop_memcpy, CTLFLAG_RW | CTLFLAG_KERN | CTLFLAG_LOCKED, &gIopMemcpy, 0, "nmx-accel: 1 = frames copied to a CPU scanout with memcpy rows, 0 = volatile word loop");
 SYSCTL_INT(_debug, OID_AUTO, nvaccel_iop_direct, CTLFLAG_RW | CTLFLAG_KERN | CTLFLAG_LOCKED, &gIopDirect, 0, "nmx-accel: 1 = copy engine staging -> CPU scanout, skipping the IOSurface's system pages; 2 = copy engine straight into the scanout's RAM pages when the framebuffer offers them");
@@ -1951,6 +1960,7 @@ static void nvaccelInstallSysctl(void)
     sysctl_register_oid(&sysctl__debug_nvaccel_iop_flip_hit);   sysctl_register_oid(&sysctl__debug_nvaccel_iop_flip_miss);
     sysctl_register_oid(&sysctl__debug_nvaccel_iop_async);      sysctl_register_oid(&sysctl__debug_nvaccel_iop_async_flips);
     { extern struct sysctl_oid sysctl__debug_nvaccel_svdiag; sysctl_register_oid(&sysctl__debug_nvaccel_svdiag); }
+    { extern struct sysctl_oid sysctl__debug_nvaccel_iop_async_rearm; sysctl_register_oid(&sysctl__debug_nvaccel_iop_async_rearm); }
     { extern struct sysctl_oid sysctl__debug_nvaccel_sv_take, sysctl__debug_nvaccel_sv_taken, sysctl__debug_nvaccel_sv_other_owner;
       sysctl_register_oid(&sysctl__debug_nvaccel_sv_take); sysctl_register_oid(&sysctl__debug_nvaccel_sv_taken);
       sysctl_register_oid(&sysctl__debug_nvaccel_sv_other_owner); }
@@ -2609,6 +2619,7 @@ static void nvAccelIopAsyncRun(void *p0, void *)
                                                      (unsigned)rr, e->f.flipResult, head); }
         if (++gIopAsyncRefuseRun >= 3 && gIopAsync) {
             gIopAsync = 0;
+            gIopAsyncAutoOff = true; gIopAsyncGoodRun = 0;
             ALOG("iop: b89k 3 async refusals in a row -- debug.nvaccel_iop_async=0 (synchronous flip, which copies on refusal)");
         }
         ((OSObject *)s)->release();
@@ -2720,9 +2731,14 @@ static bool nvAccelIopFlip(IOService *fb, unsigned head, IOSurface *s, void *pip
     if (nvAccelFlipOutcome(rr) == kNvFlipKept) { OSAddAtomic64(1, &gCntIopLate); return true; }
     if (nvAccelFlipOutcome(rr) == kNvFlipAsleep) return true;   // display asleep: nothing to show, nothing to copy   // the frame on the panel stays
     if (rr != kIOReturnSuccess) {
+        gIopAsyncGoodRun = 0;
         if (gIopFlipLogs < 8) { gIopFlipLogs++; ALOG("iop: flip REFUSED (0x%x, flipResult %d) head %u %llux%llu pitch %llu -- copying",
                                                      (unsigned)rr, f.flipResult, head, W, H, P); }
         return nvAccelIopFlipNo(7);
+    }
+    if (nvAccelIopAsyncComesBack(gIopAsyncAutoOff, gIopAsyncRearm, ++gIopAsyncGoodRun)) {
+        gIopAsyncAutoOff = false; gIopAsyncRefuseRun = 0; gIopAsync = 1;
+        ALOG("iop: %d synchronous flips accepted in a row -- debug.nvaccel_iop_async=1 again", gIopAsyncRearm);
     }
     ((OSObject *)s)->retain();
     if (gIopFlipPrev[head]) ((OSObject *)gIopFlipPrev[head])->release();
