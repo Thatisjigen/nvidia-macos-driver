@@ -63,6 +63,8 @@ static IOSurface *gIopFlipFront[kNvMaxFB], *gIopFlipPrev[kNvMaxFB];
 static bool gIopFlipped[kNvMaxFB];
 static unsigned gIopFlipLogs;
 static int gIopAsync = 1;
+static bool gIopAsyncAutoOff;
+static SInt32 gIopAsyncGoodRun;
 static SInt64 gCntIopFlip, gCntIopAsync, gCntIopLate, gCntIopAsyncRefused, gCntIopFlipNo[8], gCntIopAsyncDrop, gCntIopFlipHome;
 static SInt64 OSAddAtomic64(SInt64 v, SInt64 *p) { SInt64 o = *p; *p += v; return o; }
 static int64_t gClock = 0;

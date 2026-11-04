@@ -20,6 +20,8 @@
 #define NVRM_SS_NO_VRAM       0x80000005u
 #define NVRM_SS_TOO_SMALL     0x80000006u
 #define NVRM_SS_BUSY          0x80000007u
+/* another accelerator's cache is current: nothing was marked and this surface's other readers do not see the write */
+#define NVRM_SS_OTHER_OWNER   0x80000008u
 struct NVRMSurfShareEsc {
     unsigned int version;
     unsigned int surfaceID;
