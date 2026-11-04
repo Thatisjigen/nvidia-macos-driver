@@ -1287,6 +1287,19 @@ static void nvIopCopyRows(void *dst, unsigned dpitch, const void *src, unsigned 
         for (unsigned x = 0; x < words; x++) dp[x] = sp[x];
     }
 }
+// l10r is ARGB2101010 in a little-endian word and the scanout X8R8G8B8: each channel keeps its top eight bits.
+static inline unsigned nvIopL10rToX8(unsigned v) { return 0xff000000u | ((v >> 6) & 0xff0000u) | ((v >> 4) & 0xff00u) | ((v >> 2) & 0xffu); }
+static void nvIopCopyRowsL10r(void *dst, unsigned dpitch, const void *src, unsigned spitch, unsigned rowBytes, unsigned h)
+{
+    const unsigned words = rowBytes / 4, spr = spitch / 4, dpr = dpitch / 4;
+    const volatile unsigned int *sv = (const volatile unsigned int *)src;
+    volatile unsigned int *dv = (volatile unsigned int *)dst;
+    for (unsigned y = 0; y < h; y++) {
+        const volatile unsigned int *sp = sv + (unsigned long)y * spr;
+        volatile unsigned int *dp = dv + (unsigned long)y * dpr;
+        for (unsigned x = 0; x < words; x++) dp[x] = nvIopL10rToX8(sp[x]);
+    }
+}
 #define NVIOP_LOG_MAX 40
 static unsigned gIopLogs = 0;
 #define NVIOPLOG(fmt, ...) do { if (gIopLogs < NVIOP_LOG_MAX) { gIopLogs++; ALOG("iop: " fmt, ##__VA_ARGS__); } } while (0)
@@ -1356,7 +1369,7 @@ IOReturn NVDisplayPipe::performTransaction(IOAccelDisplayPipeTransaction2 *txn)
     OSObject  *ro = txn->getPlaneResource(0, 0);
     if (!s && !ro) { OSAddAtomic64(1, &gCntIopEmpty); return kIOReturnSuccess; }
 
-    const volatile unsigned int *src = nullptr; unsigned w = 0, h = 0, pitch = 0; bool fromRes = false;
+    const volatile unsigned int *src = nullptr; unsigned w = 0, h = 0, pitch = 0; bool fromRes = false, srcL10r = false;
     uint64_t t0 = 0;
     NVResource *res = OSDynamicCast(NVResource, ro);
     NVVidMemory *vm = res ? nvres_vidmem(res) : nullptr;
@@ -1406,7 +1419,9 @@ IOReturn NVDisplayPipe::performTransaction(IOAccelDisplayPipeTransaction2 *txn)
         }
         if (!nvAccelSurfCopyReady(s, head)) return kIOReturnSuccess;
         const unsigned fmt = s->getPixelFormat();
-        if (fmt != 0x42475241u) NVIOP_FAIL(kIOReturnUnsupported, "surface 0x%x format 0x%08x is not BGRA", s->getSurfaceID(), fmt);
+        // with EDR on, WindowServer sends l10r to this 8-bit scanout and every refused frame left it black. Copied down to 8 bits, without HDR.
+        srcL10r = fmt == 0x6c313072u;
+        if (fmt != 0x42475241u && !srcL10r) NVIOP_FAIL(kIOReturnUnsupported, "surface 0x%x format 0x%08x is neither BGRA nor l10r", s->getSurfaceID(), fmt);
         const unsigned long long W = s->getWidth(), H = s->getHeight(), P = s->getBytesPerRow();
         if (!W || !H || P < 4 || W > 16384 || H > 16384 || P > 16384ull * 8) NVIOP_FAIL(kIOReturnBadArgument, "surface geometry %llux%llu pitch %llu", W, H, P);
         if (P < 4 * W || (P & 3)) NVIOP_FAIL(kIOReturnBadArgument, "surface %llux%llu: row pitch %llu is under 4*W or not word-aligned", W, H, P);
@@ -1429,7 +1444,7 @@ IOReturn NVDisplayPipe::performTransaction(IOAccelDisplayPipeTransaction2 *txn)
 
     nvAccelIopHome(fb, head);
     const unsigned spr = pitch / 4;
-    nvIopCopyRows(q.kva, q.pitch, (const void *)src, pitch, ((pitch < q.pitch) ? pitch : q.pitch) & ~3u, h);
+    (srcL10r ? nvIopCopyRowsL10r : nvIopCopyRows)(q.kva, q.pitch, (const void *)src, pitch, ((pitch < q.pitch) ? pitch : q.pitch) & ~3u, h);
     if (t0) { uint64_t ns; absolutetime_to_nanoseconds(mach_absolute_time() - t0, &ns); OSAddAtomic64((SInt64)(ns / 1000), &gCntIopCopyUs); }
     OSAddAtomic64(1, fromRes ? &gCntIopSrcRes : &gCntIopSrcSurf);
     const SInt64 n = OSAddAtomic64(1, &gCntIopOk);
