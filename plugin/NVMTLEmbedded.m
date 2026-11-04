@@ -161,7 +161,10 @@ static id<MTLSamplerState> nvmtl_static_sampler_from(NSDictionary *st)
     if ([lo isKindOfClass:[NSNumber class]]) d.lodMinClamp = lo.floatValue;
     if ([hi isKindOfClass:[NSNumber class]]) d.lodMaxClamp = hi.floatValue;
     if (bad) return nil;
-    return [MTLCreateSystemDefaultDevice() newSamplerStateWithDescriptor:d];
+    // The device that draws, not MTLCreateSystemDefaultDevice(): with a second GPU the default can be that one, and its sampler
+    // state read as an NVMTLSamplerState has no VkSampler. The slot then held the dummy sampler, which repeats and stays on level 0:
+    // in WindowServer next to an Iris Xe, CoreAnimation's glass read its SDF past the edge and drew the shape again on the other side.
+    return [gNVMTLMainDevice newSamplerStateWithDescriptor:d];
 }
 static const void *NVMTL_SSAMP_KEY = &NVMTL_SSAMP_KEY;
 static NSArray<NSArray *> *nvmtl_static_samplers(NVMTLFunction *fn)
