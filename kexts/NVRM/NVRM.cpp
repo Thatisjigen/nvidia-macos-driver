@@ -1199,24 +1199,18 @@ void NVRM::autoGo(void *p0, wait_result_t)
         LOG("auto-go: display stack: %s", sum);
         if (!earlyRelease) s->releaseBootHold(armed == 1 && ag == 1 && iop == 1 ? "display armed" : "display PARTIAL");
         if (armed == 1 && iop == 1 && !PE_parse_boot_argn("-nvrmnoflip", nb, sizeof(nb))) {
-            // Zero-copy scan-out shows only what sits in this GPU's VRAM. One setup blacks the screen (cursor only) the
-            // moment it starts, and every report was fixed by -nvrmnoflip: a second accelerated GPU (Intel/AMD iGPU;
-            // WindowServer composites there, issues #16 #26). The black screens reported for unplaced windows (#54, #82)
-            // also had an iGPU, which the check below covers, so whether BAR1 was moved doesn't decide flipping. That
-            // setup keeps the copy path, decided below from what is known right now.
+            // Zero-copy scan-out shows only what sits in this GPU's VRAM. One setup blacked the screen (cursor only) the
+            // moment it started, and every report was fixed by -nvrmnoflip: a second accelerated GPU (Intel/AMD iGPU;
+            // WindowServer composites there, issues #16 #26). NVAccel looks at that frame by frame: VRAM this GPU's plugin
+            // did not write is copied, not flipped (nvAccelIopVramFlippable). Looking for another accelerator here only
+            // raced the other GPU's start: IntelAccelerator is published within a second of this line, so the same machine
+            // came up with flips on or off by a few milliseconds.
             const char *why = nullptr;
             // An unplaced BAR1 of 512 MB or more holds the scan-out surfaces, so it may flip. A 256 MB firmware window
             // keeps the copy path: 12 machines in the field run that way with no iGPU, and none has been tested flipping.
             const uint64_t bar1MB = s->fNv.bars[NV_GPU_BAR_INDEX_FB].size >> 20;
             if (!s->fBar1Placed && bar1MB < 512) why = "BAR1 not placed and below 512 MB (small firmware window)";
             else if (!s->fBar1Placed) LOG("auto-go: BAR1 not placed (%llu MB) - flip allowed", bar1MB);
-            if (!why) if (OSIterator *it = IOService::getMatchingServices(IOService::serviceMatching("IOAccelerator"))) {
-                while (OSObject *o = it->getNextObject()) {
-                    const char *cn = o->getMetaClass()->getClassName();
-                    if (cn && strncmp(cn, "NV", 2)) { why = "another GPU's accelerator is running"; LOG("auto-go: accelerator %s present", cn); break; }
-                }
-                it->release();
-            }
             if (why) {
                 LOG("auto-go: zero-copy flip NOT started: %s; the copy path stays (as -nvrmnoflip)", why);
                 s->setProperty("nvrm-flip", "off (copy path)");
