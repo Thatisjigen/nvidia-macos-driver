@@ -10,4 +10,8 @@ code = [l for l in made.splitlines() if not l.strip().startswith('//')]
 assert not any('MTLCreateSystemDefaultDevice' in l for l in code)
 assert any('[gNVMTLMainDevice newSamplerStateWithDescriptor:d]' in l for l in code)
 assert not any('MTLCreateSystemDefaultDevice' in l and 'Sampler' in l for l in embedded.splitlines() if not l.strip().startswith('//'))
-print('pass: constexpr samplers are made on the device that draws')
+vk = (root / 'plugin/nvmtl_vk.c').read_text()
+dummy = vk[vk.index('The sampler a shader gets at a slot nothing was bound to'):]
+dummy = dummy[:dummy.index('&g_dummySampler')]
+assert 'sci.addressModeU = sci.addressModeV = sci.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;' in dummy
+print('pass: constexpr samplers are made on the device that draws, and the dummy sampler clamps')
