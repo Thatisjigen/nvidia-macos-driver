@@ -1653,7 +1653,8 @@ static uint64_t nvmtl_host_pages_cookie(IOSurfaceRef s)
 // unfinished copy current until the surface is drawn again. Each retry is again a try that never waits for the lock,
 // right after checking that the seed has not moved (a CPU write, or a newer commit marked it again): a mark that waited
 // for the lock could land after a CPU write that came in meanwhile and make the older VRAM current over it. 50 tries,
-// 2 ms apart; the texture then follows the seed the mark left.
+// 2 ms apart; the texture then follows the seed the mark left. A retry refused for an owner is what nvmtlSurfaceOutDirtied: says about
+// a try refused for an owner: the stamp the first try left comes off, tag included.
 static void nvmtl_surface_remark_later(NVMTLTexture *r, uint32_t seed) {
     static dispatch_queue_t queue; static dispatch_once_t once;
     dispatch_once(&once, ^{ queue = dispatch_queue_create("nvmtl.surface-remark", DISPATCH_QUEUE_SERIAL); });
@@ -1664,9 +1665,10 @@ static void nvmtl_surface_remark_later(NVMTLTexture *r, uint32_t seed) {
             if (IOSurfaceGetSeed(r->_surf) != seed) return;
             marked = nvmtl_vk_surface_dirty_try((uint32_t)IOSurfaceGetID(r->_surf), (uint32_t)r->_plane);
         }
-        if (marked) return;
+        if (marked && marked != NVMTL_MARK_OTHER_OWNER) return;
         @synchronized (nvmtl_surface_sync(r)) {
             if (r->_surfSeed != seed) return;
+            if (marked) { r->_surfSynced = NO; nvmtl_vram_tag_set(r->_surf, r->_plane, seed - 1); return; }
             const uint32_t now = IOSurfaceGetSeed(r->_surf);
             r->_surfSeed = now; r->_surfGen = nvmtl_vram_tag_bump(r->_surf, r->_plane, now);
         }
@@ -1686,6 +1688,10 @@ static void nvmtl_surface_remark_later(NVMTLTexture *r, uint32_t seed) {
             (unsigned long long)(clock_gettime_nsec_np(CLOCK_UPTIME_RAW) / 1000));
     const int marked = !r->_vramOn ? -1 : dirtied ? nvmtl_vk_surface_dirty_try((uint32_t)IOSurfaceGetID(r->_surf), (uint32_t)r->_plane)
                                                    : nvmtl_vk_surface_dirty((uint32_t)IOSurfaceGetID(r->_surf), (uint32_t)r->_plane);
+    // The commit's mark went in, and the try was refused for an owner: another accelerator has taken the surface since, and its bind has
+    // moved this GPU's pixels out (the page-off waited for them). What it wrote since is not in this VRAM, so the seed stays behind and
+    // the next read here imports. An unlock right after a taken try reads as a refusal too, and costs that one import.
+    if (dirtied && marked == NVMTL_MARK_OTHER_OWNER) return YES;
     if (r->_vramOn && (dirtied || !marked)) {
         uint32_t seed = IOSurfaceGetSeed(r->_surf);
         r->_surfSeed = seed; r->_surfSynced = YES;
