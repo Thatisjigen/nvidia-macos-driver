@@ -1861,7 +1861,9 @@ static bool nvSurfWaitReady(unsigned int id)
     if (waited) {
         uint64_t ns = 0; absolutetime_to_nanoseconds(mach_absolute_time() - start, &ns);
         if ((int)(ns / 1000) > gSurfWaitMaxUs) gSurfWaitMaxUs = (int)(ns / 1000);
-        OSAddAtomic64(1, ready ? &gCntSurfWaits : &gCntSurfTimeouts);
+        const SInt64 before = OSAddAtomic64(1, ready ? &gCntSurfWaits : &gCntSurfTimeouts);
+        if (!ready && (before < 16 || (before & 63) == 0))
+            ALOG("surface %u: no completion mark after %u ms, going on with the GPU perhaps still writing it (%lld so far)", id, kSurfGpuWaitMs, (long long)before + 1);
     }
     return ready;
 }
@@ -2178,10 +2180,11 @@ static bool nvSVDiag() { return gSVDiag > 0 && OSDecrementAtomic(&gSVDiag) > 0; 
 // IOSurface::set_current_device_cache refuses while another accelerator's cache is current, and says nothing: the seed
 // stays and the CPU and that accelerator go on reading their own old pixels, while this GPU reads what it wrote. Apple's
 // drivers avoid it by binding a surface when they encode a use of it (ioAccelResourceGroupAddNewResource). The plugin
-// does not bind, so a surface another accelerator wrote last is still that accelerator's at this mark.
-// sysctl debug.nvaccel_sv_take: 1 = report the refusal, and the plugin copies the pixels out under a CPU lock, which waits
-// in user space; 2 = bind here, as Apple's do at encode, which keeps the VRAM copy but waits for the owner's GPU inside this
-// escape, with the NVRM client's gate and power use held; 0 = ignore the refusal, as before.
+// does not bind when it encodes, so a surface another accelerator wrote last is still that accelerator's at this mark.
+// sysctl debug.nvaccel_sv_take: 1 = report the refusal: WindowServer's commit takes the surface with a CPU lock and marks again,
+// which keeps the VRAM copy and waits in user space, and any other process copies the pixels out under a CPU lock; 2 = bind here, as
+// Apple's do at encode, which waits for the owner's GPU inside this escape, with the NVRM client's gate and power use held; 0 =
+// ignore the refusal, as before.
 static int gSVTake = 1;
 SYSCTL_INT(_debug, OID_AUTO, nvaccel_sv_take, CTLFLAG_RW | CTLFLAG_LOCKED, &gSVTake, 0, "a dirty mark on a surface another accelerator owns: 1 = the refusal goes back to the plugin, 2 = bound here, 0 = ignored");
 static SInt64 gCntSVTaken, gCntSVOtherOwner;
@@ -2413,7 +2416,11 @@ void NVResource::pageoff(IOAccelEvent *ev, bool a1, bool *out, unsigned long lon
             if (!surf || !vm || !vm->fRmHandle || vm->fScanout || !vm->fBytes || !nvAccelRmHandles(fAccel, &h)) { NV_FAM_PAGEOFF(ev, a1, out, a3); return; }
         } else {
             if (gPoUnlocked && a && nvSurfIsPending(sid)) OSAddAtomic64(1, &gCntPoNotOwner);
-            nvSurfWaitReady(sid);
+            if (!nvSurfWaitReady(sid)) {   // this one held the accelerator lock all that time
+                static SInt32 late;
+                const SInt32 n = OSIncrementAtomic(&late);
+                if (n < 16 || (n & 63) == 0) ALOG("surfvram pageoff: surface %u waited out holding the accelerator lock (%d so far)", sid, (int)n + 1);
+            }
         }
     }
     IOMemoryDescriptor *md = (IOMemoryDescriptor *)_ZNK9IOSurface19getMemoryDescriptorEv(surf);
