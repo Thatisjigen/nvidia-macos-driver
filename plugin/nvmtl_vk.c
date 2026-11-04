@@ -89,6 +89,8 @@ static inline const char *nvmtl_pick_vk(const char *staged, const char *dev) {
  * accelerator), RADV for AMD and ANV for Intel (NMXAccel, the accelerator for the GPUs NMXGPU drives).
  */
 #include <IOKit/IOKitLib.h>
+#include <IOSurface/IOSurfaceRef.h>
+#include <dispatch/dispatch.h>
 static uint16_t g_vendor;
 static uint16_t nvmtl_pci_vendor_of(io_service_t accel)
 {
@@ -2939,6 +2941,7 @@ _Static_assert(sizeof(struct nvmtl_surfshare_esc) == 40, "NVRMSurfShareEsc");
 enum { NVMTL_SS_VERSION = 2, NVMTL_ESC_SURF_DIRTY = 0xE3, NVMTL_SEL_ESC = 1, NVMTL_RM_CLIENT_CTL = 0x4E560000 };
 #define NVMTL_SS_OFF           0x80000002u
 #define NVMTL_SS_BUSY          0x80000007u
+#define NVMTL_SS_OTHER_OWNER   0x80000008u
 #define NVMTL_SS_PLANE_TRYLOCK 0x40000000u
 static io_connect_t g_marks_client, g_wait_client;
 static pthread_once_t g_marks_client_once = PTHREAD_ONCE_INIT, g_wait_client_once = PTHREAD_ONCE_INIT;
@@ -2987,13 +2990,95 @@ static int nvmtl_vk_surface_mark_newest(uint32_t surfaceID, uint32_t plane, uint
     uint32_t st = nvmtl_ws_dirty_esc(surfaceID, plane, flags, &sent);
     if (!sent) st = pnvk_surface_dirty(g_dev, surfaceID, plane | flags);
     if (st == NVMTL_SS_BUSY) return 1;    /* a try that found the accelerator lock taken */
-    if (st) { static unsigned n; if (n++ < 8 || n % 2000 == 0) nvlog("surface %u dirty refused (%#x) - copy-out (%u so far)", surfaceID, st, n); }
-    return st ? -1 : 0;
+    if (st) { static unsigned n; if (n++ < 8 || n % 2000 == 0) nvlog("surface %u dirty refused (%#x, %u so far)", surfaceID, st, n); }
+    return st == NVMTL_SS_OTHER_OWNER ? NVMTL_MARK_OTHER_OWNER : st ? -1 : 0;
 }
 int nvmtl_vk_surface_dirty(uint32_t surfaceID, uint32_t plane) { return nvmtl_vk_surface_mark_newest(surfaceID, plane, 0); }
 /* the same mark, given up instead of waiting when the accelerator lock is taken (NVRM_SS_PLANE_TRYLOCK; only an NVAccel
    that publishes NVAccelSurfaceWait is asked): 0 marked, 1 the lock was taken, -1 refused */
 int nvmtl_vk_surface_dirty_try(uint32_t surfaceID, uint32_t plane) { return nvmtl_vk_surface_mark_newest(surfaceID, plane, NVMTL_SS_PLANE_TRYLOCK); }
+// A CPU lock pages off the surface's owner, and with that owner's accelerator disabled (its display asleep or changing mode:
+// acceleratorWaitEnabled) or its GPU hung it may not come back. On WindowServer's commit thread that would stop the display on this GPU
+// because of the other one. So it goes on a thread of its own: the commit waits NVMTL_OWNER_WAIT_MS at most and carries on without it.
+// Past NVMTL_OWNER_JOBS still out nothing more goes in line, and nobody waits.
+enum { NVMTL_OWNER_WAIT_MS = 50, NVMTL_OWNER_JOBS = 4 };
+static _Atomic int g_owner_jobs;
+static dispatch_queue_t g_owner_queue;
+static pthread_once_t g_owner_queue_once = PTHREAD_ONCE_INIT;
+static void nvmtl_owner_queue_make(void)
+{
+    g_owner_queue = dispatch_queue_create("nvmtl.surface-owner", dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL, QOS_CLASS_USER_INTERACTIVE, 0));
+}
+struct nvmtl_owner_job {
+    void *surface;
+    IOReturn result;
+    pthread_mutex_t lock; pthread_cond_t cond;
+    int finished, refs;                           // refs: that thread and the caller, which can leave first
+};
+// called with the job's lock held, which it lets go
+static void nvmtl_owner_job_put(struct nvmtl_owner_job *job)
+{
+    const int left = --job->refs;
+    pthread_mutex_unlock(&job->lock);
+    if (left) return;
+    pthread_cond_destroy(&job->cond);
+    pthread_mutex_destroy(&job->lock);
+    free(job);
+}
+static void nvmtl_owner_job_run(void *context)
+{
+    struct nvmtl_owner_job *job = context;
+    const IOReturn result = IOSurfaceLock((IOSurfaceRef)job->surface, kIOSurfaceLockReadOnly, NULL);
+    if (result == kIOReturnSuccess) IOSurfaceUnlock((IOSurfaceRef)job->surface, kIOSurfaceLockReadOnly, NULL);
+    CFRelease(job->surface);
+    atomic_fetch_sub(&g_owner_jobs, 1);
+    pthread_mutex_lock(&job->lock);
+    job->result = result; job->finished = 1;
+    pthread_cond_signal(&job->cond);
+    nvmtl_owner_job_put(job);
+}
+static IOReturn nvmtl_owner_lets_go(void *surface)
+{
+    pthread_once(&g_owner_queue_once, nvmtl_owner_queue_make);
+    if (atomic_fetch_add(&g_owner_jobs, 1) >= NVMTL_OWNER_JOBS) { atomic_fetch_sub(&g_owner_jobs, 1); return kIOReturnBusy; }
+    struct nvmtl_owner_job *job = calloc(1, sizeof *job);
+    if (!job) { atomic_fetch_sub(&g_owner_jobs, 1); return kIOReturnNoMemory; }
+    job->surface = surface; job->refs = 2;
+    pthread_mutex_init(&job->lock, NULL); pthread_cond_init(&job->cond, NULL);
+    CFRetain(surface);
+    dispatch_async_f(g_owner_queue, job, nvmtl_owner_job_run);
+    const uint64_t deadline = clock_gettime_nsec_np(CLOCK_UPTIME_RAW) + NVMTL_OWNER_WAIT_MS * 1000000ull;
+    pthread_mutex_lock(&job->lock);
+    while (!job->finished) {
+        const uint64_t now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+        if (now >= deadline) break;
+        const uint64_t left = deadline - now;
+        const struct timespec wait = { (time_t)(left / 1000000000ull), (long)(left % 1000000000ull) };
+        pthread_cond_timedwait_relative_np(&job->cond, &job->lock, &wait);
+    }
+    const IOReturn result = job->finished ? job->result : kIOReturnTimeout;
+    nvmtl_owner_job_put(job);
+    return result;
+}
+// The mark at WindowServer's commit. IOSurface::set_current_device_cache refuses while another accelerator's cache is current: a
+// surface the Intel GPU wrote last would go on being the Intel's, and the CPU and the Intel would read its old pixels. Apple's
+// drivers avoid the refusal by binding a surface when they encode a use of it (ioAccelResourceGroupAddNewResource). A read-only CPU
+// lock runs the same code as that bind (synchronize_device_caches: the owner is taken away, paged off and waited for) with no
+// accelerator id and no private call, and the next mark takes the surface. Only here, when this GPU is about to write: later the owner
+// may be drawing its next frame, and taking the surface then would hide that frame. This thread holds no lock, nothing waits for it, and
+// its wait is bounded above. A lock past the limit has usually taken the surface from its owner already, and the mark goes in; one still
+// in line leaves the mark refused, and that goes to publication (nvmtlSurfaceOutRefused).
+int nvmtl_vk_surface_dirty_commit(void *surface, uint32_t surfaceID, uint32_t plane)
+{
+    int marked = nvmtl_vk_surface_mark_newest(surfaceID, plane, 0);
+    if (marked != NVMTL_MARK_OTHER_OWNER) return marked;
+    const IOReturn let_go = nvmtl_owner_lets_go(surface);
+    if (let_go == kIOReturnSuccess || let_go == kIOReturnTimeout) marked = nvmtl_vk_surface_mark_newest(surfaceID, plane, 0);
+    static _Atomic unsigned events;
+    const unsigned n = atomic_fetch_add(&events, 1) + 1;
+    if (n <= 8 || n % 2000 == 0) nvlog("surface %u was another accelerator's at commit: lock %#x, mark %d (%u so far)", surfaceID, let_go, marked, n);
+    return marked;
+}
 // 0 = the kernel took it. NVK's surface escape only if the client could not be opened.
 uint32_t nvmtl_vk_surface_gpu_mark(uint32_t surfaceID, int pending)
 {

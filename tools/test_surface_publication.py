@@ -33,7 +33,9 @@ static unsigned uploads, gpu_seed;
 static unsigned long long g_surfin_skip, g_surfin_copy;
 static uint32_t IOSurfaceGetSeed(IOSurfaceRef s) { return s->seed; }
 static unsigned IOSurfaceGetID(IOSurfaceRef s) { return 1; }
+static unsigned cpuLocks;
 static IOReturn IOSurfaceLock(IOSurfaceRef s, unsigned opts, uint32_t *seed) {
+    cpuLocks++;
     if (!opts) s->seed++;
     if (seed) *seed=s->seed;
     return 0;
@@ -59,6 +61,7 @@ static unsigned nvmtl_vram_tag_bump(IOSurfaceRef s, NSUInteger p, unsigned seed)
 static int dirtyAnswer=1, tryAnswer=-1; static unsigned blockingDirties, tries;
 static int nvmtl_vk_surface_dirty(unsigned s, unsigned p) { blockingDirties++; return dirtyAnswer; }
 static int nvmtl_vk_surface_dirty_try(unsigned s, unsigned p) { tries++; return tryAnswer; }
+#define NVMTL_MARK_OTHER_OWNER (-2)
 static int nvmtl_noseed(void) { return 0; }
 // own-write tracking across planes (nvmtl_plane_seed.h) is off unless NVMTL_PLANE_SEED=1; its surface-property and page-key
 // calls are stubs here, so every arm below runs the default path
@@ -94,6 +97,7 @@ static int nvmtl_vk_image_read(void *q, Image *i, void *base, size_t row) {
 - (void)nvmtlSurfaceIn;
 - (BOOL)nvmtlSurfaceOut;
 - (BOOL)nvmtlSurfaceOutDirtied:(BOOL)dirtied;
+- (BOOL)nvmtlSurfaceOutRefused;
 @end
 @implementation NVMTLTexture
 - (BOOL)nvmtlSurfaceCopyable { return YES; }
@@ -151,6 +155,28 @@ int main(int argc, char **argv) { @autoreleasepool {
     dirtyAnswer=0;
     assert([w nvmtlSurfaceOut] && tries==2 && blockingDirties==1);
     dirtyAnswer=1;
+    // the commit's mark stayed refused: this is the thread that releases the marks every page-off waits for, so no blocking mark, no
+    // CPU lock and no copy here for an owner; this frame stays in VRAM and the texture follows the seed
+    Surface tt={.seed=20}; NVMTLTexture *t8=[NVMTLTexture new]; t8->_surf=&tt; t8->_vramOn=YES; t8->_i=(Image){.w=1,.h=1,.bpp=4};
+    blockingDirties=0; tries=0; cpuLocks=0;
+    tryAnswer=0;
+    assert([t8 nvmtlSurfaceOutRefused] && tries==1 && t8->_surfSynced && t8->_surfSeed==20);   // the try took it
+    for (int answer=NVMTL_MARK_OTHER_OWNER; answer<=1; answer+=3) {                             // refused for an owner, the lock taken
+        tryAnswer=answer; t8->_surfSynced=NO; t8->_surfSeed=0; const unsigned before=tries;
+        assert([t8 nvmtlSurfaceOutRefused] && tries==before+1 && t8->_surfSynced && t8->_surfSeed==20);
+    }
+    assert(!blockingDirties && !cpuLocks);
+    assert(dispatch_semaphore_wait(entered,DISPATCH_TIME_NOW));
+    // any other refusal has nothing to do with an owner: the blocking mark and the copy, as ever
+    tryAnswer=-1; dirtyAnswer=1; dispatch_semaphore_signal(release_read);
+    const unsigned triesCopy=tries;
+    assert([t8 nvmtlSurfaceOutRefused] && tries==triesCopy+1 && blockingDirties==1 && cpuLocks==1);
+    assert(!dispatch_semaphore_wait(entered,DISPATCH_TIME_NOW));
+    // a private copy has no mark: its pixels go out under a lock, as ever
+    Surface ps={.seed=30}; NVMTLTexture *priv=[NVMTLTexture new]; priv->_surf=&ps; priv->_i=(Image){.w=1,.h=1,.bpp=4};
+    const unsigned triesBefore=tries; cpuLocks=0; dispatch_semaphore_signal(release_read);
+    assert([priv nvmtlSurfaceOutRefused] && tries==triesBefore && cpuLocks==1);
+    assert(!dispatch_semaphore_wait(entered,DISPATCH_TIME_NOW));
     // a surface another process is still drawing (PR #398): this process waits for that write before it imports, and
     // remembers the surface as client-written so every later import waits too; its own writes never wait
     Surface cs={.seed=3}; NVMTLTexture *c=[NVMTLTexture new]; c->_surf=&cs; c->_i=(Image){.w=1,.h=1,.bpp=4};
@@ -161,7 +187,8 @@ int main(int argc, char **argv) { @autoreleasepool {
     busyForeign=0; cs.seed++; [c nvmtlSurfaceIn];
     assert(busyWaits==2);
     puts("PASS: overlapping publication preserves GPU pixels; later CPU edits import; a publication after the commit's "
-         "VRAM mark never waits for the accelerator lock and retries a busy re-mark off its thread; another process's "
+         "VRAM mark never waits for the accelerator lock and retries a busy re-mark off its thread; neither does one after a "
+         "mark that stayed refused, with no CPU lock and no copy there; another process's "
          "write is waited for before import");
 } return 0; }
 '''
