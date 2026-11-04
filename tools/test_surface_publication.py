@@ -33,7 +33,9 @@ static unsigned uploads, gpu_seed;
 static unsigned long long g_surfin_skip, g_surfin_copy;
 static uint32_t IOSurfaceGetSeed(IOSurfaceRef s) { return s->seed; }
 static unsigned IOSurfaceGetID(IOSurfaceRef s) { return 1; }
+static unsigned cpuLocks;
 static IOReturn IOSurfaceLock(IOSurfaceRef s, unsigned opts, uint32_t *seed) {
+    cpuLocks++;
     if (!opts) s->seed++;
     if (seed) *seed=s->seed;
     return 0;
@@ -59,6 +61,7 @@ static unsigned nvmtl_vram_tag_bump(IOSurfaceRef s, NSUInteger p, unsigned seed)
 static int dirtyAnswer=1, tryAnswer=-1; static unsigned blockingDirties, tries;
 static int nvmtl_vk_surface_dirty(unsigned s, unsigned p) { blockingDirties++; return dirtyAnswer; }
 static int nvmtl_vk_surface_dirty_try(unsigned s, unsigned p) { tries++; return tryAnswer; }
+#define NVMTL_MARK_OTHER_OWNER (-2)
 static int nvmtl_noseed(void) { return 0; }
 // own-write tracking across planes (nvmtl_plane_seed.h) is off unless NVMTL_PLANE_SEED=1; its surface-property and page-key
 // calls are stubs here, so every arm below runs the default path
@@ -94,6 +97,7 @@ static int nvmtl_vk_image_read(void *q, Image *i, void *base, size_t row) {
 - (void)nvmtlSurfaceIn;
 - (BOOL)nvmtlSurfaceOut;
 - (BOOL)nvmtlSurfaceOutDirtied:(BOOL)dirtied;
+- (BOOL)nvmtlSurfaceOutRefusedAtSeed:(uint32_t)commitSeed;
 @end
 @implementation NVMTLTexture
 - (BOOL)nvmtlSurfaceCopyable { return YES; }
@@ -130,10 +134,16 @@ int main(int argc, char **argv) { @autoreleasepool {
     // releases the pending marks, so it never waits for the accelerator lock: busy, the commit's mark stands and nothing
     // is copied (a copy would block in the read stub and fail); free, the surface is marked again.
     Surface ws={.seed=9}; NVMTLTexture *w=[NVMTLTexture new]; w->_surf=&ws; w->_vramOn=YES; w->_i=(Image){.w=1,.h=1,.bpp=4};
-    blockingDirties=0; tries=0; tryAnswer=-1;
-    assert([w nvmtlSurfaceOutDirtied:YES] && tries==1 && !blockingDirties && w->_surfSynced && w->_surfSeed==9);
+    // Refused for an owner: another accelerator has taken the surface since the commit, so the seed is not this VRAM's and the next
+    // read imports. Refused for anything else: as before.
+    blockingDirties=0; tries=0; tryAnswer=NVMTL_MARK_OTHER_OWNER;
+    assert([w nvmtlSurfaceOutDirtied:YES] && tries==1 && !blockingDirties && !w->_surfSynced && w->_surfSeed==0);
+    assert(dispatch_semaphore_wait(entered,DISPATCH_TIME_NOW));
+    uploads=0; [w nvmtlSurfaceIn]; assert(uploads==1);
+    w->_surfSynced=NO; w->_surfSeed=0; tryAnswer=-1; tries=0;
+    assert([w nvmtlSurfaceOutDirtied:YES] && tries==1 && !blockingDirties && w->_surfSynced && w->_surfSeed==ws.seed);
     tryAnswer=0;
-    assert([w nvmtlSurfaceOutDirtied:YES] && tries==2 && !blockingDirties);
+    assert([w nvmtlSurfaceOutDirtied:YES] && tries==2 && !blockingDirties && w->_surfSynced && w->_surfSeed==ws.seed);
     // the lock was taken: this thread goes on, and the re-mark is retried off it, again only as tries (a mark that
     // waited for the lock could land after a newer CPU write), until one takes; a page-off that slipped in between the
     // commit's marks must not leave its copy current
@@ -146,11 +156,39 @@ int main(int argc, char **argv) { @autoreleasepool {
     [NSThread sleepForTimeInterval:0.02];
     const unsigned after=tries; [NSThread sleepForTimeInterval:0.02];
     assert(after>settledTries && tries==after && !blockingDirties);   // it took, and the retries stopped
+    // the lock was taken, then the retry is refused for an owner: the same thing, found later. The stamp comes off, tag included
+    tryAnswer=1;
+    assert([w nvmtlSurfaceOutDirtied:YES] && w->_surfSynced);
+    tryAnswer=NVMTL_MARK_OTHER_OWNER;
+    for (int i=0; i<400 && w->_surfSynced; i++) [NSThread sleepForTimeInterval:0.002];
+    assert(!w->_surfSynced);
+    uploads=0; [w nvmtlSurfaceIn]; assert(uploads==1);
     tryAnswer=-1; tries=2;
     // any other publication asks with the blocking mark, as before
     dirtyAnswer=0;
     assert([w nvmtlSurfaceOut] && tries==2 && blockingDirties==1);
     dirtyAnswer=1;
+    // the commit's mark stayed refused for an owner: this is the thread that releases the marks every page-off waits for, so no blocking
+    // mark, no CPU lock and no copy here; this frame stays in VRAM and the texture follows the seed
+    Surface tt={.seed=20}; NVMTLTexture *t8=[NVMTLTexture new]; t8->_surf=&tt; t8->_vramOn=YES; t8->_i=(Image){.w=1,.h=1,.bpp=4};
+    blockingDirties=0; tries=0; cpuLocks=0;
+    tryAnswer=0;
+    assert([t8 nvmtlSurfaceOutRefusedAtSeed:20] && tries==1 && t8->_surfSynced && t8->_surfSeed==20);   // the try took it
+    for (int answer=NVMTL_MARK_OTHER_OWNER; answer<=1; answer+=3) {                                      // refused for an owner, the lock taken
+        tryAnswer=answer; t8->_surfSynced=NO; t8->_surfSeed=0; const unsigned before=tries;
+        assert([t8 nvmtlSurfaceOutRefusedAtSeed:20] && tries==before+1 && t8->_surfSynced && t8->_surfSeed==20);
+    }
+    // somebody wrote since the commit: no try and no stamp, and the next read imports what they wrote
+    tryAnswer=0; t8->_surfSynced=NO; t8->_surfSeed=0; const unsigned triesMoved=tries;
+    assert([t8 nvmtlSurfaceOutRefusedAtSeed:19] && tries==triesMoved && !t8->_surfSynced && t8->_surfSeed==0);
+    assert(!blockingDirties && !cpuLocks);
+    assert(dispatch_semaphore_wait(entered,DISPATCH_TIME_NOW));
+    uploads=0; [t8 nvmtlSurfaceIn]; assert(uploads==1); cpuLocks=0;
+    // refused for something else by now: the blocking mark and the copy, as ever
+    const uint32_t seedNow=tt.seed; tryAnswer=-1; dirtyAnswer=1; dispatch_semaphore_signal(release_read);
+    const unsigned triesCopy=tries;
+    assert([t8 nvmtlSurfaceOutRefusedAtSeed:seedNow] && tries==triesCopy+1 && blockingDirties==1 && cpuLocks==1);
+    assert(!dispatch_semaphore_wait(entered,DISPATCH_TIME_NOW));
     // a surface another process is still drawing (PR #398): this process waits for that write before it imports, and
     // remembers the surface as client-written so every later import waits too; its own writes never wait
     Surface cs={.seed=3}; NVMTLTexture *c=[NVMTLTexture new]; c->_surf=&cs; c->_i=(Image){.w=1,.h=1,.bpp=4};
@@ -161,7 +199,8 @@ int main(int argc, char **argv) { @autoreleasepool {
     busyForeign=0; cs.seed++; [c nvmtlSurfaceIn];
     assert(busyWaits==2);
     puts("PASS: overlapping publication preserves GPU pixels; later CPU edits import; a publication after the commit's "
-         "VRAM mark never waits for the accelerator lock and retries a busy re-mark off its thread; another process's "
+         "VRAM mark never waits for the accelerator lock and retries a busy re-mark off its thread; neither does one after a "
+         "mark that stayed refused, with no CPU lock and no copy there; another process's "
          "write is waited for before import");
 } return 0; }
 '''

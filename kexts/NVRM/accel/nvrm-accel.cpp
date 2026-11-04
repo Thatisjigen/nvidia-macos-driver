@@ -1861,7 +1861,9 @@ static bool nvSurfWaitReady(unsigned int id)
     if (waited) {
         uint64_t ns = 0; absolutetime_to_nanoseconds(mach_absolute_time() - start, &ns);
         if ((int)(ns / 1000) > gSurfWaitMaxUs) gSurfWaitMaxUs = (int)(ns / 1000);
-        OSAddAtomic64(1, ready ? &gCntSurfWaits : &gCntSurfTimeouts);
+        const SInt64 before = OSAddAtomic64(1, ready ? &gCntSurfWaits : &gCntSurfTimeouts);
+        if (!ready && (before < 16 || (before & 63) == 0))
+            ALOG("surface %u: no completion mark after %u ms, going on with the GPU perhaps still writing it (%lld so far)", id, kSurfGpuWaitMs, (long long)before + 1);
     }
     return ready;
 }
@@ -1896,6 +1898,15 @@ NVACCEL_CNT(nvaccel_surface_gpu_timeouts, gCntSurfTimeouts, "swaps whose composi
 SYSCTL_INT(_debug, OID_AUTO, nvaccel_surface_gpu_wait_max_us, CTLFLAG_RD | CTLFLAG_LOCKED, &gSurfWaitMaxUs, 0, "longest swap wait for a composite, us");
 static SInt64 gCntIopAsync, gCntIopAsyncRefused, gCntIopAsyncDrop;
 SYSCTL_INT(_debug, OID_AUTO, nvaccel_iop_async, CTLFLAG_RW | CTLFLAG_LOCKED, &gIopAsync, 0, "1 = the swap runs on a thread call and completes through signalTransactionInterrupt (Apple's shape); 0 = the earlier synchronous flip");
+// Three refusals in a row turn the asynchronous swap off, because the synchronous one copies a refused frame. But a display
+// going to sleep or waking refuses every flip for a moment, so one stop was enough to leave the swap synchronous until the next
+// boot: its wait for the composite on the pipe's workloop, and the next transactionEnd behind it holding the accelerator lock.
+// It comes back after debug.nvaccel_iop_async_rearm accepted synchronous flips in a row, 0 = never.
+static bool gIopAsyncAutoOff;
+static SInt32 gIopAsyncGoodRun;
+static int gIopAsyncRearm = 120;
+SYSCTL_INT(_debug, OID_AUTO, nvaccel_iop_async_rearm, CTLFLAG_RW | CTLFLAG_LOCKED, &gIopAsyncRearm, 0, "accepted synchronous flips in a row before an asynchronous swap turned off by refusals comes back, 0 = never");
+static inline bool nvAccelIopAsyncComesBack(bool autoOff, int rearm, SInt32 goodRun) { return autoOff && rearm > 0 && goodRun >= rearm; }
 NVACCEL_CNT(nvaccel_iop_async_flips,   gCntIopAsync,        "swaps completed asynchronously");
 SYSCTL_INT(_debug, OID_AUTO, nvaccel_iop_memcpy, CTLFLAG_RW | CTLFLAG_KERN | CTLFLAG_LOCKED, &gIopMemcpy, 0, "nmx-accel: 1 = frames copied to a CPU scanout with memcpy rows, 0 = volatile word loop");
 SYSCTL_INT(_debug, OID_AUTO, nvaccel_iop_direct, CTLFLAG_RW | CTLFLAG_KERN | CTLFLAG_LOCKED, &gIopDirect, 0, "nmx-accel: 1 = copy engine staging -> CPU scanout, skipping the IOSurface's system pages; 2 = copy engine straight into the scanout's RAM pages when the framebuffer offers them");
@@ -1951,6 +1962,10 @@ static void nvaccelInstallSysctl(void)
     sysctl_register_oid(&sysctl__debug_nvaccel_iop_flip_hit);   sysctl_register_oid(&sysctl__debug_nvaccel_iop_flip_miss);
     sysctl_register_oid(&sysctl__debug_nvaccel_iop_async);      sysctl_register_oid(&sysctl__debug_nvaccel_iop_async_flips);
     { extern struct sysctl_oid sysctl__debug_nvaccel_svdiag; sysctl_register_oid(&sysctl__debug_nvaccel_svdiag); }
+    { extern struct sysctl_oid sysctl__debug_nvaccel_iop_async_rearm; sysctl_register_oid(&sysctl__debug_nvaccel_iop_async_rearm); }
+    { extern struct sysctl_oid sysctl__debug_nvaccel_sv_take, sysctl__debug_nvaccel_sv_taken, sysctl__debug_nvaccel_sv_other_owner;
+      sysctl_register_oid(&sysctl__debug_nvaccel_sv_take); sysctl_register_oid(&sysctl__debug_nvaccel_sv_taken);
+      sysctl_register_oid(&sysctl__debug_nvaccel_sv_other_owner); }
     sysctl_register_oid(&sysctl__debug_nvaccel_iop_memcpy);     sysctl_register_oid(&sysctl__debug_nvaccel_iop_direct);
     sysctl_register_oid(&sysctl__debug_nvaccel_iop_direct_frames); sysctl_register_oid(&sysctl__debug_nvaccel_iop_copy_us);
     sysctl_register_oid(&sysctl__debug_nvaccel_iop_ram_frames);
@@ -2076,6 +2091,8 @@ void *_ZN13IOSurfaceRoot13lookupSurfaceEjP4task(void *root, unsigned int id, tas
 void *_ZN22IOGraphicsAccelerator223deviceCacheForIOSurfaceEP9IOSurfacej(void *accel, void *surface, unsigned int plane);
 void  _ZN16IOAccelVidMemory4wireEv(void *vidmem);
 void  _ZN20IOSurfaceDeviceCache10setCurrentEv(void *cache);
+unsigned int _ZNK9IOSurface13getUnlockSeedEv(void *surface);
+int   _ZN9IOSurface10bind_accelEjj(void *surface, unsigned int accelerator, unsigned int plane);
 #if defined(NM_ERA) && NM_ERA < 1015
 }
 static inline void *_ZNK9IOSurface19getMemoryDescriptorEv(void *surface) { return _ZN9IOSurface19getMemoryDescriptorEv(surface); }
@@ -2160,6 +2177,24 @@ static unsigned gNVSVDirty, gNVSVDirtyRefused, gNVSVPageoff, gNVSVPageoffFail;
 static int gSVDiag;
 SYSCTL_INT(_debug, OID_AUTO, nvaccel_svdiag, CTLFLAG_RW | CTLFLAG_LOCKED, &gSVDiag, 0, "log the next N surface dirty marks and page-offs");
 static bool nvSVDiag() { return gSVDiag > 0 && OSDecrementAtomic(&gSVDiag) > 0; }
+// IOSurface::set_current_device_cache refuses while another accelerator's cache is current, and says nothing: the seed
+// stays and the CPU and that accelerator go on reading their own old pixels, while this GPU reads what it wrote. Apple's
+// drivers avoid it by binding a surface when they encode a use of it (ioAccelResourceGroupAddNewResource). The plugin
+// does not bind when it encodes, so a surface another accelerator wrote last is still that accelerator's at this mark.
+// sysctl debug.nvaccel_sv_take: 1 = report the refusal: WindowServer's commit takes the surface with a CPU lock and marks again,
+// which keeps the VRAM copy and waits in user space, and any other process copies the pixels out under a CPU lock; 2 = bind here, as
+// Apple's do at encode, which waits for the owner's GPU inside this escape, with the NVRM client's gate and power use held; 0 =
+// ignore the refusal, as before.
+static int gSVTake = 1;
+SYSCTL_INT(_debug, OID_AUTO, nvaccel_sv_take, CTLFLAG_RW | CTLFLAG_LOCKED, &gSVTake, 0, "a dirty mark on a surface another accelerator owns: 1 = the refusal goes back to the plugin, 2 = bound here, 0 = ignored");
+static SInt64 gCntSVTaken, gCntSVOtherOwner;
+SYSCTL_QUAD(_debug, OID_AUTO, nvaccel_sv_taken, CTLFLAG_RD | CTLFLAG_LOCKED, (SInt64 *)&gCntSVTaken, "dirty marks that bound the surface away from another accelerator");
+SYSCTL_QUAD(_debug, OID_AUTO, nvaccel_sv_other_owner, CTLFLAG_RD | CTLFLAG_LOCKED, (SInt64 *)&gCntSVOtherOwner, "dirty marks that went back refused because another accelerator owned the surface");
+// set_current_device_cache leaves its answer in the cache, where IOSurfaceDeviceCache::sync reads it: the new unlock seed if
+// it took the mark, that seed minus one if it refused. Reading the owner back would not do: a CPU lock can clear it right
+// after a refusal, and the write would again be lost. An unlock right after a taken mark makes it look refused: the plugin's
+// copy or a second mark puts that right, but not on a re-mark, a try, which only the next draw corrects.
+static inline bool nvAccelSurfOtherOwner(unsigned markedSeed, unsigned unlockSeed) { return markedSeed != unlockSeed; }
 static unsigned nvAccelSurfDirty(void *cache, NVResource *res, unsigned plane)
 {
     volatile unsigned char *r = (volatile unsigned char *)res;
@@ -2168,8 +2203,11 @@ static unsigned nvAccelSurfDirty(void *cache, NVResource *res, unsigned plane)
     volatile unsigned short *valid = *(unsigned short *volatile *)(r + kNvResValid);
     if (type != 0xc0 || (fl & 0x8000) || !valid || plane > 15) return NVRM_SS_NO_CACHE;
     if (!gNVSVPendLock) gNVSVPendLock = IOSimpleLockAlloc();
-    if (!nvSVPend(_ZNK9IOSurface12getSurfaceIDEv(*(void *volatile *)((unsigned char *)cache + 0x10)), 1, res)) return NVRM_SS_NO_CACHE;
+    void *surf = *(void *volatile *)((unsigned char *)cache + 0x10);
+    if (!nvSVPend(_ZNK9IOSurface12getSurfaceIDEv(surf), 1, res)) return NVRM_SS_NO_CACHE;
     _ZN20IOSurfaceDeviceCache10setCurrentEv(cache);
+    if (gSVTake && nvAccelSurfOtherOwner(*(const volatile unsigned *)((unsigned char *)cache + 0x50), _ZNK9IOSurface13getUnlockSeedEv(surf)))
+        return NVRM_SS_OTHER_OWNER;
     valid[6] |= (unsigned short)(1u << plane);
     valid[0] &= (unsigned short)~(1u << plane);
     { NVVidMemory *vm = nvres_vidmem(res); res->fPluginWroteCookie = vm ? vm->fAllocationCookie : 0; }
@@ -2245,6 +2283,25 @@ static IOReturn nvAccelSurfVram(NVAccel *owner, struct NVRMSurfShareEsc *p, task
         const bool sameBacking = nvAccelRestoreParkedForDirty(res, vm, p->plane);
         p->status = (sameBacking && cache && res && vm && vm->fRmHandle)
             ? nvAccelSurfDirty(cache, res, p->plane) : NVRM_SS_NO_CACHE;
+        if (p->status == NVRM_SS_OTHER_OWNER && !tryOnly && gSVTake > 1) {
+            // bind_accel pages the owner off under that owner's accelerator lock and waits for its GPU, so this lock is let
+            // go first: the owner can be a cache of ours, for another plane. A try does not wait for it: the commit's mark stands.
+            const unsigned accelerator = *(const volatile unsigned *)((unsigned char *)cache + 0x48);
+            const unsigned plane = *(const volatile unsigned *)((unsigned char *)cache + 0x54);
+            nvFamUnlock(a);
+            _ZN9IOSurface10bind_accelEjj(surf, accelerator, plane);
+            nvFamLock(a, false);   // it exists: it was just held
+            ctx = *(OSObject *volatile *)((unsigned char *)cache + 0x20);
+            res = OSDynamicCast(NVResource, ctx);
+            vm = res ? nvres_vidmem(res) : nullptr;
+            p->status = (nvAccelRestoreParkedForDirty(res, vm, p->plane) && res && vm && vm->fRmHandle)
+                ? nvAccelSurfDirty(cache, res, p->plane) : NVRM_SS_NO_CACHE;
+            if (p->status == 0) {
+                OSAddAtomic64(1, &gCntSVTaken);
+                if (gCntSVTaken <= 8) ALOG("surfvram dirty: surface %u was another accelerator's, taken (%lld so far)", p->surfaceID, (long long)gCntSVTaken);
+            }
+        }
+        if (p->status == NVRM_SS_OTHER_OWNER) OSAddAtomic64(1, &gCntSVOtherOwner);
         if (p->status == 0) gNVSVDirty++; else gNVSVDirtyRefused++;
         if (nvSVDiag()) ALOG("SVDIAG dirty surface %u plane %u -> %#x (cache %d res %d vm %d)", p->surfaceID, p->plane, p->status,
                              cache ? 1 : 0, res ? 1 : 0, (vm && vm->fRmHandle) ? 1 : 0);
@@ -2359,7 +2416,11 @@ void NVResource::pageoff(IOAccelEvent *ev, bool a1, bool *out, unsigned long lon
             if (!surf || !vm || !vm->fRmHandle || vm->fScanout || !vm->fBytes || !nvAccelRmHandles(fAccel, &h)) { NV_FAM_PAGEOFF(ev, a1, out, a3); return; }
         } else {
             if (gPoUnlocked && a && nvSurfIsPending(sid)) OSAddAtomic64(1, &gCntPoNotOwner);
-            nvSurfWaitReady(sid);
+            if (!nvSurfWaitReady(sid)) {   // this one held the accelerator lock all that time
+                static SInt32 late;
+                const SInt32 n = OSIncrementAtomic(&late);
+                if (n < 16 || (n & 63) == 0) ALOG("surfvram pageoff: surface %u waited out holding the accelerator lock (%d so far)", sid, (int)n + 1);
+            }
         }
     }
     IOMemoryDescriptor *md = (IOMemoryDescriptor *)_ZNK9IOSurface19getMemoryDescriptorEv(surf);
@@ -2565,6 +2626,7 @@ static void nvAccelIopAsyncRun(void *p0, void *)
                                                      (unsigned)rr, e->f.flipResult, head); }
         if (++gIopAsyncRefuseRun >= 3 && gIopAsync) {
             gIopAsync = 0;
+            gIopAsyncAutoOff = true; gIopAsyncGoodRun = 0;
             ALOG("iop: b89k 3 async refusals in a row -- debug.nvaccel_iop_async=0 (synchronous flip, which copies on refusal)");
         }
         ((OSObject *)s)->release();
@@ -2676,9 +2738,14 @@ static bool nvAccelIopFlip(IOService *fb, unsigned head, IOSurface *s, void *pip
     if (nvAccelFlipOutcome(rr) == kNvFlipKept) { OSAddAtomic64(1, &gCntIopLate); return true; }
     if (nvAccelFlipOutcome(rr) == kNvFlipAsleep) return true;   // display asleep: nothing to show, nothing to copy   // the frame on the panel stays
     if (rr != kIOReturnSuccess) {
+        gIopAsyncGoodRun = 0;
         if (gIopFlipLogs < 8) { gIopFlipLogs++; ALOG("iop: flip REFUSED (0x%x, flipResult %d) head %u %llux%llu pitch %llu -- copying",
                                                      (unsigned)rr, f.flipResult, head, W, H, P); }
         return nvAccelIopFlipNo(7);
+    }
+    if (nvAccelIopAsyncComesBack(gIopAsyncAutoOff, gIopAsyncRearm, ++gIopAsyncGoodRun)) {
+        gIopAsyncAutoOff = false; gIopAsyncRefuseRun = 0; gIopAsync = 1;
+        ALOG("iop: %d synchronous flips accepted in a row -- debug.nvaccel_iop_async=1 again", gIopAsyncRearm);
     }
     ((OSObject *)s)->retain();
     if (gIopFlipPrev[head]) ((OSObject *)gIopFlipPrev[head])->release();
