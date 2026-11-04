@@ -118,10 +118,16 @@ int main(int argc, char **argv) { @autoreleasepool {
     // releases the pending marks, so it never waits for the accelerator lock: busy, the commit's mark stands and nothing
     // is copied (a copy would block in the read stub and fail); free, the surface is marked again.
     Surface ws={.seed=9}; NVMTLTexture *w=[NVMTLTexture new]; w->_surf=&ws; w->_vramOn=YES; w->_i=(Image){.w=1,.h=1,.bpp=4};
-    blockingDirties=0; tries=0; tryAnswer=-1;
-    assert([w nvmtlSurfaceOutDirtied:YES] && tries==1 && !blockingDirties && w->_surfSynced && w->_surfSeed==9);
+    // Refused for an owner: another accelerator has taken the surface since the commit, so the seed is not this VRAM's and the next
+    // read imports. Refused for anything else: as before.
+    blockingDirties=0; tries=0; tryAnswer=NVMTL_MARK_OTHER_OWNER;
+    assert([w nvmtlSurfaceOutDirtied:YES] && tries==1 && !blockingDirties && !w->_surfSynced && w->_surfSeed==0);
+    assert(dispatch_semaphore_wait(entered,DISPATCH_TIME_NOW));
+    uploads=0; [w nvmtlSurfaceIn]; assert(uploads==1);
+    w->_surfSynced=NO; w->_surfSeed=0; tryAnswer=-1; tries=0;
+    assert([w nvmtlSurfaceOutDirtied:YES] && tries==1 && !blockingDirties && w->_surfSynced && w->_surfSeed==ws.seed);
     tryAnswer=0;
-    assert([w nvmtlSurfaceOutDirtied:YES] && tries==2 && !blockingDirties);
+    assert([w nvmtlSurfaceOutDirtied:YES] && tries==2 && !blockingDirties && w->_surfSynced && w->_surfSeed==ws.seed);
     // the lock was taken: this thread goes on, and the re-mark is retried off it, again only as tries (a mark that
     // waited for the lock could land after a newer CPU write), until one takes; a page-off that slipped in between the
     // commit's marks must not leave its copy current
@@ -134,6 +140,13 @@ int main(int argc, char **argv) { @autoreleasepool {
     [NSThread sleepForTimeInterval:0.02];
     const unsigned after=tries; [NSThread sleepForTimeInterval:0.02];
     assert(after>settledTries && tries==after && !blockingDirties);   // it took, and the retries stopped
+    // the lock was taken, then the retry is refused for an owner: the same thing, found later. The stamp comes off, tag included
+    tryAnswer=1;
+    assert([w nvmtlSurfaceOutDirtied:YES] && w->_surfSynced);
+    tryAnswer=NVMTL_MARK_OTHER_OWNER;
+    for (int i=0; i<400 && w->_surfSynced; i++) [NSThread sleepForTimeInterval:0.002];
+    assert(!w->_surfSynced);
+    uploads=0; [w nvmtlSurfaceIn]; assert(uploads==1);
     tryAnswer=-1; tries=2;
     // any other publication asks with the blocking mark, as before
     dirtyAnswer=0;
