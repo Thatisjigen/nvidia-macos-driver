@@ -33,18 +33,21 @@ pend = pend[:pend.index('\n}\n')]
 assert pend.index('nvmtl_vk_surface_dirty_commit(') < pend.index('nvmtl_ws_lock()'), 'the commit can wait for the other GPU: never under the marks\' lock'
 settled = events[events.index('static BOOL nvmtl_ws_publish_settled('):]
 settled = settled[:settled.index('\n}\n')]
-assert '[d->texture nvmtlSurfaceOutRefused]' in settled and '[d->texture nvmtlSurfaceOut]' not in settled, \
-    'a publication after a refused mark runs on the thread that releases the marks: no blocking mark there'
+assert settled.index('d->dirtied ?') < settled.index('d->refusedAt ? [d->texture nvmtlSurfaceOutRefusedAtSeed:') < settled.index('[d->texture nvmtlSurfaceOut]'), \
+    'a publication after a mark refused for an owner runs on the thread that releases the marks: no blocking mark there; only private copies and other refusals go out under a lock'
+assert pend.index('marked == NVMTL_MARK_OTHER_OWNER') < pend.index('IOSurfaceGetSeed(t->_surf)') < pend.index('nvmtl_ws_lock()'), \
+    'publication needs the seed right after the mark that stayed refused for an owner'
 start_commit = events.index('- (void)nvmtlSubmitWithEvents')
 commit = events[start_commit:events.index('\n}\n', start_commit)]
 first_lock_end = commit.index('\n    }\n')
 assert first_lock_end < commit.index('nvmtl_ws_mark_pending(self);') < commit.index('@synchronized ([NVMTLCommandBuffer class])', first_lock_end), \
     'the marks, and with them the lock, stay outside the class lock'
-refused = objects[objects.index('- (BOOL)nvmtlSurfaceOutRefused {'):]
+refused = objects[objects.index('- (BOOL)nvmtlSurfaceOutRefusedAtSeed:(uint32_t)commitSeed {'):]
 refused = refused[:refused.index('\n}\n')]
 for waits in ('IOSurfaceLock(', 'nvmtl_vk_surface_dirty(', 'nvmtl_vk_image_read', 'lets_go'):
     assert waits not in refused, 'nothing that can wait on the completion thread, and nothing that takes the surface later: ' + waits
 assert refused.index('_vramOn') < refused.index('nvmtl_vk_surface_dirty_try('), 'a private copy has no mark to try'
+assert refused.index('!= commitSeed') < refused.index('nvmtl_vk_surface_dirty_try('), 'a seed that moved since the commit is somebody else\'s write: no try and no stamp'
 assert re.search(r'copy = marked == -1;', refused), 'only a refusal that has nothing to do with an owner goes to the copy'
 assert 'IOSurfaceBindAccelOnPlane' not in vk, 'the lock runs the bind\'s code with no private call'
 
@@ -64,6 +67,7 @@ typedef int IOReturn; typedef unsigned io_connect_t, io_service_t; typedef void 
 #define kIOReturnBusy 2
 #define kIOReturnNoMemory 3
 #define kIOReturnTimeout 4
+#define kIOReturnAborted 6
 #define kIOSurfaceLockReadOnly 1
 static _Atomic int retains;
 #define CFRetain(x) atomic_fetch_add(&retains, 1)
@@ -164,6 +168,8 @@ int main(void) {
     assert(ms(t0) < 20);                  // nobody waits any more, and nothing more goes in line
     atomic_store(&hungNow, 0);
     for (int i = 0; i < 4; i++) dispatch_semaphore_signal(hung);
+    // what stood in line when the commit gave up never runs: it could hide a frame the owner has begun since
+    drain(); assert(atomic_load(&locks) == 1 && atomic_load(&owner) == INTEL);
     reset(INTEL); assert(commit() == 0 && atomic_load(&owner) == RTX && marksSent == 2);
     puts("PASS: refused at commit, a CPU lock takes the surface from its owner and the mark goes in again; a failed lock or an Intel write in between stay refused; tries and waiting marks take different clients; an owner that hangs costs 50 ms a few times, then nothing, and it comes back");
 #else

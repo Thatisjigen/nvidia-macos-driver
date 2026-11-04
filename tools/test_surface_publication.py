@@ -97,7 +97,7 @@ static int nvmtl_vk_image_read(void *q, Image *i, void *base, size_t row) {
 - (void)nvmtlSurfaceIn;
 - (BOOL)nvmtlSurfaceOut;
 - (BOOL)nvmtlSurfaceOutDirtied:(BOOL)dirtied;
-- (BOOL)nvmtlSurfaceOutRefused;
+- (BOOL)nvmtlSurfaceOutRefusedAtSeed:(uint32_t)commitSeed;
 @end
 @implementation NVMTLTexture
 - (BOOL)nvmtlSurfaceCopyable { return YES; }
@@ -168,27 +168,26 @@ int main(int argc, char **argv) { @autoreleasepool {
     dirtyAnswer=0;
     assert([w nvmtlSurfaceOut] && tries==2 && blockingDirties==1);
     dirtyAnswer=1;
-    // the commit's mark stayed refused: this is the thread that releases the marks every page-off waits for, so no blocking mark, no
-    // CPU lock and no copy here for an owner; this frame stays in VRAM and the texture follows the seed
+    // the commit's mark stayed refused for an owner: this is the thread that releases the marks every page-off waits for, so no blocking
+    // mark, no CPU lock and no copy here; this frame stays in VRAM and the texture follows the seed
     Surface tt={.seed=20}; NVMTLTexture *t8=[NVMTLTexture new]; t8->_surf=&tt; t8->_vramOn=YES; t8->_i=(Image){.w=1,.h=1,.bpp=4};
     blockingDirties=0; tries=0; cpuLocks=0;
     tryAnswer=0;
-    assert([t8 nvmtlSurfaceOutRefused] && tries==1 && t8->_surfSynced && t8->_surfSeed==20);   // the try took it
-    for (int answer=NVMTL_MARK_OTHER_OWNER; answer<=1; answer+=3) {                             // refused for an owner, the lock taken
+    assert([t8 nvmtlSurfaceOutRefusedAtSeed:20] && tries==1 && t8->_surfSynced && t8->_surfSeed==20);   // the try took it
+    for (int answer=NVMTL_MARK_OTHER_OWNER; answer<=1; answer+=3) {                                      // refused for an owner, the lock taken
         tryAnswer=answer; t8->_surfSynced=NO; t8->_surfSeed=0; const unsigned before=tries;
-        assert([t8 nvmtlSurfaceOutRefused] && tries==before+1 && t8->_surfSynced && t8->_surfSeed==20);
+        assert([t8 nvmtlSurfaceOutRefusedAtSeed:20] && tries==before+1 && t8->_surfSynced && t8->_surfSeed==20);
     }
+    // somebody wrote since the commit: no try and no stamp, and the next read imports what they wrote
+    tryAnswer=0; t8->_surfSynced=NO; t8->_surfSeed=0; const unsigned triesMoved=tries;
+    assert([t8 nvmtlSurfaceOutRefusedAtSeed:19] && tries==triesMoved && !t8->_surfSynced && t8->_surfSeed==0);
     assert(!blockingDirties && !cpuLocks);
     assert(dispatch_semaphore_wait(entered,DISPATCH_TIME_NOW));
-    // any other refusal has nothing to do with an owner: the blocking mark and the copy, as ever
-    tryAnswer=-1; dirtyAnswer=1; dispatch_semaphore_signal(release_read);
+    uploads=0; [t8 nvmtlSurfaceIn]; assert(uploads==1); cpuLocks=0;
+    // refused for something else by now: the blocking mark and the copy, as ever
+    const uint32_t seedNow=tt.seed; tryAnswer=-1; dirtyAnswer=1; dispatch_semaphore_signal(release_read);
     const unsigned triesCopy=tries;
-    assert([t8 nvmtlSurfaceOutRefused] && tries==triesCopy+1 && blockingDirties==1 && cpuLocks==1);
-    assert(!dispatch_semaphore_wait(entered,DISPATCH_TIME_NOW));
-    // a private copy has no mark: its pixels go out under a lock, as ever
-    Surface ps={.seed=30}; NVMTLTexture *priv=[NVMTLTexture new]; priv->_surf=&ps; priv->_i=(Image){.w=1,.h=1,.bpp=4};
-    const unsigned triesBefore=tries; cpuLocks=0; dispatch_semaphore_signal(release_read);
-    assert([priv nvmtlSurfaceOutRefused] && tries==triesBefore && cpuLocks==1);
+    assert([t8 nvmtlSurfaceOutRefusedAtSeed:seedNow] && tries==triesCopy+1 && blockingDirties==1 && cpuLocks==1);
     assert(!dispatch_semaphore_wait(entered,DISPATCH_TIME_NOW));
     // a surface another process is still drawing (PR #398): this process waits for that write before it imports, and
     // remembers the surface as client-written so every later import waits too; its own writes never wait

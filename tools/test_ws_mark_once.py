@@ -22,15 +22,26 @@ loop = source[start:end] + '\n    }\n'
 fixture = r'''
 #import <Foundation/Foundation.h>
 #include <stdio.h>
-typedef struct { uint32_t id; } Surf;
+typedef struct { uint32_t id, seed; } Surf;
 static uint32_t IOSurfaceGetID(Surf *s) { return s->id; }
+static uint32_t IOSurfaceGetSeed(Surf *s) { return s->seed; }
 static unsigned calls, errors, checks; static int refuse_id;
 static int nvmtl_vk_surface_dirty(uint32_t sid, uint32_t plane) { calls++; return (int)sid == refuse_id ? -1 : 0; }
-@interface NVMTLTexture : NSObject { @public Surf *_surf; BOOL _vramOn; NSUInteger _plane; } @end
+// the mark at commit: one kernel call here, and the surface's seed moves with it, so a kept seed says which mark it followed;
+// owner_id's surface stays refused for an owner, and owner_seed holds its seed right after each plane's mark
+#define NVMTL_MARK_OTHER_OWNER (-2)
+static int owner_id; static uint32_t owner_seed[2];
+static int nvmtl_vk_surface_dirty_commit(void *surface, uint32_t sid, uint32_t plane) {
+    Surf *s = surface; const int marked = nvmtl_vk_surface_dirty(sid, plane); s->seed++;
+    if ((int)sid != owner_id) return marked;
+    if (plane < 2) owner_seed[plane] = s->seed;
+    return NVMTL_MARK_OTHER_OWNER;
+}
+@interface NVMTLTexture : NSObject { @public Surf *_surf; BOOL _vramOn; NSUInteger _plane; struct { void *img; } _surfaceLinear; } @end
 @implementation NVMTLTexture @end
 @interface NVMTLSubmissionPart : NSObject { @public NSSet *surfaces; } @end
 @implementation NVMTLSubmissionPart @end
-@interface Holds : NSObject { @public BOOL early; NSSet *dirtied; } @end
+@interface Holds : NSObject { @public BOOL early; NSSet *dirtied; NSMapTable *ownerRefused; } @end
 @implementation Holds @end
 @interface CB : NSObject { @public NSMutableArray *_parts; } @end
 @implementation CB @end
@@ -55,10 +66,19 @@ int main(void) { @autoreleasepool {
     check(![h->dirtied containsObject:off], "a texture without shared VRAM is neither marked nor recorded");
     calls = 0; refuse_id = 7; h = [Holds new]; h->early = YES;
     run(cb, h);
-    check(calls == 3 && ![h->dirtied containsObject:v0] && ![h->dirtied containsObject:v0view] && ![h->dirtied containsObject:v1],
+    check(calls == 3 && ![h->dirtied containsObject:v0] && ![h->dirtied containsObject:v0view] && ![h->dirtied containsObject:v1] && !h->ownerRefused,
           "a refused mark is asked once and its textures are not recorded as dirtied (they take the copy-out)");
     check([h->dirtied containsObject:d], "negative control: another surface in the same command buffer is still marked");
-    calls = 0; refuse_id = 0;
+    calls = 0; refuse_id = 0; owner_id = 7; h = [Holds new]; h->early = YES;
+    run(cb, h);
+    check(calls == 3 && ![h->dirtied containsObject:v0] && ![h->dirtied containsObject:v0view] && ![h->dirtied containsObject:v1],
+          "a mark refused for an owner is asked once (each ask can wait for the owner) and its textures are not recorded as dirtied");
+    check([[h->ownerRefused objectForKey:v0] isEqual:@(owner_seed[0])] && [[h->ownerRefused objectForKey:v0view] isEqual:@(owner_seed[0])] &&
+          [[h->ownerRefused objectForKey:v1] isEqual:@(owner_seed[1])],
+          "every texture of a plane refused for an owner keeps the seed read right after that plane's one mark");
+    check([h->dirtied containsObject:d] && h->ownerRefused.count == 3,
+          "negative control: another surface in the same command buffer is still marked, and not recorded as refused");
+    calls = 0; refuse_id = 0; owner_id = 0;
     CB *two = [CB new]; two->_parts = [NSMutableArray arrayWithObject:cb->_parts[0]];
     run(two, [Holds new]); run(two, [Holds new]);
     check(calls == 0, "without the early ordering nothing is marked at commit");

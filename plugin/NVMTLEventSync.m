@@ -117,12 +117,13 @@ static BOOL nvmtl_ws_surface_wait(void) {
 }
 // What one WindowServer command buffer holds: the surfaces it marked pending in the kernel, and the textures whose shared
 // VRAM its commit marked newest. early is fixed at commit (nvmtl_ws_surface_wait): the marks are released part by part.
-@interface NVMTLSurfaceHolds : NSObject { @public NSMutableSet *ids; NSSet *dirtied; BOOL early; } @end
+// ownerRefused: the textures whose mark at commit stayed refused for an owner, each with the surface's seed right after it.
+@interface NVMTLSurfaceHolds : NSObject { @public NSMutableSet *ids; NSSet *dirtied; NSMapTable *ownerRefused; BOOL early; } @end
 @implementation NVMTLSurfaceHolds @end
 // A texture whose part has landed while its surface is still held, published by the holder that releases it last.
-// dirtied: the commit marked its VRAM newest, so publication is bookkeeping only (nvmtlSurfaceOutDirtied:). Not dirtied: a private
-// copy, or a mark that stayed refused (nvmtlSurfaceOutRefused).
-@interface NVMTLDeferredPublication : NSObject { @public NVMTLTexture *texture; BOOL dirtied; __weak NVMTLCommandBuffer *owner; } @end
+// dirtied: the commit marked its VRAM newest, so publication is bookkeeping only (nvmtlSurfaceOutDirtied:). refusedAt: its mark stayed
+// refused for an owner, at this seed (nvmtlSurfaceOutRefusedAtSeed:). Neither: a private copy, or another refusal, which go out under a lock.
+@interface NVMTLDeferredPublication : NSObject { @public NVMTLTexture *texture; BOOL dirtied; NSNumber *refusedAt; __weak NVMTLCommandBuffer *owner; } @end
 @implementation NVMTLDeferredPublication @end
 // The kernel keeps one pending bit per surface, with no owner. WindowServer commits overlapping command buffers that
 // write the same surface, so the holders are counted here and the kernel mark is released only when the last of them has
@@ -140,7 +141,7 @@ static NSObject *nvmtl_ws_lock(void) {
     dispatch_once(&once, ^{ lock = [NSObject new]; });
     return lock;
 }
-static void nvmtl_ws_defer(NVMTLCommandBuffer *owner, NVMTLTexture *t, BOOL dirtied, uint32_t sid) {
+static void nvmtl_ws_defer(NVMTLCommandBuffer *owner, NVMTLTexture *t, BOOL dirtied, NSNumber *refusedAt, uint32_t sid) {
     @synchronized (nvmtl_ws_lock()) {
         if (!nvmtl_ws_deferred) nvmtl_ws_deferred = [NSMutableDictionary new];
         NSMutableArray *waiting = nvmtl_ws_deferred[@(sid)];
@@ -149,7 +150,7 @@ static void nvmtl_ws_defer(NVMTLCommandBuffer *owner, NVMTLTexture *t, BOOL dirt
         // copy written between the two would be copied out after it and leave the older pixels current
         for (NSUInteger i = 0; i < waiting.count; i++) if (((NVMTLDeferredPublication *)waiting[i])->texture == t) { [waiting removeObjectAtIndex:i]; break; }
         NVMTLDeferredPublication *d = [NVMTLDeferredPublication new];
-        d->texture = t; d->dirtied = dirtied; d->owner = owner;
+        d->texture = t; d->dirtied = dirtied; d->refusedAt = refusedAt; d->owner = owner;
         [waiting addObject:d];
     }
 }
@@ -171,7 +172,8 @@ static void nvmtl_ws_release(NVMTLSurfaceHolds *holds, uint32_t sid, NSMutableAr
 static BOOL nvmtl_ws_publish_settled(NSArray *settled, NVMTLCommandBuffer *cb) {
     BOOL ok = YES;
     for (NVMTLDeferredPublication *d in settled) {
-        if (d->dirtied ? [d->texture nvmtlSurfaceOutDirtied:YES] : [d->texture nvmtlSurfaceOutRefused]) continue;
+        if (d->dirtied ? [d->texture nvmtlSurfaceOutDirtied:YES]
+                       : d->refusedAt ? [d->texture nvmtlSurfaceOutRefusedAtSeed:d->refusedAt.unsignedIntValue] : [d->texture nvmtlSurfaceOut]) continue;
         if (cb && d->owner == cb) ok = NO;
         else nvlog("WindowServer surface %u: publication after its last write refused", (unsigned)IOSurfaceGetID(d->texture->_surf));
     }
@@ -212,16 +214,30 @@ static void nvmtl_ws_mark_pending(NVMTLCommandBuffer *cb) {
         // that several textures (views, planes' wrappers) share, was marked once for each of them, back to back with no
         // GPU or CPU work between: each mark is an ioctl that takes the accelerator lock, and WindowServer pays them on
         // every composite (#566). The first mark's answer stands for the rest of this loop.
+        // That includes a mark that stayed refused for an owner: it has already asked the owner to let go, which can wait
+        // on this thread (nvmtl_vk_surface_dirty_commit), so the plane is not asked again, and every texture over the
+        // plane goes to publication with the seed read right after that one mark.
         NSMutableSet *dirtied = [NSMutableSet new];
-        NSMutableDictionary<NSNumber *, NSNumber *> *marked = [NSMutableDictionary new];
+        NSMutableDictionary<NSNumber *, NSNumber *> *answers = [NSMutableDictionary new], *refusedAt = nil;
         for (NVMTLSubmissionPart *part in cb->_parts) {
             if (![part isKindOfClass:[NVMTLSubmissionPart class]]) continue;
             for (NVMTLTexture *t in part->surfaces) {
                 if (!t->_surf || !t->_vramOn) continue;
                 const uint32_t sid = (uint32_t)IOSurfaceGetID(t->_surf), plane = (uint32_t)t->_plane;
-                NSNumber *key = @(((uint64_t)sid << 8) | (plane & 0xffu)), *done = marked[key];
-                if (!done) { done = @(nvmtl_vk_surface_dirty_commit((void *)t->_surf, sid, plane)); marked[key] = done; }
+                NSNumber *key = @(((uint64_t)sid << 8) | (plane & 0xffu)), *done = answers[key];
+                if (!done) {
+                    const int marked = nvmtl_vk_surface_dirty_commit((void *)t->_surf, sid, plane);
+                    done = @(marked); answers[key] = done;
+                    if (marked == NVMTL_MARK_OTHER_OWNER) {
+                        if (!refusedAt) refusedAt = [NSMutableDictionary new];
+                        refusedAt[key] = @(IOSurfaceGetSeed(t->_surf));
+                    }
+                }
                 if (!done.intValue) [dirtied addObject:t];
+                else if (done.intValue == NVMTL_MARK_OTHER_OWNER) {
+                    if (!holds->ownerRefused) holds->ownerRefused = [NSMapTable strongToStrongObjectsMapTable];
+                    [holds->ownerRefused setObject:refusedAt[key] forKey:t];
+                }
             }
         }
         holds->dirtied = dirtied;
@@ -248,7 +264,7 @@ static NSArray *nvmtl_ws_part_landed(NVMTLCommandBuffer *cb, NSUInteger index, N
         if (!t->_surf) { [publish addObject:t]; continue; }
         const uint32_t sid = (uint32_t)IOSurfaceGetID(t->_surf);
         // deferred before the release below, so the release that turns out to be the last one publishes it
-        nvmtl_ws_defer(cb, t, [holds->dirtied containsObject:t], sid);
+        nvmtl_ws_defer(cb, t, [holds->dirtied containsObject:t], [holds->ownerRefused objectForKey:t], sid);
         BOOL later = NO;
         for (NSUInteger i = index + 1; i < cb->_parts.count && !later; i++) {
             NVMTLSubmissionPart *next = cb->_parts[i];

@@ -56,7 +56,10 @@ static int nvmtl_vk_copy_buffer(void *q, Buffer *from, size_t off,
 // in events as "m<surface>:<pending>", and every VRAM mark as "d<surface>" and counted in dirtyCalls.
 static NSMutableArray *events; static unsigned dirtyCalls; static BOOL wsKernelWaits;
 static int nvmtl_vk_surface_dirty(uint32_t s,uint32_t p){(void)p;dirtyCalls++;if(events)[events addObject:[NSString stringWithFormat:@"d%u",s]];return 0;}
-static int nvmtl_vk_surface_dirty_commit(void *surface,uint32_t s,uint32_t p){(void)surface;return nvmtl_vk_surface_dirty(s,p);}
+// the mark at commit: 0 taken, what an arm says otherwise; the mark that stays refused for an owner goes one way at publication, any other refused one another
+#define NVMTL_MARK_OTHER_OWNER (-2)
+static int commitAnswer;
+static int nvmtl_vk_surface_dirty_commit(void *surface,uint32_t s,uint32_t p){(void)surface;(void)nvmtl_vk_surface_dirty(s,p);return commitAnswer;}
 static BOOL nvmtl_ws_kernel_waits(void){return wsKernelWaits;}
 static uint32_t nvmtl_vk_surface_gpu_mark(uint32_t sid,int pending){if(events)[events addObject:[NSString stringWithFormat:@"m%u:%d",sid,pending]];return 0;}
 static int nvmtl_vk_accel_surface_wait(void){return getenv("KERNEL_HALF")&&!strcmp(getenv("KERNEL_HALF"),"1");}
@@ -132,13 +135,13 @@ typedef struct { int unused; } nvmtl_inflight;
 @interface NVMTLTexture (Publication)
 - (BOOL)nvmtlSurfaceOut;
 - (BOOL)nvmtlSurfaceOutDirtied:(BOOL)dirtied;
-- (BOOL)nvmtlSurfaceOutRefused;
+- (BOOL)nvmtlSurfaceOutRefusedAtSeed:(uint32_t)seed;
 @end
 // every publication is logged in events as "o<tag>:<dirtied>" (dirtied: the commit's VRAM mark stands, nothing is asked
 // of the kernel again)
 @implementation NVMTLTexture (Publication)
 - (BOOL)nvmtlSurfaceOut { return [self nvmtlSurfaceOutDirtied:NO]; }
-- (BOOL)nvmtlSurfaceOutRefused { if (events) [events addObject:[NSString stringWithFormat:@"r%d",_tag]]; return [self nvmtlSurfaceOutDirtied:NO]; }
+- (BOOL)nvmtlSurfaceOutRefusedAtSeed:(uint32_t)seed { if (events) [events addObject:[NSString stringWithFormat:@"r%d:%u",_tag,seed]]; return YES; }
 - (BOOL)nvmtlSurfaceOutDirtied:(BOOL)dirtied { if (events) [events addObject:[NSString stringWithFormat:@"o%d:%d",_tag,(int)dirtied]]; return YES; }
 @end
 @interface NVMTLCommandBuffer : NSObject { @public
@@ -339,7 +342,20 @@ int main(void) { @autoreleasepool {
     assert([cb nvmtlAdvancePart] && cb->_executionDone);
     if (half) assert(at(mark(shared,0)) < at(@"o7:0") && at(mark(shared,0)) < at(@"o8:1"));
     else assert(at(mark(shared,0)) > at(@"o8:0"));
-    assert(seen(@"r7")==half && !seen(@"r8"));   // with the early ordering what was not marked at commit goes this way
+    // a mark refused at commit: for an owner its publication has the seed right after the mark and no blocking path; any other
+    // refused one goes out under a lock, whatever the accelerator lock looks like by then
+    if (half) {
+        [events removeAllObjects]; commitAnswer=NVMTL_MARK_OTHER_OWNER;
+        NVMTLTexture *owned=tex(shared,11,YES); const uint32_t atCommit=IOSurfaceGetSeed(shared);
+        cb=commitParts(@[@[owned]]); commitAnswer=0;
+        assert([cb nvmtlAdvancePart] && cb->_executionDone);
+        assert(seen([NSString stringWithFormat:@"r11:%u",atCommit]) && !seen(@"o11:0") && !seen(@"o11:1"));
+        [events removeAllObjects]; commitAnswer=-1;
+        NVMTLTexture *other=tex(shared,12,YES);
+        cb=commitParts(@[@[other]]); commitAnswer=0;
+        assert([cb nvmtlAdvancePart] && cb->_executionDone && seen(@"o12:0") && !seen(@"o12:1"));
+        [events removeAllObjects];
+    }
     // 5. Shared, private, shared again on one surface: the shared texture keeps only its latest place, so the private
     // copy-out does not land after the final shared pixels.
     [events removeAllObjects];

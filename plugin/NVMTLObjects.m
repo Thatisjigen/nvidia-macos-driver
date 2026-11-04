@@ -1731,19 +1731,21 @@ static void nvmtl_surface_remark_later(NVMTLTexture *r, uint32_t seed) {
     return YES;
     }
 }
-// The commit's mark stayed refused (nvmtl_vk_surface_dirty_commit): the other GPU took the surface back at once, or does not answer. This
-// is WindowServer's one completion thread, where nothing may wait. A CPU lock here would: for the surface's owner; and with no owner
-// left a write lock waits for this accelerator's lock too (synchronize_device_caches, then accelRelease on every cache), which a page-off
-// can hold until this thread has released the mark it waits for. So this frame stays in VRAM, where this GPU finds it, and the CPU and the
-// other GPU go on reading what they had, until either GPU draws the surface again. The owner is not asked to let go later: by then it
-// may be drawing its next frame, whose mark would be refused in turn. Any other refusal has nothing to do with an owner: the pixels
-// go out under a lock, as they always did. So does a private copy, which has no mark.
-- (BOOL)nvmtlSurfaceOutRefused {
+// The commit's mark stayed refused for an owner (nvmtl_vk_surface_dirty_commit): the other GPU took the surface back at once, or does
+// not answer. This is WindowServer's one completion thread, where nothing may wait. A CPU lock here would: for the surface's owner; and
+// with no owner left a write lock waits for this accelerator's lock too (synchronize_device_caches, then accelRelease on every cache),
+// which a page-off can hold until this thread has released the mark it waits for. So this frame stays in VRAM, where this GPU finds it,
+// and the CPU and the other GPU go on reading what they had, until either GPU draws the surface again. The owner is not asked to let go
+// later: by then it may be drawing its next frame, whose mark would be refused in turn. If the seed has moved since the commit, somebody
+// wrote after this frame began: the texture does not take that seed, and the next read here imports what they wrote. A refusal that
+// has nothing to do with an owner this time goes out under a lock, like one at commit.
+- (BOOL)nvmtlSurfaceOutRefusedAtSeed:(uint32_t)commitSeed {
     NVMTLTexture *r = _parent ? _parent : self;
     if (!r->_surf || !r->_vramOn) return [r nvmtlSurfaceOut];
     BOOL copy;
     @synchronized (nvmtl_surface_sync(r)) {
         if (![r nvmtlSurfaceCopyable]) return NO;
+        if (IOSurfaceGetSeed(r->_surf) != commitSeed) return YES;
         const int marked = nvmtl_vk_surface_dirty_try((uint32_t)IOSurfaceGetID(r->_surf), (uint32_t)r->_plane);
         copy = marked == -1;
         if (!copy) {
