@@ -29,6 +29,7 @@ struct __IOSurface {unsigned id,seed;};
 // Apple's driver: one seed step per GPU write); dirtyBumpsSeed models that, dirtyCalls counts the marks
 static int dirtyBumpsSeed, dirtyCalls; static struct __IOSurface *dirtySurface;
 static int nvmtl_vk_surface_dirty(uint32_t s,uint32_t p){(void)p;dirtyCalls++;if(dirtyBumpsSeed&&dirtySurface&&dirtySurface->id==s)dirtySurface->seed++;return 0;}
+static int nvmtl_vk_surface_dirty_commit(void *surface,uint32_t s,uint32_t p){(void)surface;return nvmtl_vk_surface_dirty(s,p);}
 static void nvtrace(const char *f,...){(void)f;}
 // cross-process busy marks (PR #398) are off in WindowServer, which this test runs as; the consumer side is covered
 // by test_surface_publication.py
@@ -41,6 +42,7 @@ static unsigned IOSurfaceGetSeed(IOSurfaceRef s){return s->seed;}
 @implementation NVMTLTexture
 - (BOOL)nvmtlSurfaceOut{return YES;}
 - (BOOL)nvmtlSurfaceOutDirtied:(BOOL)dirtied{(void)dirtied;return YES;}
+- (BOOL)nvmtlSurfaceOutRefused{return YES;}
 @end
 @interface NVMTLCommandBuffer:NSObject{@public id _queue;NSArray *_parts;NSDictionary *_busyMarks;}@end
 @implementation NVMTLCommandBuffer @end
@@ -139,7 +141,7 @@ assert commit.index('_commitMarking = YES')<first_lock_end and second_lock<commi
 assert commit.count('nvmtl_vk_surface_dirty')==0
 pend=source[source.index('static void nvmtl_ws_mark_pending('):]
 pend=pend[:pend.index('\n}\n')]
-assert pend.index('nvmtl_vk_surface_dirty(')<pend.index('nvmtl_ws_mark(n.unsignedIntValue, YES)'), 'VRAM marks before pending marks'
+assert pend.index('nvmtl_vk_surface_dirty_commit(')<pend.index('nvmtl_ws_mark(n.unsignedIntValue, YES)'), 'VRAM marks before pending marks'
 print('PASS: production commit order: kernel marks outside the class lock, VRAM marks before pending marks, records after both')
 with tempfile.TemporaryDirectory() as d:
  p=pathlib.Path(d);(p/'test.m').write_text(fixture+helpers+checks)

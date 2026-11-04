@@ -118,7 +118,8 @@ static BOOL nvmtl_ws_surface_wait(void) {
 @interface NVMTLSurfaceHolds : NSObject { @public NSMutableSet *ids; NSSet *dirtied; BOOL early; } @end
 @implementation NVMTLSurfaceHolds @end
 // A texture whose part has landed while its surface is still held, published by the holder that releases it last.
-// dirtied: the commit marked its VRAM newest, so publication is bookkeeping only (nvmtlSurfaceOutDirtied:).
+// dirtied: the commit marked its VRAM newest, so publication is bookkeeping only (nvmtlSurfaceOutDirtied:). Not dirtied: a private
+// copy, or a mark that stayed refused (nvmtlSurfaceOutRefused).
 @interface NVMTLDeferredPublication : NSObject { @public NVMTLTexture *texture; BOOL dirtied; __weak NVMTLCommandBuffer *owner; } @end
 @implementation NVMTLDeferredPublication @end
 // The kernel keeps one pending bit per surface, with no owner. WindowServer commits overlapping command buffers that
@@ -168,7 +169,7 @@ static void nvmtl_ws_release(NVMTLSurfaceHolds *holds, uint32_t sid, NSMutableAr
 static BOOL nvmtl_ws_publish_settled(NSArray *settled, NVMTLCommandBuffer *cb) {
     BOOL ok = YES;
     for (NVMTLDeferredPublication *d in settled) {
-        if (d->dirtied ? [d->texture nvmtlSurfaceOutDirtied:YES] : [d->texture nvmtlSurfaceOut]) continue;
+        if (d->dirtied ? [d->texture nvmtlSurfaceOutDirtied:YES] : [d->texture nvmtlSurfaceOutRefused]) continue;
         if (cb && d->owner == cb) ok = NO;
         else nvlog("WindowServer surface %u: publication after its last write refused", (unsigned)IOSurfaceGetID(d->texture->_surf));
     }
@@ -209,7 +210,7 @@ static void nvmtl_ws_mark_pending(NVMTLCommandBuffer *cb) {
         for (NVMTLSubmissionPart *part in cb->_parts) {
             if (![part isKindOfClass:[NVMTLSubmissionPart class]]) continue;
             for (NVMTLTexture *t in part->surfaces)
-                if (t->_surf && t->_vramOn && !nvmtl_vk_surface_dirty((uint32_t)IOSurfaceGetID(t->_surf), (uint32_t)t->_plane)) [dirtied addObject:t];
+                if (t->_surf && t->_vramOn && !nvmtl_vk_surface_dirty_commit((void *)t->_surf, (uint32_t)IOSurfaceGetID(t->_surf), (uint32_t)t->_plane)) [dirtied addObject:t];
         }
         holds->dirtied = dirtied;
     }
