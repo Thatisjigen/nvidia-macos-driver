@@ -2701,8 +2701,14 @@ static void nvmtl_owner_job_put(struct nvmtl_owner_job *job)
 static void nvmtl_owner_job_run(void *context)
 {
     struct nvmtl_owner_job *job = context;
-    const IOReturn result = IOSurfaceLock((IOSurfaceRef)job->surface, kIOSurfaceLockReadOnly, NULL);
-    if (result == kIOReturnSuccess) IOSurfaceUnlock((IOSurfaceRef)job->surface, kIOSurfaceLockReadOnly, NULL);
+    // The commit gave up on this one while it stood in line. Taking the surface now could hide a frame the owner has begun since, or page
+    // off this GPU's own copy under its accelerator lock (nvmtl_vk_surface_dirty_commit).
+    pthread_mutex_lock(&job->lock);
+    const int abandoned = job->refs == 1;
+    pthread_mutex_unlock(&job->lock);
+    IOReturn result = kIOReturnAborted;
+    if (!abandoned && (result = IOSurfaceLock((IOSurfaceRef)job->surface, kIOSurfaceLockReadOnly, NULL)) == kIOReturnSuccess)
+        IOSurfaceUnlock((IOSurfaceRef)job->surface, kIOSurfaceLockReadOnly, NULL);
     CFRelease(job->surface);
     atomic_fetch_sub(&g_owner_jobs, 1);
     pthread_mutex_lock(&job->lock);
@@ -2740,7 +2746,7 @@ static IOReturn nvmtl_owner_lets_go(void *surface)
 // accelerator id and no private call, and the next mark takes the surface. Only here, when this GPU is about to write: later the owner
 // may be drawing its next frame, and taking the surface then would hide that frame. This thread holds no lock, nothing waits for it, and
 // its wait is bounded above. A lock past the limit has usually taken the surface from its owner already, and the mark goes in; one still
-// in line leaves the mark refused, and that goes to publication (nvmtlSurfaceOutRefused).
+// in line does not run at all and leaves the mark refused, and that goes to publication (nvmtlSurfaceOutRefusedAtSeed:).
 int nvmtl_vk_surface_dirty_commit(void *surface, uint32_t surfaceID, uint32_t plane)
 {
     int marked = nvmtl_vk_surface_mark_newest(surfaceID, plane, 0);
