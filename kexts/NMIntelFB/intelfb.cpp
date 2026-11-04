@@ -325,7 +325,7 @@ public:
                  rd(0xC8250), rd(0xC8254), rd(0xC8258), rd(0xC8350), rd(0xC8354), rd(0xC8358),
                  (unsigned long long)*((volatile uint64_t *)(fRegs + 0x800000) + (fSurf >> 12)));
     }
-    // the Type-C ports, power wells, PLLs and DBUF, as the firmware left them. Reads only, no
+    // the Type-C ports, power wells, PLLs and DBUF. Reads only, no
     // MMIO write; logged once at start and read on demand through sysctl debug.nmintelfb_tcdiag. Offsets: Linux 7.3 i915
     // (MIT) for display 13 (ADL-P/RPL-P): TC1-TC4 = ports D-G, modular FIA (FIA1 holds TC1-2, FIA2 TC3-4). A port in
     // TC-cold reads 0xffffffff in TCSS/FIA.
@@ -1103,7 +1103,7 @@ void NMIntelFB::usbcAdopt(unsigned i)
     memcpy(gIfbUsbcK5, k5, sizeof k5);
 }
 
-// the index of CEA 1080p60 at HBR, the mode the first versions lit, added to the list when the EDID lacks it
+// the index of CEA 1080p60 at HBR, the mode the first bring-up lit, added to the list when the EDID lacks it
 unsigned NMIntelFB::usbcCea60()
 {
     unsigned k = 0;
@@ -1231,7 +1231,7 @@ bool NMIntelFB::usbcStart(IOService *provider)
     if (!fSurfMap) return decline("the screen would not map write-combined");
     ifb_trail("usbc-mem");
     // the PHY connected and kept (tc1Set 3) for the sink's EDID and link rates, then the modes; without an
-    // EDID, or with nullmoth-intelfb-usbc-edid=0, CEA 1080p60 alone, as before
+    // EDID, or with nullmoth-intelfb-usbc-edid=0, CEA 1080p60 alone
     uint32_t maxClock = panel->fPclk ? (uint32_t)(panel->fPclk / 1000) : kTc1Cea1080p60.clock;
     uint8_t maxBw = 0;
     if (ifb_knob("nullmoth-intelfb-usbc-edid", 1)) {
@@ -1263,7 +1263,7 @@ bool NMIntelFB::usbcStart(IOService *provider)
                 fModes[i].clock, fModes[i].rate == 540000 ? "HBR2" : "HBR");
         IFBLOG("usbc: %s", gIfbUsbcModes);
     }
-    // the boot lights CEA 1080p60 at HBR, the mode the first versions lit (or the only mode, if the list lacks it):
+    // the boot lights CEA 1080p60 at HBR, the mode the first bring-up lit (or the only mode, if the list lacks it):
     // the faster modes, HBR2 among them, are first tried by macOS through setDisplayMode, which falls back when one fails
     IOLockLock(gTc1Lock);
     const unsigned boot = usbcCea60() < fNModes ? usbcCea60() : 0;
