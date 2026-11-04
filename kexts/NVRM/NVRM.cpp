@@ -43,6 +43,7 @@ static bool nvrm_kernel_supported(void) { return version_major == 24 || version_
 #include "nvrm_gpuva_abi.h"
 #define NVRM_SS_KERNEL_ABI 1
 #include "nvrm_surfshare_abi.h"
+#include "nvrm_smc_abi.h"
 extern "C" int nvrm_surfshare_rm(struct NVRMSurfShareRm *);
 extern "C" int nvrm_surfshare_pageoff(struct NVRMSurfPageoff *, void *nv);
 extern "C" task_t current_task(void);
@@ -2622,8 +2623,18 @@ public:
 };
 OSDefineMetaClassAndStructors(IOAccelNVRMBridge, NVRMUserClient)
 
+extern "C" void rm_nvgfx_smc_api(struct NVRMSmcApi *api);
+
 IOReturn NVRM::callPlatformFunction(const OSSymbol *fn, bool wait, void *p1, void *p2, void *p3, void *p4)
 {
+    if (fn && fn->isEqualTo(NVRM_SMC_API_FN)) {
+        NVRMSmcApi *api = (NVRMSmcApi *)p1;
+        if (!api || api->version != NVRM_SMC_API_VERSION) return kIOReturnBadArgument;
+        rm_nvgfx_smc_api(api);
+        api->pmEnter = (void *)nv_xnu_pm_enter;
+        api->pmExit = (void *)nv_xnu_pm_exit;
+        return kIOReturnSuccess;
+    }
     if (fn && fn->isEqualTo(NVRM_UTILIZATION_FN)) {
         NVRMUtilization *sample = (NVRMUtilization *)p1;
         if (!sample || sample->version != NVRM_UTILIZATION_ABI_VERSION) return kIOReturnBadArgument;

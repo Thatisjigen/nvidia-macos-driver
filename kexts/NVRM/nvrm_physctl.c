@@ -14,6 +14,8 @@
 #include <core/locks.h>
 #include "rmapi/rmapi.h"
 #include "nvrm_physctl_abi.h"
+#include "gpu_mgr/gpu_mgr.h"
+#include "nvrm_smc_abi.h"
 
 NV_STATUS rm_nvgfx_phys_control(nv_state_t *nv, NvU32 mode, NvU32 hClient, NvU32 hObject, NvU32 cmd, void *pParams,
                                 NvU32 paramsSize);
@@ -55,4 +57,26 @@ NV_STATUS rm_nvgfx_phys_control(nv_state_t *nv, NvU32 mode, NvU32 hClient, NvU32
     threadStateFree(&threadState, THREAD_STATE_FLAGS_NONE);
     NV_EXIT_RM_RUNTIME(sp, fp);
     return st;
+}
+
+void rm_nvgfx_smc_api(struct NVRMSmcApi *api);
+
+/* What this build's RM looks like to SMCNvidiaGPU, from the compiler. NVRM.cpp adds the sleep gate, which is its own. */
+void rm_nvgfx_smc_api(struct NVRMSmcApi *api)
+{
+    api->size = sizeof *api;
+    api->gpumgrGetGpu = (void *)gpumgrGetGpu;
+    api->createRusd = (void *)gpuCreateRusdMemory_IMPL;
+    api->linkRusd = (void *)gpuRusdInitPhysical_KERNEL;
+    api->lock = (void *)rmapiLockAcquire;
+    api->unlock = (void *)rmapiLockRelease;
+    api->gpuLock = (void *)rmGpuLocksAcquire;
+    api->gpuUnlock = (void *)rmGpuLocksRelease;
+    api->hInternalClient = __builtin_offsetof(struct OBJGPU, hInternalClient);
+    api->hInternalSubdevice = __builtin_offsetof(struct OBJGPU, hInternalSubdevice);
+    api->physicalRmApi = __builtin_offsetof(struct OBJGPU, physicalRmApi);
+    api->rmapiControl = __builtin_offsetof(struct OBJGPU, physicalRmApi) + __builtin_offsetof(RM_API, Control);
+    api->usdMemDesc = __builtin_offsetof(struct OBJGPU, userSharedData) + __builtin_offsetof(GpuSharedDataMap, pMemDesc);
+    api->usdMapBuffer = __builtin_offsetof(struct OBJGPU, userSharedData) + __builtin_offsetof(GpuSharedDataMap, pMapBuffer);
+    api->usdData = __builtin_offsetof(struct OBJGPU, userSharedData) + __builtin_offsetof(GpuSharedDataMap, data);
 }
