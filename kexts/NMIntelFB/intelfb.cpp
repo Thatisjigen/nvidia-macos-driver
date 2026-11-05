@@ -1445,11 +1445,16 @@ void NMIntelFB::kapiInit()
     IOService *nub = m ? IOService::waitForMatchingService(m, 20ull * NSEC_PER_SEC) : nullptr;
     OSSafeReleaseNULL(m);
     if (!nub || !fVramLock) { ifb_trail("kapi-none"); IFBLOG("kapi: no NVRMDisplay nub - NVAccel gets no VRAM from this panel"); OSSafeReleaseNULL(nub); return; }
-    OSNumber *k = OSDynamicCast(OSNumber, nub->getProperty("nvkms-kapi"));
     OSNumber *g = OSDynamicCast(OSNumber, nub->getProperty("gpu-id"));
-    OSNumber *pv = OSDynamicCast(OSNumber, nub->getProperty("phys-for-va"));
-    fKms = k ? (struct NvKmsKapiFunctionsTable *)(uintptr_t)k->unsigned64BitValue() : nullptr;
-    fPhysForVa = pv ? (NvU64 (*)(const void *))(uintptr_t)pv->unsigned64BitValue() : nullptr;
+    // Kernel pointers are no longer IORegistry properties: NVRM hands them over through a kernel-only call.
+    struct NVRMDisplayPointers displayPtrs = {};
+    displayPtrs.version = NVRM_DISPLAY_PTRS_ABI_VERSION;
+    if (const OSSymbol *displayPtrsFn = OSSymbol::withCString(NVRM_DISPLAY_PTRS_FN)) {
+        nub->callPlatformFunction(displayPtrsFn, false, &displayPtrs, NULL, NULL, NULL);
+        displayPtrsFn->release();
+    }
+    fKms = (struct NvKmsKapiFunctionsTable *)displayPtrs.kapi;
+    fPhysForVa = (NvU64 (*)(const void *))displayPtrs.physForVa;
     uint64_t bar = 0;
     IOService *rm = nub->getProvider();
     // intelfb-0012: the first range of at least 256 MB, as NVRMFB's surveyBar1 finds BAR1 (NVRM replaces the device
@@ -1766,7 +1771,7 @@ static void ifb_usbc_publish(IOService *nub0, IOService *nvrm)
     IOService *nub = OSDynamicCast(IOService, OSMetaClass::allocClassWithName("NVRMDisplay"));
     bool ok = nub && nub->init();
     if (ok) {
-        static const char *const kCopy[] = {"nvkms-kapi", "gpu-id", "phys-for-va"};
+        static const char *const kCopy[] = {"gpu-id"};
         for (const char *k : kCopy) if (OSObject *v = nub0->getProperty(k)) nub->setProperty(k, v);
         nub->setProperty("fb-index", 5ull, 32);
         nub->setProperty("nm-intel-usbc", kOSBooleanTrue);
@@ -1801,7 +1806,7 @@ void NMIntelFBClaim::publishThread(void *, wait_result_t)
     IOService *nub = (nub0 && nvrm) ? OSDynamicCast(IOService, OSMetaClass::allocClassWithName("NVRMDisplay")) : nullptr;
     bool ok = nub && nub->init();
     if (ok) {
-        static const char *const kCopy[] = {"nvkms-kapi", "gpu-id", "phys-for-va"};
+        static const char *const kCopy[] = {"gpu-id"};
         for (const char *k : kCopy) if (OSObject *v = nub0->getProperty(k)) nub->setProperty(k, v);
         nub->setProperty("fb-index", 4ull, 32);
         nub->setProperty("nm-intel-panel", kOSBooleanTrue);
