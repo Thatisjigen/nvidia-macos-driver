@@ -26,3 +26,12 @@ struct NVRMVramRequest {
     unsigned int width, height, pitch;
     unsigned long long allocationCookie;
 };
+
+// Asks NVRM for the two kernel pointers a display kext needs; the same call as in NVRM's nvrm_gpuva_abi.h.
+#define NVRM_DISPLAY_PTRS_ABI_VERSION 1u
+#define NVRM_DISPLAY_PTRS_FN "nvDisplayPointers"
+struct NVRMDisplayPointers {
+    unsigned int version;
+    void        *kapi;
+    void        *physForVa;
+};
