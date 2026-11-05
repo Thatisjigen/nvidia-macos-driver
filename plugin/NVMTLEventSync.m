@@ -58,7 +58,7 @@ static BOOL nvmtl_surface_pending_write(NVMTLCommandBuffer *cb, NVMTLTexture *t)
             NVMTLPendingSurfaceWrite *write = writes[key];
             NVMTLCommandBuffer *writer = write ? write->buffer : nil;
             NVMTLTexture *backing = write ? write->texture : nil;
-            const BOOL sameBacking = backing && (backing == t || (backing->_vramOn && t->_vramOn));
+            const BOOL sameBacking = backing && (backing == t || (backing->_vramOn && t->_vramOn && !backing->_surfaceLinear.img && !t->_surfaceLinear.img));
             if (writer && writer != cb && sameBacking && write->seed == IOSurfaceGetSeed(t->_surf)) return YES;
         }
         return NO;
@@ -222,7 +222,7 @@ static void nvmtl_ws_mark_pending(NVMTLCommandBuffer *cb) {
         for (NVMTLSubmissionPart *part in cb->_parts) {
             if (![part isKindOfClass:[NVMTLSubmissionPart class]]) continue;
             for (NVMTLTexture *t in part->surfaces) {
-                if (!t->_surf || !t->_vramOn) continue;
+                if (!t->_surf || !t->_vramOn || t->_surfaceLinear.img) continue;
                 const uint32_t sid = (uint32_t)IOSurfaceGetID(t->_surf), plane = (uint32_t)t->_plane;
                 NSNumber *key = @(((uint64_t)sid << 8) | (plane & 0xffu)), *done = answers[key];
                 if (!done) {

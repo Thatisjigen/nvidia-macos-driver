@@ -1295,7 +1295,7 @@ static void nvmtl_surface_in_for_cb(NVMTLCommandBuffer *cb, NVMTLTexture *t) {
     // write would also return, so skip both global locks. _vramOn is fixed for the texture's life; seeds only grow, so a
     // stale _surfSeed equal to the current seed is the value the lock would show. On a machine with a second GPU a surface
     // a client wrote still waits for that client at nvmtlSurfaceIn even with the seed unmoved: it does not take this path.
-    if (r->_vramOn && !r->_clientWritten && __atomic_load_n(&r->_surfSynced, __ATOMIC_ACQUIRE)
+    if (r->_vramOn && !r->_surfaceLinear.img && !r->_clientWritten && __atomic_load_n(&r->_surfSynced, __ATOMIC_ACQUIRE)
         && __atomic_load_n(&r->_surfSeed, __ATOMIC_ACQUIRE) == IOSurfaceGetSeed(r->_surf)) return;
     if (cb && [cb->_surfOverwrites containsObject:r]) return;
     // A prior committed buffer defines this GPU backing's contents.
@@ -1494,6 +1494,7 @@ void nvmtl_texture_desc_swizzle(NVMTLTexture *t, MTLTextureDescriptor *d) {
         }
     }
     if (_y422Surf) { CFRelease(_y422Surf); _y422Surf = NULL; }
+    if (!_parent && _surfaceLinear.img) nvmtl_vk_image_destroy(&_surfaceLinear);
     if (!_parent && _vramOn) { if (!nvmtl_ic_put(&_vramBuf)) nvmtl_vk_buffer_destroy(&_vramBuf); _vramOn = NO; }
     if (!_parent) nvmtl_vk_host_pages_drop(&_hostPages);
     if (_surfOwned && _surf) CFRelease(_surf);
@@ -1614,8 +1615,8 @@ static uint64_t nvmtl_host_pages_cookie(IOSurfaceRef s)
     if (!r->_surf) return;
     @synchronized (nvmtl_surface_sync(r)) {
     if (r->_clientWritten) nvmtl_busy_wait(r->_surf, r->_plane);
-    const uint32_t vgen = r->_vramOn ? 0 : nvmtl_vram_gen(r->_surf, r->_plane);
-    if (__atomic_load_n(&r->_surfSynced, __ATOMIC_ACQUIRE) && IOSurfaceGetSeed(r->_surf) == __atomic_load_n(&r->_surfSeed, __ATOMIC_ACQUIRE) && (r->_vramOn || vgen == r->_surfGen)) return;
+    const uint32_t vgen = r->_vramOn && !r->_surfaceLinear.img ? 0 : nvmtl_vram_gen(r->_surf, r->_plane);
+    if (__atomic_load_n(&r->_surfSynced, __ATOMIC_ACQUIRE) && IOSurfaceGetSeed(r->_surf) == __atomic_load_n(&r->_surfSeed, __ATOMIC_ACQUIRE) && ((r->_vramOn && !r->_surfaceLinear.img) || vgen == r->_surfGen)) return;
     if (!r->_clientWritten && nvmtl_busy_foreign(r->_surf, r->_plane)) { r->_clientWritten = YES; nvmtl_busy_wait(r->_surf, r->_plane); }
     if (r->_surfSynced && !r->_vramOn && vgen == r->_surfGen && nvmtl_plane_seed_on()) {
         // the seed moved, but only through our own surface-outs of other planes: this plane's image is still current
@@ -1633,6 +1634,8 @@ static uint64_t nvmtl_host_pages_cookie(IOSurfaceRef s)
     if (![r nvmtlSurfaceCopyable]) return;
     { uint32_t now = IOSurfaceGetSeed(r->_surf);
       if (r->_vramOn && nvmtl_vram_tag_current(r->_surf, r->_plane, now)) {
+          if (r->_surfaceLinear.img && nvmtl_vk_copy_image(r->_q, &r->_surfaceLinear, 0, 0, &r->_i, 0, 0, r->_i.w, r->_i.h)) return;
+          r->_surfGen = vgen;
           __atomic_store_n(&r->_surfSeed, now, __ATOMIC_RELEASE); __atomic_store_n(&r->_surfSynced, YES, __ATOMIC_RELEASE); g_surfin_skip++;
           static unsigned ns; if (ns++ < 6 || ns % 2000 == 0) nvlog("item 7: surface-in SKIPPED (shared VRAM current at seed %u): %llu skipped, %llu copied", now, g_surfin_skip, g_surfin_copy);
           return; } }
@@ -1652,7 +1655,7 @@ static uint64_t nvmtl_host_pages_cookie(IOSurfaceRef s)
     IOSurfaceUnlock(r->_surf, kIOSurfaceLockReadOnly, NULL);
     if (rc) { nvlog("G13 surface-in: upload FAILED (%ux%u) — retried at the next use", r->_i.w, r->_i.h); return; }
     r->_surfGen = vgen; __atomic_store_n(&r->_surfSeed, seed, __ATOMIC_RELEASE); __atomic_store_n(&r->_surfSynced, YES, __ATOMIC_RELEASE);
-    g_surfin_copy++; if (r->_vramOn) nvmtl_vram_tag_set(r->_surf, r->_plane, seed);
+    g_surfin_copy++; if (r->_vramOn && !r->_surfaceLinear.img) nvmtl_vram_tag_set(r->_surf, r->_plane, seed);
     static unsigned n; if (n++ < 6 || n % 2000 == 0) nvlog("G13 surface-in #%u: %ux%u surface %p seed %u uploaded", n, r->_i.w, r->_i.h, (void *)r->_surf, seed);
     }
 }
@@ -1695,6 +1698,7 @@ static void nvmtl_surface_remark_later(NVMTLTexture *r, uint32_t seed) {
     if (![r nvmtlSurfaceCopyable]) { nvtrace("SURFOUT surf %u %ux%u NOT copyable", (unsigned)IOSurfaceGetID(r->_surf), r->_i.w, r->_i.h); return NO; }
     nvtrace("SURFOUT surf %u %ux%u vramOn %d t=%llu", (unsigned)IOSurfaceGetID(r->_surf), r->_i.w, r->_i.h, (int)r->_vramOn,
             (unsigned long long)(clock_gettime_nsec_np(CLOCK_UPTIME_RAW) / 1000));
+    if (r->_surfaceLinear.img && nvmtl_vk_copy_image(r->_q, &r->_i, 0, 0, &r->_surfaceLinear, 0, 0, r->_i.w, r->_i.h)) return NO;
     const int marked = !r->_vramOn ? -1 : dirtied ? nvmtl_vk_surface_dirty_try((uint32_t)IOSurfaceGetID(r->_surf), (uint32_t)r->_plane)
                                                    : nvmtl_vk_surface_dirty((uint32_t)IOSurfaceGetID(r->_surf), (uint32_t)r->_plane);
     // The commit's mark went in, and the try was refused for an owner: another accelerator has taken the surface since, and its bind has
