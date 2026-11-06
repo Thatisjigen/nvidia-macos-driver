@@ -42,6 +42,7 @@ static inline thread_call_t nvrmfbCall(thread_call_func_t fn, thread_call_param_
 #include "nvrm-hud.h"
 #include "nvrm-fb-safety.h"
 #include "nvrm-allocation-table.h"
+#include "nvrm-head-gate.h"
 static IORecursiveLock *startLock();
 class NVRMCallReference {
     OSObject *owner;
@@ -481,6 +482,7 @@ class NVRMNVDAFramebuffer : public IOFramebuffer {
     IOSimpleLock *fFlipCacheLock = nullptr;
     unsigned    fFlipCacheN = 0, fFlipCount = 0, fFlipRejects = 0, fFlipEvict = 0;
     struct NvKmsKapiSurface *fFrontSurf = nullptr;
+    NVRMHeadGateState fPrimaryGate;
     static inline volatile SInt32 sFlipLatched[8] = {};
     bool flipToMemory(struct NvKmsKapiMemory *mem, unsigned w, unsigned h, unsigned pitch, int *rcOut, bool pure = false, UInt64 cookie = 0);
     bool fSubmissionSeen = false, fSubmissionFaulted = false;
@@ -1749,15 +1751,17 @@ static IORecursiveLock *startLock()
 // flicker" on a 143 Hz panel: 56 flips/s median; 540 Hz: 192/s). The flip-occurred event wakes the waiter, and the
 // pending flag (still the truth) is re-read at least every 250 us. The bound is the caller's, in microseconds: the
 // frame path passes one refresh period and a quarter (flipWaitUs), the old 100 ms is kept only as the stuck limit.
-static IOLock *sFlipWaitLock;
+static IORecursiveLock *sFlipWaitLock;
 static volatile SInt32 sFlipWakeEv[8];
 void NVRMNVDAFramebuffer::flipWake(unsigned head)
 {
-    if (head < 8 && sFlipWaitLock) IOLockWakeup(sFlipWaitLock, (event_t)&sFlipWakeEv[head], false);
+    if (head < 8 && sFlipWaitLock) IORecursiveLockWakeup(sFlipWaitLock, (event_t)&sFlipWakeEv[head], false);
 }
 bool NVRMNVDAFramebuffer::waitFlipDone(uint64_t limitUs)
 {
-    if (!sFlipWaitLock) { IOLock *l = IOLockAlloc(); if (l && !OSCompareAndSwapPtr(nullptr, l, (void *volatile *)&sFlipWaitLock)) IOLockFree(l); }
+    IORecursiveLock *lock = startLock();
+    if (!lock || !IORecursiveLockHaveLock(lock) || !fPrimaryGate.owned()) return false;
+    if (!sFlipWaitLock) OSCompareAndSwapPtr(nullptr, lock, (void *volatile *)&sFlipWaitLock);
     uint64_t end = 0; clock_interval_to_deadline(limitUs > 0xffffffffull ? 0xffffffffu : (uint32_t)limitUs, kMicrosecondScale, &end);
     for (;;) {
         NvBool pending = NV_TRUE;
@@ -1767,10 +1771,11 @@ bool NVRMNVDAFramebuffer::waitFlipDone(uint64_t limitUs)
         if (now >= end) return false;
         uint64_t next = 0; clock_interval_to_deadline(250, kMicrosecondScale, &next);
         if (next > end) next = end;
-        if (!sFlipWaitLock) { IOSleep(1); continue; }
-        IOLockLock(sFlipWaitLock);
-        IOLockSleepDeadline(sFlipWaitLock, (event_t)&sFlipWakeEv[fHead < 8 ? fHead : 0], next, THREAD_UNINT);
-        IOLockUnlock(sFlipWaitLock);
+        // Retain this head's transaction while releasing the global lock,
+        // including any recursive callers. Completion is still required before
+        // the old scanout surface may retire; another head or cursor does not
+        // need to wait for this display's refresh.
+        IORecursiveLockSleepDeadline(lock, (event_t)&sFlipWakeEv[fHead < 8 ? fHead : 0], next, THREAD_UNINT);
     }
 }
 // Flip completion-wait controls, surfaced through the debug.nvrmfb_flip_latch* sysctls registered
@@ -2007,6 +2012,8 @@ void NVRMNVDAFramebuffer::sampleFire(thread_call_param_t p0, thread_call_param_t
 bool NVRMNVDAFramebuffer::reflip()
 {
     NVRMDisplayGate gate; if (!gate.valid()) return false;
+    NVRMHeadGate primary(startLock(), fPrimaryGate, true);
+    if (!primary.valid() || OSAddAtomic(0, &fStopping)) return false;
     if (!fKms || !fDev || !fSurf) return false;
     struct NvKmsKapiSurface *front = fFrontSurf ? fFrontSurf : fSurf;
     struct NvKmsKapiRequestedModeSetConfig *cfg =
@@ -2105,6 +2112,9 @@ IOReturn NVRMNVDAFramebuffer::nvrmSetGamma(UInt32 channels, UInt32 count, UInt32
         FBLOG("gamma: refused a table (%u channels, %u entries, %u bits)", channels, count, width);
         return kIOReturnBadArgument;
     }
+    NVRMDisplayGate gate; if (!gate.valid()) return kIOReturnNoMemory;
+    NVRMHeadGate primary(startLock(), fPrimaryGate, true);
+    if (!primary.valid() || OSAddAtomic(0, &fStopping)) return kIOReturnNotReady;
     if (nvrmLutIsBlack(channels, count, width, data) && fBlackLutDeadline &&
         mach_absolute_time() < fBlackLutDeadline) {
         FBLOG("gamma: all-black table ignored after a reconnect (previous LUT kept)");
@@ -2132,7 +2142,7 @@ IOReturn NVRMNVDAFramebuffer::nvrmSetGamma(UInt32 channels, UInt32 count, UInt32
     fGammaOn = true;
     // Not lit yet (boot, display sleep, GPU in standby, console aperture): the next modeset carries the table.
     if (!fModeSet || !fSurf || fHeadSlept || fConsoleAperture || !rmGpuReady()) return kIOReturnSuccess;
-    NVRMDisplayGate gate; if (!gate.valid() || !fKms || !fDev) return kIOReturnSuccess;
+    if (!fKms || !fDev) return kIOReturnSuccess;
     struct NvKmsKapiRequestedModeSetConfig *cfg = (struct NvKmsKapiRequestedModeSetConfig *)IOMalloc(sizeof *cfg);
     struct NvKmsKapiModeSetReplyConfig *rep = (struct NvKmsKapiModeSetReplyConfig *)IOMalloc(sizeof *rep);
     if (!cfg || !rep) { if (cfg) IOFree(cfg, sizeof *cfg); if (rep) IOFree(rep, sizeof *rep); return kIOReturnSuccess; }
@@ -2260,6 +2270,8 @@ bool NVRMNVDAFramebuffer::cursorInit()
 bool NVRMNVDAFramebuffer::cursorApply(bool imageChanged)
 {
     NVRMDisplayGate gate; if (!gate.valid()) return false;
+    NVRMHeadGate::waitForCursor(startLock(), fPrimaryGate);
+    if (OSAddAtomic(0, &fStopping)) return false;
     if (!fKms || !fDev || !fCurSurf || !fModeSet) return false;
     struct NvKmsKapiRequestedModeSetConfig *cfg =
         (struct NvKmsKapiRequestedModeSetConfig *)IOMalloc(sizeof *cfg);
@@ -2331,6 +2343,8 @@ IOReturn NVRMNVDAFramebuffer::setCursorImage(void *cursorImage)
 {
     if (!fCurKva || !fCurSurf) return kIOReturnUnsupported;
     NVRMDisplayGate gate; if (!gate.valid()) return kIOReturnUnsupported;
+    NVRMHeadGate::waitForCursor(startLock(), fPrimaryGate);
+    if (OSAddAtomic(0, &fStopping) || !fCurKva || !fCurSurf) return kIOReturnUnsupported;
     return setCursorImageLocked(cursorImage);
 }
 IOReturn NVRMNVDAFramebuffer::setCursorImageLocked(void *cursorImage)
@@ -2540,6 +2554,8 @@ void NVRMNVDAFramebuffer::vblFire(thread_call_param_t p0, thread_call_param_t)
 bool NVRMNVDAFramebuffer::setHeadActive(bool active)
 {
     NVRMDisplayGate gate; if (!gate.valid()) return false;
+    NVRMHeadGate primary(startLock(), fPrimaryGate, true);
+    if (!primary.valid() || OSAddAtomic(0, &fStopping)) return false;
     if (!fKms || !fDev) return false;
     struct NvKmsKapiRequestedModeSetConfig *cfg = (struct NvKmsKapiRequestedModeSetConfig *)IOMalloc(sizeof *cfg);
     struct NvKmsKapiModeSetReplyConfig *rep = (struct NvKmsKapiModeSetReplyConfig *)IOMalloc(sizeof *rep);
@@ -2590,6 +2606,8 @@ void NVRMNVDAFramebuffer::headProbeFire(thread_call_param_t p0, thread_call_para
 bool NVRMNVDAFramebuffer::applyMode()
 {
     NVRMDisplayGate gate; if (!gate.valid()) return false;
+    NVRMHeadGate primary(startLock(), fPrimaryGate, true);
+    if (!primary.valid() || OSAddAtomic(0, &fStopping)) return false;
     if (fConsoleAperture) {
         FBLOG("applyMode: skipped (console aperture mode -- the GOP drives this panel)");
         fModeSet = true; return true;
@@ -2825,6 +2843,13 @@ void NVRMNVDAFramebuffer::stop(IOService *provider)
         IOInterruptState state = IOSimpleLockLockDisableInterrupt(fFlipCacheLock);
         fStopping = 1;
         IOSimpleLockUnlockEnableInterrupt(fFlipCacheLock, state);
+    }
+    // No new primary transaction may start after fStopping. Wait for the
+    // accepted one before removing completion callbacks or other head state.
+    // Drop both guards before draining workers that can enter this same head.
+    {
+        NVRMDisplayGate gate;
+        if (gate.valid()) { NVRMHeadGate primary(startLock(), fPrimaryGate, true); }
     }
     if (fHwVblCb && fKms && fDev) {
         fKms->unregisterVblankIntrCallback(fDev, fHead, fHwVblCb); fHwVblCb = nullptr;
@@ -3205,6 +3230,8 @@ int NVRMNVDAFramebuffer::dtIndex(IODisplayModeID id) const
 IOReturn NVRMNVDAFramebuffer::switchMode(IODisplayModeID id, const struct NvKmsKapiDisplayMode &m, NvU32 w, NvU32 h, UInt32 transform)
 {
     NVRMDisplayGate gate; if (!gate.valid()) return kIOReturnNoMemory;
+    NVRMHeadGate primary(startLock(), fPrimaryGate, true);
+    if (!primary.valid() || OSAddAtomic(0, &fStopping)) return kIOReturnNotReady;
     if (fSubmissionFaulted) return kIOReturnNotReady;
     if (!fKms || !fDev || !fMem || fConsoleAperture) return kIOReturnNotReady;
     NvU32 pitch = 0;
@@ -3932,6 +3959,10 @@ bool NVRMNVDAFramebuffer::flipToMemory(struct NvKmsKapiMemory *mem, unsigned w, 
                                    unsigned pitch, int *rcOut, bool pure, UInt64 cookie)
 {
     NVRMDisplayGate gate; if (!gate.valid() || fSubmissionFaulted) return false;
+    retain();
+    NVRMCallReference callReference(this);
+    NVRMHeadGate primary(startLock(), fPrimaryGate, !pure);
+    if (!primary.valid() || OSAddAtomic(0, &fStopping) || fSubmissionFaulted) return false;
     if (mem) {
         const UInt64 bytes = gAllocations.size(mem, cookie);
         if (!bytes || !w || !h || w > 65535 || h > 65535 || (UInt64)w * 4 > pitch || (UInt64)pitch * h > bytes) return false;
@@ -4178,6 +4209,8 @@ IOReturn NVRMNVDAFramebuffer::getAttributeForConnection(IOIndex connectIndex, IO
 bool NVRMNVDAFramebuffer::headOff()
 {
     NVRMDisplayGate gate; if (!gate.valid()) return false;
+    NVRMHeadGate primary(startLock(), fPrimaryGate, true);
+    if (!primary.valid() || OSAddAtomic(0, &fStopping)) return false;
     if (!fKms || !fDev) return false;
     struct NvKmsKapiRequestedModeSetConfig *cfg = (struct NvKmsKapiRequestedModeSetConfig *)IOMalloc(sizeof *cfg);
     struct NvKmsKapiModeSetReplyConfig *rep = (struct NvKmsKapiModeSetReplyConfig *)IOMalloc(sizeof *rep);
@@ -4196,6 +4229,8 @@ bool NVRMNVDAFramebuffer::headOff()
 bool NVRMNVDAFramebuffer::setHeadPower(bool awake)
 {
     NVRMDisplayGate gate; if (!gate.valid()) return false;
+    NVRMHeadGate primary(startLock(), fPrimaryGate, true);
+    if (!primary.valid()) return false;
     char nb[8] = { 0 };
     const bool dpms = !PE_parse_boot_argn("-nvrmnodpms", nb, sizeof nb);
     if (OSAddAtomic(0, &fStopping)) return false;
@@ -4344,6 +4379,8 @@ void NVRMNVDAFramebuffer::gpuWakeFire(thread_call_param_t p0, thread_call_param_
     NVRMCallReference callReference(me);
     if (OSAddAtomic(0, &me->fStopping)) return;
     NVRMDisplayGate gate; if (!gate.valid()) return;
+    NVRMHeadGate primary(startLock(), me->fPrimaryGate, true);
+    if (!primary.valid() || OSAddAtomic(0, &me->fStopping)) return;
     if (!me->fHeadSlept || !me->fPowerOn || !me->fModeSet || !me->fSurf) {
         FBLOG("GPU back: head %u left as is (slept %u, power %u)", me->fHead, (unsigned)me->fHeadSlept, (unsigned)me->fPowerOn);
         return;
