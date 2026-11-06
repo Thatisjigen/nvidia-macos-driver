@@ -332,6 +332,59 @@ static bool nvmtl_is_decode_service(const char *me)
 {
     return me && strncmp(me, "VTDecoderXPCService", 19) == 0;
 }
+#include <crt_externs.h>
+#include <mach/mach_vm.h>
+// Gecko (Firefox, Zen, LibreWolf...) decodes media in child processes started as
+// `plugin-container ... -parentPid <pid> ... <type>`, with the process type as the last argument.
+// RDD is the media decoder; the GPU process decodes there when Gecko is configured to.
+// Gecko's CheckArg (toolkit/xre/CmdLineAndEnvUtils.h) removes every flag it consumes from argv by shifting the
+// pointer array, so by the time VideoToolbox maps this bundle *_NSGetArgv() no longer holds -parentPid or the
+// process type (measured in Zen's RDD: no decoder registered, sandbox on or off). The strings stay where exec put
+// them, one after another from argv[0], and argc is main's unchanged count. Walk those strings, bounded by the
+// memory region that holds them (the leaf mapping: a shared-cache submap reports as one readable entry even where
+// parts are PROT_NONE) so a rewritten argv[0] cannot send the walk into unmapped memory.
+// Returns 1 for RDD, 2 for the GPU process, 0 otherwise.
+static int nvmtl_gecko_decoder_process_type(void)
+{
+    int argc = *_NSGetArgc();
+    char **argv = *_NSGetArgv();
+    if (!argv || argc < 3 || argc > 4096 || !argv[0]) return 0;
+    const mach_vm_address_t at = (mach_vm_address_t)(uintptr_t)argv[0];
+    mach_vm_address_t region = at;
+    mach_vm_size_t size = 0;
+    natural_t depth = 0;
+    vm_region_submap_info_data_64_t info;
+    for (;;) {
+        mach_msg_type_number_t count = VM_REGION_SUBMAP_INFO_COUNT_64;
+        region = at;
+        if (mach_vm_region_recurse(mach_task_self_, &region, &size, &depth, (vm_region_recurse_info_t)&info,
+                                   &count) != KERN_SUCCESS || region > at) return 0;
+        if (!info.is_submap) break;
+        if (++depth > 8) return 0;
+    }
+    if (!(info.protection & VM_PROT_READ) || !size || size > UINTPTR_MAX - region || at >= region + size) return 0;
+    const char *p = argv[0], *end = (const char *)(uintptr_t)(region + size), *type = NULL;
+    bool child = false, parent = false;
+    for (int i = 0; i < argc; i++) {
+        if (p >= end) return 0;
+        size_t n = strnlen(p, (size_t)(end - p));
+        if (p + n >= end) return 0;                         // unterminated within the region: not exec's strings
+        if (parent) {
+            unsigned long value = 0;
+            if (!n || n > 10) return 0;
+            for (size_t k = 0; k < n; ++k) {
+                if (p[k] < '0' || p[k] > '9' || value > (2147483647ul - (unsigned)(p[k] - '0')) / 10) return 0;
+                value = value * 10 + (unsigned)(p[k] - '0');
+            }
+            if (!value) return 0;
+            child = true; parent = false;
+        } else if (i > 0 && i < argc - 2 && !strcmp(p, "-parentPid")) parent = true;
+        type = p;
+        p += n + 1;
+    }
+    if (!child || !type) return 0;
+    return !strcmp(type, "rdd") ? 1 : !strcmp(type, "gpu") ? 2 : 0;
+}
 // Apple's sandboxed apps (Safari's WebKit GPU process, QuickTime Player, Preview) hand decoding to VTDecoderXPCService,
 // where the decoder is registered; inside them the in-process registration fails on the sandbox (#349). Chromium and
 // Electron decode in their own GPU process and ask VideoToolbox for a hardware decoder there, so skipping it left
