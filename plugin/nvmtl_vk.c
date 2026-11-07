@@ -407,7 +407,7 @@ void nvmtl_vk_counts(uint64_t *bm, uint64_t *bg, uint64_t *im, uint64_t *ig, siz
     if (bytes) *bytes = g_alloc_bytes;
 }
 
-#define INSTANCE_FNS(X) X(vkEnumeratePhysicalDevices) X(vkGetPhysicalDeviceProperties) X(vkGetPhysicalDeviceFeatures) \
+#define INSTANCE_FNS(X) X(vkEnumeratePhysicalDevices) X(vkGetPhysicalDeviceProperties) X(vkGetPhysicalDeviceFeatures) X(vkGetPhysicalDeviceFormatProperties) \
     X(vkEnumerateDeviceExtensionProperties) X(vkGetPhysicalDeviceQueueFamilyProperties) X(vkGetPhysicalDeviceMemoryProperties) X(vkGetPhysicalDeviceMemoryProperties2) X(vkGetPhysicalDeviceProperties2) X(vkCreateDevice) X(vkGetDeviceProcAddr)
 #define DEVICE_FNS(X) X(vkGetDeviceQueue) X(vkCreateBuffer) X(vkGetBufferMemoryRequirements) X(vkAllocateMemory) \
     X(vkGetImageMemoryRequirements2) X(vkBindBufferMemory) X(vkMapMemory) X(vkUnmapMemory) X(vkCreateImage) X(vkGetImageMemoryRequirements) X(vkBindImageMemory) \
@@ -2210,12 +2210,12 @@ static int nvmtl_vk_stage(nvk_queue *q, size_t size, nvk_buffer *out)
 
 int nvmtl_vk_format_is_storage(uint32_t vkfmt)
 {
-    static void (*fp)(VkPhysicalDevice, VkFormat, VkFormatProperties *); static int tried;
     if (nvmtl_vk_init()) return 0;
-    if (!tried) { tried = 1; fp = (void (*)(VkPhysicalDevice, VkFormat, VkFormatProperties *))pvkGetInstanceProcAddr(g_inst, "vkGetPhysicalDeviceFormatProperties");
-                  if (!fp) nvlog("vk: vkGetPhysicalDeviceFormatProperties is missing — NO texture can be a storage image"); }
-    if (!fp) return 0;
-    VkFormatProperties fpz; memset(&fpz, 0, sizeof fpz); fp(g_pdev, (VkFormat)vkfmt, &fpz);
+    // The instance dispatch is published by nvmtl_vk_init's pthread_once. A
+    // separate tried flag could become visible before its function pointer,
+    // incorrectly stripping storage usage from textures created on other threads.
+    VkFormatProperties fpz; memset(&fpz, 0, sizeof fpz);
+    pvkGetPhysicalDeviceFormatProperties(g_pdev, (VkFormat)vkfmt, &fpz);
     return (fpz.optimalTilingFeatures & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT) != 0;
 }
 static int nvmtl_vk_cube_compat(uint32_t mtl_type, uint32_t w, uint32_t h, uint32_t layers)
