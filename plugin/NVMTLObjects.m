@@ -496,6 +496,17 @@ static BOOL nvmtl_res2_movable(NVMTLTexture *t) {
 }
 static os_unfair_lock gRes2RegLock = OS_UNFAIR_LOCK_INIT;
 static NSHashTable *gRes2Reg;
+// A weak hash table keeps a slot for every object ever added and never reuses a dead
+// one, so a process that makes resources all day grows it without limit. Rebuild it
+// from its live members once it is large; call with gRes2RegLock held.
+static void nvmtl_res2_reg_compact(void) {
+    static unsigned n;
+    if (!gRes2Reg || gRes2Reg.count <= 4096 || (++n & 0x3F)) return;
+    NSArray *live = gRes2Reg.allObjects;
+    NSHashTable *fresh = [NSHashTable weakObjectsHashTable];
+    for (id o in live) [fresh addObject:o];
+    gRes2Reg = fresh;
+}
 extern void (*nvmtl_res2_pressure_hook)(uint64_t want);
 static _Atomic uint64_t gRes2Want;
 static void nvmtl_res2_pressure(uint64_t want) {
@@ -509,6 +520,7 @@ static void nvmtl_res2_note_use(NVMTLTexture *t) {
         if (__atomic_compare_exchange_n(&t->_lruReg, &z, 1, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE) && nvmtl_res2_on() && nvmtl_res2_movable(t)) {
             os_unfair_lock_lock(&gRes2RegLock);
             if (!gRes2Reg) gRes2Reg = [NSHashTable weakObjectsHashTable];
+            nvmtl_res2_reg_compact();
             [gRes2Reg addObject:t];
             os_unfair_lock_unlock(&gRes2RegLock);
             if (!nvmtl_res2_pressure_hook) nvmtl_res2_pressure_hook = nvmtl_res2_pressure;
@@ -635,6 +647,7 @@ static void nvmtl_res3_note_use(NVMTLBuffer *b) {
         if (__atomic_compare_exchange_n(&b->_lruReg, &z, 1, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE) && nvmtl_res2_on() && nvmtl_res3_movable(b)) {
             os_unfair_lock_lock(&gRes2RegLock);
             if (!gRes2Reg) gRes2Reg = [NSHashTable weakObjectsHashTable];
+            nvmtl_res2_reg_compact();
             [gRes2Reg addObject:b];
             os_unfair_lock_unlock(&gRes2RegLock);
             if (!nvmtl_res2_pressure_hook) nvmtl_res2_pressure_hook = nvmtl_res2_pressure;
@@ -1535,6 +1548,16 @@ static id nvmtl_surface_sync(NVMTLTexture *t) {
         id monitor = objc_getAssociatedObject(t, &key);
         if (!monitor) {
             if (!monitors) monitors = [NSMapTable strongToWeakObjectsMapTable];
+            // The table keeps its keys strongly and its values weakly, and a weak value
+            // dying leaves the key behind. A compositor wraps hundreds of surfaces a
+            // second, so without this it would grow with every surface ever seen
+            // (WindowServer gained hundreds of MB this way). Sweep at most every 256
+            // new surfaces: this runs on the per-frame path.
+            static unsigned sinceSweep;
+            if (monitors.count > 1024 && (++sinceSweep & 0xFF) == 0) {
+                NSArray *keys = monitors.keyEnumerator.allObjects;
+                for (NSArray *k in keys) if (![monitors objectForKey:k]) [monitors removeObjectForKey:k];
+            }
             NSArray *surface = @[@(IOSurfaceGetID(t->_surf)), @(t->_plane)];
             monitor = [monitors objectForKey:surface];
             if (!monitor) { monitor = [NSObject new]; [monitors setObject:monitor forKey:surface]; }
