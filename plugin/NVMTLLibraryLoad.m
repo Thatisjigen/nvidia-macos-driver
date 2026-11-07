@@ -579,6 +579,13 @@ static NSString *nvmtl_air_text_made(NSString *s) {
 // newFunctionWithName scanned the whole module twice on every call for these two markers (megabytes of text, each
 // time a VideoToolbox transfer made its function). The answer is kept on the text once.
 static const void *NVMTL_AIRFLAGS_KEY = &NVMTL_AIRFLAGS_KEY;
+// The visible/intersection-table answer from nvmtl_air_reads_function_table, kept for the same reason and with the
+// same lifetime as the flags above: the answer depends only on text that is never edited.
+static const void *NVMTL_AIRFNTABLE_KEY = &NVMTL_AIRFNTABLE_KEY;
+// The module's SHA-256 (nvmtl_air_text_sha8), likewise keyed to the text: VideoToolbox builds a new compute pipeline
+// from the same module on every transfer, so it was hashed again per pipeline. (The translator's visible-reference
+// answer is kept by nvmtl_needs_visible_link itself.)
+static const void *NVMTL_AIRSHA8_KEY = &NVMTL_AIRSHA8_KEY;
 uint32_t nvmtl_air_text_flags(NSString *ll) {
     if (!ll) return 0;
     const BOOL keep = ll.length >= 4096 && objc_getAssociatedObject(ll, NVMTL_AIRTEXT_KEY) != nil;
@@ -2940,6 +2947,14 @@ static NVMTLFunction *nvmtl_link_dylibs(NVMTLFunction *fn, NSArray *dylibs, NSEr
 BOOL nvmtl_air_reads_function_table(NSString *air)
 {
     if (!air.length) return NO;
+    // This is asked before the SPIR-V cache is consulted, every time a function is made, so a module that was
+    // translated once was scanned again on each later call: VideoToolbox's Metal scaler makes its function again on
+    // every transfer, and each call paid 8 rangeOfString over the whole module. Measured on the scaler's 3.9 MB
+    // module: 8 x rangeOfString = 0.4-0.5 s per call, the same 8 searches over the UTF-8 bytes = 12-35 ms, and the
+    // answer is the same every time. Search the bytes and keep the answer on the text, as nvmtl_air_text_flags does.
+    const BOOL keep = air.length >= 4096 && objc_getAssociatedObject(air, NVMTL_AIRTEXT_KEY) != nil;
+    NSNumber *have = keep ? objc_getAssociatedObject(air, NVMTL_AIRFNTABLE_KEY) : nil;
+    if (have) return have.boolValue;
     static NSArray<NSString *> *forms;
     static dispatch_once_t once;
     dispatch_once(&once, ^{
@@ -2952,9 +2967,35 @@ BOOL nvmtl_air_reads_function_table(NSString *air)
                   @"!\"air.visible_function_table\"",
                   @"!\"air.intersection_function_table\""];
     });
-    for (NSString *f in forms)
-        if ([air rangeOfString:f].location != NSNotFound) return YES;
-    return NO;
+    const char *bytes = air.UTF8String;
+    const size_t n = bytes ? [air lengthOfBytesUsingEncoding:NSUTF8StringEncoding] : 0;
+    BOOL reads = NO;
+    for (NSString *f in forms) {
+        if (bytes) {
+            const char *s = f.UTF8String;
+            if (s && memmem(bytes, n, s, strlen(s))) { reads = YES; break; }
+        } else if ([air rangeOfString:f].location != NSNotFound) { reads = YES; break; }
+    }
+    if (keep) objc_setAssociatedObject(air, NVMTL_AIRFNTABLE_KEY, @(reads), OBJC_ASSOCIATION_RETAIN);
+    return reads;
+}
+
+// The first 8 bytes of the module's SHA-256, the key a translator module is named by. Kept on the text: every
+// pipeline built from one library holds the same string, and VideoToolbox makes a pipeline per transfer, so this
+// hashed the same megabytes again for each one. Used by nvmtl_function_air_key (NVMTLObjects.m).
+uint64_t nvmtl_air_text_sha8(NSString *air)
+{
+    if (!air.length) return 0;
+    const BOOL keep = air.length >= 4096 && objc_getAssociatedObject(air, NVMTL_AIRTEXT_KEY) != nil;
+    NSNumber *have = keep ? objc_getAssociatedObject(air, NVMTL_AIRSHA8_KEY) : nil;
+    if (have) return have.unsignedLongLongValue;
+    const char *s = air.UTF8String;
+    unsigned char dg[CC_SHA256_DIGEST_LENGTH];
+    CC_SHA256(s, (CC_LONG)strlen(s), dg);
+    uint64_t v = 0;
+    for (int i = 0; i < 8; i++) v = (v << 8) | dg[i];
+    if (keep) objc_setAssociatedObject(air, NVMTL_AIRSHA8_KEY, @(v), OBJC_ASSOCIATION_RETAIN);
+    return v;
 }
 
 // Whether a function needs linking before it can be translated: it calls visible functions it does not define,
