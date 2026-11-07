@@ -5390,7 +5390,11 @@ IOReturn NVRMNVDAFramebuffer::getAttribute(IOSelect attribute, uintptr_t *value)
     // one report, issue #216), which buried every real error. An attribute is logged again only when its answer changes.
     static struct { IOSelect a; IOReturn r; uintptr_t v; } seen[16];
     static unsigned nseen;
-    const uintptr_t v = value ? *value : 0;
+    // Only a successful call has an answer in *value: IOFramebuffer leaves the caller's buffer untouched for an
+    // attribute it does not support, and the caller reuses it. 'hdcs' (kIOReturnUnsupported) therefore compared a
+    // different leftover on every poll, the cache above never matched, and it logged every poll - the lines issue
+    // #216 added it for. Compare what the call actually wrote.
+    const uintptr_t v = (value && r == kIOReturnSuccess) ? *value : 0;
     unsigned i = 0;
     while (i < nseen && seen[i].a != attribute) i++;
     if (i == nseen || seen[i].r != r || seen[i].v != v) {
