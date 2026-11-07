@@ -2630,6 +2630,9 @@ IOReturn NVRM::callPlatformFunction(const OSSymbol *fn, bool wait, void *p1, voi
     if (fn && fn->isEqualTo(NVRM_SMC_API_FN)) {
         NVRMSmcApi *api = (NVRMSmcApi *)p1;
         if (!api || api->version != NVRM_SMC_API_VERSION) return kIOReturnBadArgument;
+        // size is an output, and from now on also an input: a caller that states its buffer's size gets it checked
+        // before the struct is filled; one that leaves it 0 is served as before.
+        if (api->size != 0 && api->size != sizeof(*api)) return kIOReturnBadArgument;
         rm_nvgfx_smc_api(api);
         api->pmEnter = (void *)nv_xnu_pm_enter;
         api->pmExit = (void *)nv_xnu_pm_exit;

@@ -1,7 +1,8 @@
 /*
- * NvGfx: issue one RM control with kernel privilege, for experiments with the internal PRH/PMGR controls that
- * userland cannot reach (notes/power.md). Called only by NVRM.cpp's NVRM_ESC_PHYS_CTRL, which checks root and the
- * nvrmphysctl boot-arg first. Compiled with RM's own osapi.c command line (rmcc.py) because it needs OBJGPU.
+ * NvGfx: issue one RM control with kernel privilege, for the internal PRH/PMGR controls that userland cannot reach
+ * (notes/power.md). Its only caller is the TGP mode switch in nvrm_power.cpp, and only that control is accepted: no
+ * user client reaches this, and the allow-list keeps it from becoming a generic escape if one ever does. Compiled
+ * with RM's own osapi.c command line (rmcc.py) because it needs OBJGPU.
  */
 // <wtl> fork: nvgfx | author: watchthelight </wtl>
 
@@ -31,6 +32,8 @@ NV_STATUS rm_nvgfx_phys_control(nv_state_t *nv, NvU32 mode, NvU32 hClient, NvU32
 
     if (pGpu == NULL || paramsSize > NVRM_PHYSCTL_MAX_PARAMS || (paramsSize && pParams == NULL) || mode > NVRM_PHYSCTL_KERNEL)
         return NV_ERR_INVALID_ARGUMENT;
+    if (cmd != NVGFX_CTRL_CONFIGURE_TGP_MODE || mode != NVRM_PHYSCTL_PHYS_SUBDEV)
+        return NV_ERR_NOT_SUPPORTED;
     if (paramsSize == 0) pParams = NULL;
 
     NV_ENTER_RM_RUNTIME(sp, fp);
