@@ -616,6 +616,9 @@ static uint64_t nvmtl_evfold_promised(id event) {
 static void nvmtl_evfold_promise(id event, uint64_t value) {
     if (!event || !nvmtl_evfold_on()) return;
     if (!nvmtl_evfold_submitted) nvmtl_evfold_submitted = [NSMapTable weakToStrongObjectsMapTable];
+    // A dead key leaves its entry behind. Promises only save a wait, so dropping them
+    // all once the table is large is harmless.
+    if (nvmtl_evfold_submitted.count > 4096) [nvmtl_evfold_submitted removeAllObjects];
     if (value > nvmtl_evfold_promised(event)) [nvmtl_evfold_submitted setObject:@(value) forKey:event];
 }
 static void nvmtl_evfold_promise_part(NVMTLSubmissionPart *part) {
