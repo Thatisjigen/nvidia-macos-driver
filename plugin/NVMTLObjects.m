@@ -1138,18 +1138,16 @@ uint32_t nvmtl_function_spv_fnv(id f)
 }
 // The first 8 bytes of the sha256 of a function's AIR text, as the pipeline key line prints them: the module key a
 // profile row or a fault-context dispatch is joined to. Computed once per function.
+uint64_t nvmtl_air_text_sha8(NSString *air);   // NVMTLLibraryLoad.m: kept on the text, see there
 uint64_t nvmtl_function_air_key(id f)
 {
     if (![f isKindOfClass:[NVMTLFunction class]]) return 0;
     NVMTLFunction *fn = f; static char kKey;
     NSNumber *h = objc_getAssociatedObject(fn, &kKey);
     if (h) return h.unsignedLongLongValue;
-    uint64_t v = 0;
-    if (fn->_air.length) {
-        const char *s = fn->_air.UTF8String; unsigned char dg[CC_SHA256_DIGEST_LENGTH];
-        CC_SHA256(s, (CC_LONG)strlen(s), dg);
-        for (int i = 0; i < 8; i++) v = (v << 8) | dg[i];
-    }
+    // The hash is of the AIR text, which every pipeline built from the same library shares: keying it to the
+    // function object hashed the same megabytes again for each new pipeline of the same module.
+    uint64_t v = nvmtl_air_text_sha8(fn->_air);
     objc_setAssociatedObject(fn, &kKey, @(v), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     return v;
 }
