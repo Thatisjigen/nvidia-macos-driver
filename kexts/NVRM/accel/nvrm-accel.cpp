@@ -2329,8 +2329,9 @@ static IOReturn nvAccelSurfVram(NVAccel *owner, struct NVRMSurfShareEsc *p, task
     }
     if (p->status == 0) gNVSVOk++; else gNVSVRefused++;
     if (gNVSVOk + gNVSVRefused <= 8 || ((gNVSVOk + gNVSVRefused) & 1023) == 0)
-        ALOG("surfvram: surface %u plane %u -> cache %p res %p vidmem %p (%llu B) -> client %#x mem %#x status %#x (ok %u, refused %u)",
-             p->surfaceID, p->plane, cache, res, vm, vm ? vm->fBytes : 0ull, p->hSrcClient, p->hSrcMemory, p->status, gNVSVOk, gNVSVRefused);
+        ALOG("surfvram: surface %u plane %u -> cache %u res %u vidmem %u (%llu B) -> client %#x mem %#x status %#x (ok %u, refused %u)",
+             p->surfaceID, p->plane, (unsigned)(cache != nullptr), (unsigned)(res != nullptr), (unsigned)(vm != nullptr),
+             vm ? vm->fBytes : 0ull, p->hSrcClient, p->hSrcMemory, p->status, gNVSVOk, gNVSVRefused);
     if (cache) ((OSObject *)cache)->release();
     nvFamUnlock(a);
     ((OSObject *)surf)->release();
