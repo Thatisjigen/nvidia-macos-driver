@@ -18,6 +18,9 @@
 #define NVRM_PHYSCTL_ST_OFF         0x80000001u   /* boot-arg nvrmphysctl=1 not set */
 #define NVRM_PHYSCTL_ST_BAD_VERSION 0x80000002u
 #define NVRM_PHYSCTL_ST_BAD_SIZE    0x80000003u
+/* The one RM control rm_nvgfx_phys_control accepts: NV2080_CTRL_CMD_INTERNAL_PMGR_PFM_REQ_HNDLR_CONFIGURE_TGP_MODE,
+ * sent by the TGP mode switch with NVRM_PHYSCTL_PHYS_SUBDEV. Every other command and mode is refused. */
+#define NVGFX_CTRL_CONFIGURE_TGP_MODE 0x20800ad2u
 
 struct NVRMPhysCtrlEsc {
     unsigned int version;      /* in: NVRM_PHYSCTL_VERSION */
