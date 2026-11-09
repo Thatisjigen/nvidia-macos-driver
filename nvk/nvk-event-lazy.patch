@@ -1,27 +1,37 @@
 diff --git a/src/nouveau/vulkan/nvkmd/nvrm/nvkmd_nvrm.h b/src/nouveau/vulkan/nvkmd/nvrm/nvkmd_nvrm.h
-index 27770bc..2be74b8 100644
+index 27770bc..1d612c0 100644
 --- a/src/nouveau/vulkan/nvkmd/nvrm/nvkmd_nvrm.h
 +++ b/src/nouveau/vulkan/nvkmd/nvrm/nvkmd_nvrm.h
-@@ -62,8 +62,18 @@ struct nvkmd_nvrm_dev {
+@@ -62,8 +62,28 @@ struct nvkmd_nvrm_dev {
      * multiplied RM's per-interrupt list walk. Waits sleep on osEvent (kext selector 6). -1 / 0 = none. */
     int osEvent;
     NvHandle hEvent;
-+   /* RM posts every graphics completion to every device's event, from every process: with ~40 processes holding a
-+    * Metal device that was ~48,000 posts a second at a quiet desktop and ~1,400 waits. So a device registers its
-+    * event only once it waits on the GPU often enough to sleep (nvkmd_nvrm_dev_event_fd); WindowServer, which
-+    * sleeps on it all the time, still registers at creation. eventState: 0 = not yet, 1 = osEvent valid, -1 = none.
-+    * eventWaits counts slow waits before the event exists; eventMtx serialises the one allocation. */
++   /* RM posts every graphics completion to every registered event, from every process: with ~40 processes holding
++    * a Metal device that was ~40,000-50,000 posts a second, against a few hundred waits. So outside WindowServer a
++    * device registers its event while it is waiting on the GPU and drops it once it has gone 2 s without (see
++    * nvkmd_nvrm_dev.c). eventState: 0 = none now, 1 = osEvent valid, -1 = never (NVRM_EVENT_WAIT=0 or RM refused).
++    * eventLock: waiters hold it shared while they use osEvent; registering and dropping hold it exclusive. */
 +   int eventState;
 +   uint32_t eventWaits;
-+   pthread_mutex_t eventMtx;
++   uint64_t eventLastUse;          // CLOCK_MONOTONIC ns of the last wait that used the event
++   bool eventKeep;                 // registered at creation and kept (WindowServer, NVRM_EVENT_WAIT=1)
++   pthread_rwlock_t eventLock;
++   pthread_mutex_t eventMtx;       // the idle thread's sleep and stop flag
++   pthread_cond_t eventCv;
++   pthread_t eventIdle;
++   bool eventIdleStarted, eventStopping;
  };
  
-+int nvkmd_nvrm_dev_event_fd(struct nvkmd_nvrm_dev *dev, bool count_wait);
++/* The device's event fd for one wait, or -1 (poll instead). On >= 0 the caller holds the event and must call
++ * nvkmd_nvrm_dev_event_put once the wait is over. count_wait: this is a new slow wait, which counts towards
++ * registering the event. */
++int nvkmd_nvrm_dev_event_get(struct nvkmd_nvrm_dev *dev, bool count_wait);
++void nvkmd_nvrm_dev_event_put(struct nvkmd_nvrm_dev *dev);
 +
  NVKMD_DECL_SUBCLASS(dev, nvrm);
  
  VkResult nvkmd_nvrm_create_dev(struct nvkmd_pdev *pdev,
-@@ -175,6 +185,7 @@ struct nvkmd_nvrm_exec_ctx {
+@@ -175,6 +195,7 @@ struct nvkmd_nvrm_exec_ctx {
     int osEvent;
     NvHandle hEvent;
     uint64_t wSeq;
@@ -30,34 +40,68 @@ index 27770bc..2be74b8 100644
     uint64_t gpPut;
     struct nv_push push;
 diff --git a/src/nouveau/vulkan/nvkmd/nvrm/nvkmd_nvrm_ctx.c b/src/nouveau/vulkan/nvkmd/nvrm/nvkmd_nvrm_ctx.c
-index e297f19..fb83f58 100644
+index e297f19..613134b 100644
 --- a/src/nouveau/vulkan/nvkmd/nvrm/nvkmd_nvrm_ctx.c
 +++ b/src/nouveau/vulkan/nvkmd/nvrm/nvkmd_nvrm_ctx.c
-@@ -206,6 +206,7 @@ static bool
- nvrm_evwait_pending(unsigned n, const uint32_t *slot, const uint32_t *gen, const uint64_t *want, int *fd)
+@@ -203,18 +203,19 @@ nvkmd_nvrm_wait_backoff(int64_t waited_ns)
+  * sleeps only while the count still equals it.  Bounded: 2 ms per sleep, so a missing event costs latency, never a hang.
+  * NVRM_EVENT_WAIT=0 = the polling control. */
+ static bool
+-nvrm_evwait_pending(unsigned n, const uint32_t *slot, const uint32_t *gen, const uint64_t *want, int *fd)
++nvrm_evwait_pending(unsigned n, const uint32_t *slot, const uint32_t *gen, const uint64_t *want,
++                    struct nvkmd_nvrm_dev **dev)
  {
     bool pending = false;
-+   struct nvkmd_nvrm_dev *dev = NULL;
-    *fd = -1;
+-   *fd = -1;
++   if (dev) *dev = NULL;
     pthread_mutex_lock(&nvkmd_nvrm_gsub_mtx);
     for (unsigned h = 0; h < n; h++) {
-@@ -213,10 +214,13 @@ nvrm_evwait_pending(unsigned n, const uint32_t *slot, const uint32_t *gen, const
+       const struct nvkmd_nvrm_slot *s = &nvkmd_nvrm_slots[slot[h]];
        if (s->ctx == NULL || s->gen != gen[h] || __atomic_load_n(s->sem, __ATOMIC_ACQUIRE) >= want[h])
           continue;
        pending = true;
 -      if (*fd < 0 && !s->ctx->ceOnly && s->dev != NULL && nvkmd_nvrm_dev(s->dev)->osEvent >= 0)
 -         *fd = nvkmd_nvrm_dev(s->dev)->osEvent;   /* b73: the device's one GRAPHICS event */
-+      if (dev == NULL && !s->ctx->ceOnly && s->dev != NULL)
-+         dev = nvkmd_nvrm_dev(s->dev);   /* b73: the device's one GRAPHICS event */
++      if (dev && *dev == NULL && !s->ctx->ceOnly && s->dev != NULL)
++         *dev = nvkmd_nvrm_dev(s->dev);   /* b73: the device's one GRAPHICS event */
     }
     pthread_mutex_unlock(&nvkmd_nvrm_gsub_mtx);
-+   /* outside the slot lock: registering the event is an RM call */
-+   if (dev != NULL)
-+      *fd = nvkmd_nvrm_dev_event_fd(dev, true);
     return pending;
+@@ -235,24 +236,28 @@ nvkmd_nvrm_wait_block(int64_t waited_ns, unsigned n, const uint32_t *slot, const
+       nvkmd_nvrm_wait_backoff(waited_ns);
+       return;
+    }
+-   int fd;
+-   if (!nvrm_evwait_pending(n, slot, gen, want, &fd))
++   struct nvkmd_nvrm_dev *dev;
++   if (!nvrm_evwait_pending(n, slot, gen, want, &dev))
+       return;   /* it just finished: the caller re-checks at once */
++   /* outside the slot lock: registering the event is an RM call. This path is WindowServer's (or
++    * NVRM_EVENT_WAIT=1), whose event is kept, so each call is a new wait only in name. */
++   const int fd = dev != NULL ? nvkmd_nvrm_dev_event_get(dev, true) : -1;
+    if (fd < 0) {
+       nvkmd_nvrm_wait_backoff(waited_ns);   /* copy-engine only: no graphics event to sleep on */
+       return;
+    }
+    const int64_t seen = nvrm_xnu_wait_event(fd, 0, 0);   /* the count BEFORE the re-check */
+    if (seen < 0) {
++      nvkmd_nvrm_dev_event_put(dev);
+       if (on) fprintf(stderr, "nvrm: event wait OFF (the kext has no selector 6) - polling\n");
+       on = 0;
+       nvkmd_nvrm_wait_backoff(waited_ns);
+       return;
+    }
+    { static int said; if (!said++ && nvkmd_nvrm_diag_on()) fprintf(stderr, "nvrm: event wait ON - waits sleep on graphics completion events (fd %d)\n", fd); }
+-   if (!nvrm_evwait_pending(n, slot, gen, want, &fd) || fd < 0)
+-      return;
+-   (void)nvrm_xnu_wait_event(fd, (uint32_t)seen, 2000);
++   if (nvrm_evwait_pending(n, slot, gen, want, NULL))
++      (void)nvrm_xnu_wait_event(fd, (uint32_t)seen, 2000);
++   nvkmd_nvrm_dev_event_put(dev);
  }
- void
-@@ -265,7 +269,10 @@ nvrm_flush_sleep(struct nvkmd_nvrm_exec_ctx *ctx, const volatile uint64_t *sem,
+ 
+ /* b73 (patch_evflush.py): the synchronous flush's sleep. true = slept on the device's graphics completion event, or
+@@ -265,18 +270,24 @@ nvrm_flush_sleep(struct nvkmd_nvrm_exec_ctx *ctx, const volatile uint64_t *sem,
     if (on < 0) { const char *e = nvmtl_cfg_getenv("NVRM_EVENT_WAIT"); on = !(e && e[0] == '0'); }
     if (!on || ctx->ceOnly || ctx->base.dev == NULL)
        return false;
@@ -65,27 +109,56 @@ index e297f19..fb83f58 100644
 +   /* each slow flush counts once towards registering the device's event, not each pass of the flush loop */
 +   const bool first = ctx->evWaitSeq != want;
 +   ctx->evWaitSeq = want;
-+   const int fd = nvkmd_nvrm_dev_event_fd(nvkmd_nvrm_dev(ctx->base.dev), first);
++   struct nvkmd_nvrm_dev *dev = nvkmd_nvrm_dev(ctx->base.dev);
++   const int fd = nvkmd_nvrm_dev_event_get(dev, first);
     if (fd < 0)
        return false;
     const int64_t seen = nvrm_xnu_wait_event(fd, 0, 0);   /* the count BEFORE the re-check */
+    if (seen < 0) {
++      nvkmd_nvrm_dev_event_put(dev);
+       on = 0;
+       return false;
+    }
+-   if (__atomic_load_n(sem, __ATOMIC_ACQUIRE) >= want)
+-      return true;
+-   { static int said; if (!said++ && nvkmd_nvrm_diag_on()) fprintf(stderr, "nvrm: flush waits sleep on the device's graphics event (fd %d)\n", fd); }
+-   (void)nvrm_xnu_wait_event(fd, (uint32_t)seen, 2000);
++   if (__atomic_load_n(sem, __ATOMIC_ACQUIRE) < want) {
++      { static int said; if (!said++ && nvkmd_nvrm_diag_on()) fprintf(stderr, "nvrm: flush waits sleep on the device's graphics event (fd %d)\n", fd); }
++      (void)nvrm_xnu_wait_event(fd, (uint32_t)seen, 2000);
++   }
++   nvkmd_nvrm_dev_event_put(dev);
+    return true;
+ }
+ 
 diff --git a/src/nouveau/vulkan/nvkmd/nvrm/nvkmd_nvrm_dev.c b/src/nouveau/vulkan/nvkmd/nvrm/nvkmd_nvrm_dev.c
-index 2db6f55..80b4b7b 100644
+index 2db6f55..1e2d658 100644
 --- a/src/nouveau/vulkan/nvkmd/nvrm/nvkmd_nvrm_dev.c
 +++ b/src/nouveau/vulkan/nvkmd/nvrm/nvkmd_nvrm_dev.c
-@@ -16,6 +16,80 @@
+@@ -16,6 +16,166 @@
  #include "ctrl/ctrl2080/ctrl2080tmr.h"
  #include "class/cl0005.h" // NV01_EVENT (b73 device event)
  #include "class/cl2080_notification.h" // NV2080_NOTIFIERS_GRAPHICS
 +#include "../../nvmtl_cfg.h"
++#include <time.h>
 +
-+/* Slow waits (past the 20 us spin) a device without its event polls through before it registers one. A process
-+ * that waits on the GPU now and then keeps polling, as every process did before b73; one that waits all the time
-+ * registers after its first few dozen waits. */
-+#define NVRM_EVENT_LAZY_WAITS 32
++/* Slow waits (past the 20 us spin) a device without its event polls through before it registers one, and how long
++ * the event then stays unused before it is dropped. RM posts every graphics completion to every registered event,
++ * so an idle process that kept its event made every other process's completions cost one more post; the polling
++ * those few waits pay instead is what every process did before b73. */
++#define NVRM_EVENT_LAZY_WAITS 16
++#define NVRM_EVENT_IDLE_NS    (2000ull * 1000 * 1000)
 +
-+/* 1 = register the event when the device is made, 0 = on demand, -1 = never. NVRM_EVENT_WAIT=0 turns every event
-+ * sleep off, so no event is needed; NVRM_EVENT_WAIT=1 makes every process sleep like WindowServer. */
++static uint64_t
++nvrm_now_ns(void)
++{
++   struct timespec t;
++   clock_gettime(CLOCK_MONOTONIC, &t);
++   return (uint64_t)t.tv_sec * 1000000000ull + (uint64_t)t.tv_nsec;
++}
++
++/* 1 = register the event when the device is made and keep it, 0 = while in use, -1 = never. NVRM_EVENT_WAIT=0 turns
++ * every event sleep off, so no event is needed; NVRM_EVENT_WAIT=1 makes every process sleep like WindowServer. */
 +static int
 +nvrm_event_policy(void)
 +{
@@ -131,30 +204,105 @@ index 2db6f55..80b4b7b 100644
 +   return true;
 +}
 +
-+/* The device's event fd, or -1 while it has none. count_wait: the caller is about to poll a slow wait it could
-+ * sleep through; the NVRM_EVENT_LAZY_WAITS-th such wait registers the event. */
-+int
-+nvkmd_nvrm_dev_event_fd(struct nvkmd_nvrm_dev *dev, bool count_wait)
++static void
++nvrm_dev_event_free(struct nvkmd_nvrm_dev *dev)
 +{
-+   const int st = __atomic_load_n(&dev->eventState, __ATOMIC_ACQUIRE);
-+   if (st != 0)
-+      return st > 0 ? dev->osEvent : -1;
-+   if (!count_wait || __atomic_add_fetch(&dev->eventWaits, 1, __ATOMIC_RELAXED) < NVRM_EVENT_LAZY_WAITS)
-+      return -1;
++   if (dev->hEvent != 0) {
++      struct NvRmApi rm;
++      nvkmd_nvrm_dev_api_ctl(nvkmd_nvrm_pdev(dev->base.pdev), &rm);
++      nvRmApiFree(&rm, dev->hEvent);
++      dev->hEvent = 0;
++   }
++   if (dev->osEvent >= 0)
++      NVRM_CLOSE(dev->osEvent);
++   dev->osEvent = -1;
++}
++
++/* Runs while a device that does not keep its event has one: drops it after NVRM_EVENT_IDLE_NS without a wait, then
++ * ends. The next slow waits register it again and start a new one. */
++static void *
++nvrm_dev_event_idle(void *arg)
++{
++   struct nvkmd_nvrm_dev *dev = arg;
 +   pthread_mutex_lock(&dev->eventMtx);
-+   if (__atomic_load_n(&dev->eventState, __ATOMIC_RELAXED) == 0) {
-+      const bool ok = nvrm_dev_event_alloc(dev);
-+      if (ok && nvkmd_nvrm_diag_on())
-+         fprintf(stderr, "nvrm: device event registered after %u slow waits\n", (unsigned)NVRM_EVENT_LAZY_WAITS);
-+      __atomic_store_n(&dev->eventState, ok ? 1 : -1, __ATOMIC_RELEASE);
++   while (!dev->eventStopping) {
++      struct timespec until;
++      clock_gettime(CLOCK_REALTIME, &until);
++      until.tv_sec += 1;
++      pthread_cond_timedwait(&dev->eventCv, &dev->eventMtx, &until);
++      if (dev->eventStopping)
++         break;
++      if (nvrm_now_ns() - __atomic_load_n(&dev->eventLastUse, __ATOMIC_RELAXED) < NVRM_EVENT_IDLE_NS)
++         continue;
++      if (pthread_rwlock_trywrlock(&dev->eventLock) != 0)
++         continue;   // a wait is using it right now
++      nvrm_dev_event_free(dev);
++      __atomic_store_n(&dev->eventWaits, 0, __ATOMIC_RELAXED);
++      __atomic_store_n(&dev->eventState, 0, __ATOMIC_RELEASE);
++      pthread_rwlock_unlock(&dev->eventLock);
++      break;
 +   }
 +   pthread_mutex_unlock(&dev->eventMtx);
-+   return __atomic_load_n(&dev->eventState, __ATOMIC_ACQUIRE) > 0 ? dev->osEvent : -1;
++   return NULL;
++}
++
++int
++nvkmd_nvrm_dev_event_get(struct nvkmd_nvrm_dev *dev, bool count_wait)
++{
++   if (__atomic_load_n(&dev->eventState, __ATOMIC_ACQUIRE) < 0)
++      return -1;
++   pthread_rwlock_rdlock(&dev->eventLock);
++   if (dev->eventState > 0) {
++      if (!dev->eventKeep)
++         __atomic_store_n(&dev->eventLastUse, nvrm_now_ns(), __ATOMIC_RELAXED);
++      return dev->osEvent;
++   }
++   pthread_rwlock_unlock(&dev->eventLock);
++   if (!count_wait || __atomic_add_fetch(&dev->eventWaits, 1, __ATOMIC_RELAXED) < NVRM_EVENT_LAZY_WAITS)
++      return -1;
++
++   pthread_rwlock_wrlock(&dev->eventLock);
++   if (dev->eventState == 0) {
++      const bool ok = nvrm_dev_event_alloc(dev);
++      __atomic_store_n(&dev->eventLastUse, nvrm_now_ns(), __ATOMIC_RELAXED);
++      if (ok) {
++         /* the previous idle thread has dropped the event and ended (or is ending): collect it first */
++         pthread_mutex_lock(&dev->eventMtx);
++         const bool joinOld = dev->eventIdleStarted;
++         dev->eventIdleStarted = false;
++         pthread_mutex_unlock(&dev->eventMtx);
++         if (joinOld)
++            pthread_join(dev->eventIdle, NULL);
++         pthread_mutex_lock(&dev->eventMtx);
++         dev->eventIdleStarted = !dev->eventStopping &&
++                                 pthread_create(&dev->eventIdle, NULL, nvrm_dev_event_idle, dev) == 0;
++         pthread_mutex_unlock(&dev->eventMtx);
++         if (!dev->eventIdleStarted) {
++            nvrm_dev_event_free(dev);   // nothing would drop it: stay with polling
++            __atomic_store_n(&dev->eventState, -1, __ATOMIC_RELEASE);
++         } else {
++            __atomic_store_n(&dev->eventState, 1, __ATOMIC_RELEASE);
++         }
++      } else {
++         __atomic_store_n(&dev->eventState, -1, __ATOMIC_RELEASE);
++      }
++      if (nvkmd_nvrm_diag_on())
++         fprintf(stderr, "nvrm: device event %s after %u slow waits\n", dev->eventState > 0 ? "registered" : "NOT registered",
++                 (unsigned)NVRM_EVENT_LAZY_WAITS);
++   }
++   pthread_rwlock_unlock(&dev->eventLock);
++   return nvkmd_nvrm_dev_event_get(dev, false);
++}
++
++void
++nvkmd_nvrm_dev_event_put(struct nvkmd_nvrm_dev *dev)
++{
++   pthread_rwlock_unlock(&dev->eventLock);
 +}
  
  VkResult
  nvkmd_nvrm_create_dev(struct nvkmd_pdev *_pdev,
-@@ -42,33 +116,13 @@ nvkmd_nvrm_create_dev(struct nvkmd_pdev *_pdev,
+@@ -42,33 +202,15 @@ nvkmd_nvrm_create_dev(struct nvkmd_pdev *_pdev,
        return vk_error(log_obj, VK_ERROR_OUT_OF_HOST_MEMORY);
     }
  
@@ -185,19 +333,39 @@ index 2db6f55..80b4b7b 100644
 -            dev->hEvent = 0;
 -         }
 -      }
++   pthread_rwlock_init(&dev->eventLock, NULL);
 +   pthread_mutex_init(&dev->eventMtx, NULL);
++   pthread_cond_init(&dev->eventCv, NULL);
 +   switch (nvrm_event_policy()) {
-+   case 1:  dev->eventState = nvrm_dev_event_alloc(dev) ? 1 : -1; break;
++   case 1:  dev->eventKeep = true; dev->eventState = nvrm_dev_event_alloc(dev) ? 1 : -1; break;
 +   case -1: dev->eventState = -1; break;
-+   default: dev->eventState = 0; break;   // registered by nvkmd_nvrm_dev_event_fd once the device waits often
++   default: dev->eventState = 0; break;   // registered by nvkmd_nvrm_dev_event_get while the device waits
     }
  
     *dev_out = &dev->base;
-@@ -92,6 +146,7 @@ nvkmd_nvrm_dev_destroy(struct nvkmd_dev *_dev)
-    }
-    if (dev->osEvent >= 0)
-       NVRM_CLOSE(dev->osEvent);
+@@ -85,13 +227,18 @@ nvkmd_nvrm_dev_destroy(struct nvkmd_dev *_dev)
+    if (dev->mappings != NULL)
+       _mesa_hash_table_destroy(dev->mappings, NULL);
+ 
+-   if (dev->hEvent != 0) {   /* b73 device event */
+-      struct NvRmApi rm;
+-      nvkmd_nvrm_dev_api_ctl(pdev, &rm);
+-      nvRmApiFree(&rm, dev->hEvent);
+-   }
+-   if (dev->osEvent >= 0)
+-      NVRM_CLOSE(dev->osEvent);
++   pthread_mutex_lock(&dev->eventMtx);
++   dev->eventStopping = true;
++   pthread_cond_broadcast(&dev->eventCv);
++   const bool joinIdle = dev->eventIdleStarted;
++   dev->eventIdleStarted = false;
++   pthread_mutex_unlock(&dev->eventMtx);
++   if (joinIdle)
++      pthread_join(dev->eventIdle, NULL);
++   nvrm_dev_event_free(dev);   /* b73 device event, if it is registered */
++   pthread_cond_destroy(&dev->eventCv);
 +   pthread_mutex_destroy(&dev->eventMtx);
++   pthread_rwlock_destroy(&dev->eventLock);
  
     FREE(dev);
  }
