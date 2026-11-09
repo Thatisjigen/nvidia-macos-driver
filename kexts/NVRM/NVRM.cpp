@@ -471,6 +471,9 @@ private:
     static IOReturn sForgetToken(OSObject *target, void *reference, IOExternalMethodArguments *args);
 public:
     volatile UInt32 fEvtSeq = 0;
+    // Callers parked in sWaitEvent on this connection. RM posts every graphics completion to every process's event,
+    // and almost none has a caller parked, so nv_post_event wakes only connections that have one.
+    volatile SInt32 fEvtSleepers = 0;
     UInt32 fEvtMagic = 0x4e564556u;
     static NVRMUserClient *fromNvfp(nv_file_private_t *p);
     int  pid() const { return fPid; }
@@ -3130,7 +3133,14 @@ extern "C" void NV_API_CALL nv_post_event(nv_event_t *event, NvHandle hEvent, Nv
 {
     const SInt64 k = OSIncrementAtomic64(&gNvEvtPosts);
     NVRMUserClient *c = event ? NVRMUserClient::fromNvfp(event->nvfp) : NULL;
-    if (c) { OSIncrementAtomic64(&gNvEvtMatched); OSIncrementAtomic((volatile SInt32 *)&c->fEvtSeq); thread_wakeup((event_t)&c->fEvtSeq); }
+    if (c) {
+        OSIncrementAtomic64(&gNvEvtMatched);
+        // The sequence is raised before the sleeper count is read, and sWaitEvent counts itself before it re-reads
+        // the sequence (both are locked operations): either this sees the sleeper, or the sleeper sees the new
+        // sequence and does not park. A wakeup skipped here is one nobody was waiting for.
+        OSIncrementAtomic((volatile SInt32 *)&c->fEvtSeq);
+        if (OSAddAtomic(0, &c->fEvtSleepers) > 0) thread_wakeup((event_t)&c->fEvtSeq);
+    }
     if (k == 999 || k == 99999 || k == 999999)
         OSReportWithBacktrace("NVRM-xnu: post #%lld caller chain (nv_post_event at %p, isr-thread %d)", (long long)k + 1,
                               (void *)&nv_post_event, current_thread() == nv_xnu_isr_thread);
@@ -3154,10 +3164,12 @@ IOReturn NVRMUserClient::sWaitEvent(OSObject *target, void *reference, IOExterna
             // result it could not already have seen.
             OSDecrementAtomic(&gNvEvtSleepers);
         } else {
+            OSIncrementAtomic(&me->fEvtSleepers);   // before the re-check below; see nv_post_event
             assert_wait_timeout((event_t)&me->fEvtSeq, THREAD_ABORTSAFE, (uint32_t)us, NSEC_PER_USEC);
             if (me->fEvtSeq != seen) thread_wakeup((event_t)&me->fEvtSeq);
             OSIncrementAtomic64(&gNvEvtSlept);
             (void)thread_block(THREAD_CONTINUE_NULL);
+            OSDecrementAtomic(&me->fEvtSleepers);
             OSDecrementAtomic(&gNvEvtSleepers);
         }
     }
