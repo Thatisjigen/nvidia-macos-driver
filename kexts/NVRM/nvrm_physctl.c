@@ -64,10 +64,10 @@ NV_STATUS rm_nvgfx_phys_control(nv_state_t *nv, NvU32 mode, NvU32 hClient, NvU32
 
 void rm_nvgfx_smc_api(struct NVRMSmcApi *api);
 
-/* What this build's RM looks like to SMCNvidiaGPU, from the compiler. NVRM.cpp adds the sleep gate, which is its own. */
+/* What this build's RM looks like to SMCNvidiaGPU, from the compiler. Writes nothing past usdData, which every caller has
+ * room for. NVRM.cpp adds what is its own: the sleep gate, the size, which depends on the caller's, and the kext's range. */
 void rm_nvgfx_smc_api(struct NVRMSmcApi *api)
 {
-    api->size = sizeof *api;
     api->gpumgrGetGpu = (void *)gpumgrGetGpu;
     api->createRusd = (void *)gpuCreateRusdMemory_IMPL;
     api->linkRusd = (void *)gpuRusdInitPhysical_KERNEL;

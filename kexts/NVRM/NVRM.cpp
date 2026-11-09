@@ -2625,17 +2625,45 @@ OSDefineMetaClassAndStructors(IOAccelNVRMBridge, NVRMUserClient)
 
 extern "C" void rm_nvgfx_smc_api(struct NVRMSmcApi *api);
 
+// Where the kernel loaded this kext, so that the caller can check the entry points it was handed before it calls any.
+// kmod_info's range is what the kernel compares a code address with; what it spans depends on how the kext was linked
+// into its collection, so it is stated only if the entry points do lie in it here. Otherwise the two fields stay 0,
+// which the caller reads as not stated.
+static void nvrm_smc_api_range(NVRMSmcApi *api)
+{
+    const unsigned long long start = kmod_info.address, size = kmod_info.size;
+    void *const entry[] = { api->gpumgrGetGpu, api->createRusd, api->linkRusd, api->lock, api->unlock,
+                            api->gpuLock,      api->gpuUnlock,  api->pmEnter,  api->pmExit };
+    api->kextStart = api->kextSize = 0;
+    for (void *e : entry) {
+        const unsigned long long a = (unsigned long long)e;
+        if (a < start || a - start >= size) {
+            static bool said;
+            if (!said) { said = true; LOG("smc api: an entry point is outside kmod_info's range, range not stated"); }
+            return;
+        }
+    }
+    api->kextStart = start;
+    api->kextSize = size;
+}
+
 IOReturn NVRM::callPlatformFunction(const OSSymbol *fn, bool wait, void *p1, void *p2, void *p3, void *p4)
 {
     if (fn && fn->isEqualTo(NVRM_SMC_API_FN)) {
         NVRMSmcApi *api = (NVRMSmcApi *)p1;
         if (!api || api->version != NVRM_SMC_API_VERSION) return kIOReturnBadArgument;
-        // size is an output, and from now on also an input: a caller that states its buffer's size gets it checked
-        // before the struct is filled; one that leaves it 0 is served as before.
-        if (api->size != 0 && api->size != sizeof(*api)) return kIOReturnBadArgument;
+        // size is how much of the struct the caller has; 0 comes from a caller that predates the rule, whose struct
+        // ends where kextStart begins. Nothing is written past it, and what is reported back is how much was filled.
+        const unsigned int room = api->size ? api->size : NVRM_SMC_API_SIZE_V1;
+        if (room < NVRM_SMC_API_SIZE_V1) return kIOReturnBadArgument;
         rm_nvgfx_smc_api(api);
         api->pmEnter = (void *)nv_xnu_pm_enter;
         api->pmExit = (void *)nv_xnu_pm_exit;
+        api->size = NVRM_SMC_API_SIZE_V1;
+        if (room >= sizeof(*api)) {
+            nvrm_smc_api_range(api);
+            api->size = sizeof(*api);
+        }
         return kIOReturnSuccess;
     }
     if (fn && fn->isEqualTo(NVRM_UTILIZATION_FN)) {
