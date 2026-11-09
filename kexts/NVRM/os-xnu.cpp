@@ -358,7 +358,13 @@ static inline void nv_xnu_map_publish(nv_xnu_map *m, IOMemoryDescriptor *md, IOM
 void *NV_API_CALL os_map_kernel_space(NvU64 start, NvU64 size, NvU32 mode)
 {
     IOOptionBits cache = (mode == NV_MEMORY_CACHED) ? kIOMapDefaultCache : (mode == NV_MEMORY_WRITECOMBINED ? kIOMapWriteCombineCache : kIOMapInhibitCache);
-    kprintf("NVRM-xnu: >os_map_kernel_space start=0x%llx size=0x%llx mode=%u\n", start, size, mode);
+    // RM maps and unmaps the same few BAR ranges dozens of times a second while the desktop runs; two lines per map
+    // filled the kernel message buffer in seconds and pushed out everything a report needs. The first maps and every
+    // 4096th are still traced; failures always are.
+    static volatile SInt32 nTraced;
+    const SInt32 seq = OSIncrementAtomic(&nTraced);
+    const bool trace = seq < 64 || (seq & 0xFFF) == 0;
+    if (trace) kprintf("NVRM-xnu: >os_map_kernel_space #%d start=0x%llx size=0x%llx mode=%u\n", (int)seq + 1, start, size, mode);
     if (!nv_pm_is_gpu(start, size)) {
         void *cookie = NULL; void *ava = nv_pm_alias(start, size, &cookie);
         if (ava) {
@@ -385,8 +391,9 @@ void *NV_API_CALL os_map_kernel_space(NvU64 start, NvU64 size, NvU32 mode)
         if ((unsigned)i + 1 > nv_xnu_maps_high) nv_xnu_maps_high = (unsigned)i + 1;
         const unsigned high = nv_xnu_maps_high;
         IOLockUnlock(nv_xnu_maps_lock);
-        kprintf("NVRM-xnu:   mapped -> 0x%llx (slot %d, high water %u/%u)\n",
-                (unsigned long long)(uintptr_t)va, i, high, (unsigned)NV_XNU_MAX_MAPS);
+        if (trace)
+            kprintf("NVRM-xnu:   mapped -> 0x%llx (slot %d, high water %u/%u)\n",
+                    (unsigned long long)(uintptr_t)va, i, high, (unsigned)NV_XNU_MAX_MAPS);
         return va;
     }
     IOLockUnlock(nv_xnu_maps_lock);
