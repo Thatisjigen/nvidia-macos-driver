@@ -81,7 +81,7 @@ is `plugin/nvconv.metal`.
 
 | Setting | Value | Why |
 |---|---|---|
-| `NVRAM > Add > 7C436110-…-FE41995C9F82 > boot-args` | `nvfb=1 nvaccel=1 nvfbheads=4 -nvkmsnosmooth amfi_get_out_of_my_way=0x1 amfi=0x80 ipc_control_port_options=0` | turns on the framebuffer and accelerator, 4 display heads; the AMFI arguments let WindowServer load the driver bundle |
+| `NVRAM > Add > 7C436110-…-FE41995C9F82 > boot-args` | `amfi_get_out_of_my_way=0x1 amfi=0x80 ipc_control_port_options=0` | the AMFI arguments let WindowServer load the driver bundle; the framebuffer, the accelerator and 4 display heads are on by default (`nvfb=0`, `nvaccel=0`, `nvfbheads=N` change that) |
 | `NVRAM > Add > … > csr-active-config` | `<430A0000>` | the SIP value the driver was tested with (its kexts are not Apple-signed) |
 | `Misc > Security > SecureBootModel` | `Disabled` | Apple Secure Boot refuses kexts Apple did not sign |
 | `UEFI > Quirks > ResizeGpuBars` | `13` | 8 GB BAR1 for full memory bandwidth; NVRM then moves BAR1 away from the boot screen (tested on the RTX 5060) |

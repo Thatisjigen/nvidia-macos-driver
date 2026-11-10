@@ -48,8 +48,9 @@ NVAccel the accelerator WindowServer composites through, NVRMAGDC the display-po
 Use the 1401 Mac app below unless you manage your OpenCore config yourself. `install.sh` installs the driver files but
 does not change OpenCore, and the driver does not start until OpenCore has these settings:
 
-- `boot-args` include `nvfb=1 nvaccel=1 nvfbheads=4 -nvkmsnosmooth amfi_get_out_of_my_way=0x1 amfi=0x80
-  ipc_control_port_options=0`, and not `nv_disable=1` or `-wegnoegpu` (both hide the NVIDIA card)
+- `boot-args` include `amfi_get_out_of_my_way=0x1 amfi=0x80 ipc_control_port_options=0`, and not `nv_disable=1` or
+  `-wegnoegpu` (both hide the NVIDIA card). The framebuffer, the accelerator, four display heads and the plain
+  takeover need no argument any more: they are the driver's defaults
 - `csr-active-config` includes the bits `0x0A43`
 - `Misc > Security > SecureBootModel` is `Disabled`
 - `Lilu.kext` and `AMFIPass.kext` are in `Kernel > Add` and enabled
@@ -97,12 +98,16 @@ them from `EFI/OC/Kexts`. OpenCore only needs to set SIP and boot-args.
 | Key | Value | Why |
 |---|---|---|
 | `csr-active-config` | `<430A0000>` (Data) | the tested value: unsigned kexts, plus what root patches need |
-| `boot-args` | `nvfb=1 nvaccel=1 nvfbheads=4 -nvkmsnosmooth amfi_get_out_of_my_way=0x1 amfi=0x80 ipc_control_port_options=0` | framebuffer + accelerator, 4 display heads; the AMFI args let WindowServer load the driver bundle |
+| `boot-args` | `amfi_get_out_of_my_way=0x1 amfi=0x80 ipc_control_port_options=0` | the AMFI args let WindowServer load the driver bundle; framebuffer, accelerator and 4 display heads are on by default |
 
 Optional boot arguments, for troubleshooting:
 
 | boot-arg | Effect |
 |---|---|
+| `nvfb=0`, `nvaccel=0` | the framebuffer or the accelerator does not start. Both are on by default; `-nvoff` and the start counter are what recovers a start that cannot light a display. |
+| `nvfbheads=N` | publishes N display heads instead of four. |
+| `nvkmssmooth=1` | tells NVKMS which head the firmware left scanning out, so it can take that raster over. Off by default, as every install ran with `-nvkmsnosmooth`. |
+| `nvrmtgp=0` | leaves a laptop GPU at its VBIOS power limit on AC: the power-budget manager does not run. It is on by default here (upstream: only with `nvrmtgp=1`); `debug.nvrm_tgp_enable=0` holds the VBIOS limit at run time. Giving `nvrmtgp=1` adds one thing: the resource manager's notebook question is then also answered from ACPI (the NVPCF device or a control-method battery), for a laptop whose battery macOS does not publish. The GPS and NVPCF `_DSM` calls stay behind `nvrmgps=1` and `nvrmnvpcf=1`. |
 | `-nvrmnoflip` | keeps the composited frame on the copy path: NVRM never turns on zero-copy scan-out (`debug.nvaccel_iop_flip`), so the display reads a finished copy instead of the surface the GPU may still be drawing. Try it first when the desktop flashes or tears while the cursor moves. |
 | `-nvrmnogo` | the driver idles until `nvrmctl go <pass>` instead of starting the GPU itself. |
 | `-nvrmnobootscreen` | do not snapshot the boot screen. |

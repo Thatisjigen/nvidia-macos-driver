@@ -116,8 +116,8 @@ static void nvrm_display_publish(IOService *provider, NvU32 gpuId)
     if (gPublished) return;
     void *kapi = nvkms_xnu_kapi_table();
     if (!kapi) { kprintf("NVRM-xnu: no NVKMS kapi table, no display nub\n"); return; }
-    int want = 1;
-    if (!PE_parse_boot_argn("nvfbheads", &want, sizeof want) || want < 1) want = 1;
+    int want = NVRM_MAX_HEADS;   // every head unless nvfbheads=N asks for fewer
+    if (PE_parse_boot_argn("nvfbheads", &want, sizeof want) && want < 1) want = 1;
     if (want > NVRM_MAX_HEADS) want = NVRM_MAX_HEADS;
     unsigned made = 0;
     for (int i = 0; i < want; i++) {
@@ -960,8 +960,10 @@ void NVRM::snapshotBootScreen()
 static int gSmoothHead = -1; static uint32_t gSmoothPclk = 0, gSmoothHt = 0, gSmoothVt = 0;
 extern "C" int nvrm_xnu_smooth_takeover(NvU32 *head, NvU32 *pclkHz, NvU32 *htotal, NvU32 *vtotal)
 {
-    char nb[8] = { 0 };
-    if (PE_parse_boot_argn("-nvkmsnosmooth", nb, sizeof(nb))) { kprintf("NVRM-xnu: smooth takeover OFF (-nvkmsnosmooth)\n"); return 0; }
+    // Off unless nvkmssmooth=1: the install's own arguments always carried -nvkmsnosmooth, so off is the tested path.
+    int smooth = 0; char nb[8] = { 0 };
+    PE_parse_boot_argn("nvkmssmooth", &smooth, sizeof smooth);
+    if (!smooth || PE_parse_boot_argn("-nvkmsnosmooth", nb, sizeof(nb))) { kprintf("NVRM-xnu: smooth takeover OFF (no nvkmssmooth=1)\n"); return 0; }
     if (gSmoothHead < 0 || !head || !pclkHz || !htotal || !vtotal) return 0;
     *head = (NvU32)gSmoothHead; *pclkHz = gSmoothPclk; *htotal = gSmoothHt; *vtotal = gSmoothVt;
     return 1;
@@ -1145,7 +1147,7 @@ void NVRM::autoGo(void *p0, wait_result_t)
         s->releaseBootHold("go(2) failed");
     } else {
         s->setProperty("nvrm-autogo", "up");
-        int want = 1; if (!PE_parse_boot_argn("nvfbheads", &want, sizeof(want)) || want < 1) want = 1;
+        int want = NVRM_MAX_HEADS; if (PE_parse_boot_argn("nvfbheads", &want, sizeof(want)) && want < 1) want = 1;
         // Hybrid laptops (boot-arg nmhybrid 1 or 2): the panel is another GPU's framebuffer, published as head 4 of this
         // accelerator. Arming before it exists leaves it without a pipe until a second write and a WindowServer restart,
         // so wait for it, bounded by the same 20 s as the NVIDIA heads.
@@ -1962,7 +1964,7 @@ IOReturn NVRM::go(uint32_t pass)
         }
         publishGpuProfile();
         if (nvkms_xnu_load()) nvrm_display_publish(this, fNv.gpu_id);
-        nvrm_power_start(&fNv);   // boot-arg nvrmtgp=1: the notebook power budget while on mains power (nvrm_power.cpp)
+        nvrm_power_start(&fNv);   // the notebook power budget while on mains power, unless nvrmtgp=0 (nvrm_power.cpp)
     }
     return kIOReturnSuccess;
 }
