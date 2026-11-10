@@ -3283,7 +3283,23 @@ bool NVRMNVDAFramebuffer::start(IOService *provider)
     setProperty("IOFBMemorySize", (unsigned long long)(8ull << 30), 64);
     IORecursiveLock *sl = startLock();
     if (!sl) { FBLOG("start lock alloc failed -- refusing to start"); return false; }
-    IORecursiveLockLock(sl); bool kapiOk = kapiInit();
+    IORecursiveLockLock(sl);
+    {   // output colour controls from the boot line (see gColorBpc); invalid values are ignored. Read before kapiInit(),
+        // whose publishTimingCaps() offers HDR10 only if gHdrOn is set by then, and under the start lock, so that no
+        // other instance publishes its range while this one is still reading.
+        static bool done; if (!done) { done = true;
+            UInt32 v = 0;
+            if (PE_parse_boot_argn("nvfbbpc", &v, sizeof v) && nvrmColorBpcValid(v)) gColorBpc = (int)v;
+            if (PE_parse_boot_argn("nvfbformat", &v, sizeof v) && nvrmColorFormatValid(v)) gColorFormat = (int)v;
+            if (PE_parse_boot_argn("nvfbrange", &v, sizeof v) && nvrmColorRangeValid(v)) gColorRange = (int)v;
+            if (PE_parse_boot_argn("nvfbvib", &v, sizeof v) && v <= 200) gVibrance = (int)v - 100;
+            gHdrOn = PE_parse_boot_argn("nvfbhdr", &v, sizeof v) && v;
+            gRotScale = PE_parse_boot_argn("nvfbrotscale", &v, sizeof v) && v;
+            gTenBit = PE_parse_boot_argn("nvfb10bit", &v, sizeof v) && v;
+            if (gHdrOn || gTenBit) FBLOG("%s%s", gTenBit ? "10-bit scanout on mode changes (nvfb10bit=1) " : "", gHdrOn ? "HDR10 advertised for PQ displays (nvfbhdr=1)" : "");
+            if (gColorBpc || gColorFormat != 3 || gColorRange || gVibrance)
+                FBLOG("colour controls: bpc %d format %d range %d vibrance %d", gColorBpc, gColorFormat, gColorRange, gVibrance); } }
+    bool kapiOk = kapiInit();
     if (!kapiOk && fOwnsHead) { gHeadsTaken &= ~(1u << fHead); fOwnsHead = false; }
     IORecursiveLockUnlock(sl);
     if (!kapiOk) {
@@ -3309,19 +3325,6 @@ bool NVRMNVDAFramebuffer::start(IOService *provider)
     }
     { char loc[12]; if (nvrmFbLocation(fIndex, loc, sizeof loc)) setLocation(loc); }   // distinct registry path per head
     if (fInternal) publishBacklight();   // before super::start(): IOFramebuffer::open looks for "backlight"
-    {   // output colour controls from the boot line (see gColorBpc); invalid values are ignored
-        static bool done; if (!done) { done = true;
-            UInt32 v = 0;
-            if (PE_parse_boot_argn("nvfbbpc", &v, sizeof v) && nvrmColorBpcValid(v)) gColorBpc = (int)v;
-            if (PE_parse_boot_argn("nvfbformat", &v, sizeof v) && nvrmColorFormatValid(v)) gColorFormat = (int)v;
-            if (PE_parse_boot_argn("nvfbrange", &v, sizeof v) && nvrmColorRangeValid(v)) gColorRange = (int)v;
-            if (PE_parse_boot_argn("nvfbvib", &v, sizeof v) && v <= 200) gVibrance = (int)v - 100;
-            gHdrOn = PE_parse_boot_argn("nvfbhdr", &v, sizeof v) && v;
-            gRotScale = PE_parse_boot_argn("nvfbrotscale", &v, sizeof v) && v;
-            gTenBit = PE_parse_boot_argn("nvfb10bit", &v, sizeof v) && v;
-            if (gHdrOn || gTenBit) FBLOG("%s%s", gTenBit ? "10-bit scanout on mode changes (nvfb10bit=1) " : "", gHdrOn ? "HDR10 advertised for PQ displays (nvfbhdr=1)" : "");
-            if (gColorBpc || gColorFormat != 3 || gColorRange || gVibrance)
-                FBLOG("colour controls: bpc %d format %d range %d vibrance %d", gColorBpc, gColorFormat, gColorRange, gVibrance); } }
     publishDdcBus();                     // before super::start() too: IOFramebuffer::open creates the I2C interface from it
     if (!super::start(provider)) {
         NVRMDisplayGate gate; if (gate.valid() && fOwnsHead) { gHeadsTaken &= ~(1u << fHead); fOwnsHead = false; }

@@ -16,6 +16,15 @@ for need in ['r.supportedDynamicRangeModes |= kIORangeDynamicRangeHDR10', 'if (g
              'mc.colorimetry = NVKMS_OUTPUT_COLORIMETRY_BT2100', 'mc.postcompColorPassthrough = NV_TRUE', 'mc.olut.enabled = NV_FALSE',
              'attribute == kIOFBHDRMetaDataAttribute', 'PE_parse_boot_argn("nvfbhdr"', 'PE_parse_boot_argn("nvfb10bit"']:
     assert need in fb, 'missing in NVRMFB: ' + need
+# The timing range is published from kapiInit() and offers HDR10 only if gHdrOn is set by then: start() has to read the
+# switch first, and under the start lock, or the first display to start never gets HDR10 in its range.
+def body(signature):
+    s = fb.index(signature)
+    return fb[s:fb.index('\n}\n', s)]
+start = body('bool NVRMNVDAFramebuffer::start(IOService *provider)')
+assert 'publishTimingCaps();' in body('bool NVRMNVDAFramebuffer::kapiInit()') and 'publishTimingCaps();' not in start
+assert start.index('IORecursiveLockLock(sl);') < start.index('gHdrOn = PE_parse_boot_argn("nvfbhdr"') < start.index('bool kapiOk = kapiInit();'), \
+    'nvfbhdr is read after kapiInit() published the timing range'
 for need in ['q.flags & NVRM_VRAM_SCANOUT_30BIT', 'nv_iop_convert_row(dp, sp, w, srcFmt, dst30)', 'fmt != NV_IOP_FMT_RGHA']:
     assert need in acc, 'missing in NVAccel: ' + need
 for a in ['NVRMFB', 'NVRM', 'NMIntelFB']:
