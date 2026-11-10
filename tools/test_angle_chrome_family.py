@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""The ANGLE Metal rule is on by default for Chrome and Chromium, and opt-in for everything else.
+"""The ANGLE Metal rule is on by default for the Chromium family and WebKit's GPU process, and opt-in for everything else.
 
 The constructor read the environment and the process name; lift it into a fixture with stubs so the
 matching and the NVMTL_ANGLE_METAL overrides are checked without a GPU or a browser.
@@ -88,6 +88,12 @@ int main(int argc, char **argv) {
     run("Safari", nullptr, nullptr, "");
     run("Slack Helper (Renderer)", nullptr, nullptr, "");
     run("QQ Helper", nullptr, nullptr, "");
+    // WebKit's separate GPU process uses ANGLE Metal too; do not match Safari/WebContent indiscriminately.
+    run("com.apple.WebKit.GPU", nullptr, nullptr, "disableMetalOnNvidia");
+    run("com.apple.WebKit.GPU", "0", "other", "other");
+    run("com.apple.WebKit.GPU", nullptr, "other", "other:disableMetalOnNvidia");
+    run("com.apple.WebKit.WebContent", nullptr, nullptr, "");
+    run("com.apple.WebKit.GPU.fake", nullptr, nullptr, "");
     // PR #404: Edge, Brave, Electron apps and Discord are on by default too.
     run("Microsoft Edge Helper (GPU)", nullptr, nullptr, "disableMetalOnNvidia");
     run("Brave Browser Helper", nullptr, nullptr, "disableMetalOnNvidia");
@@ -127,4 +133,4 @@ with tempfile.TemporaryDirectory() as tmp:
     assert result.returncode == 0, result.stderr
     assert result.stdout.strip() == "ok", result.stdout
 
-print("ok: ANGLE Chrome/Chromium/Edge/Brave/Electron/Discord matching, app-bundle framework check, loaded ANGLE libraries, opt-in for other apps, NVMTL_ANGLE_METAL overrides")
+print("ok: ANGLE Chrome/Chromium/Edge/Brave/Electron/Discord matching, WebKit GPU process by exact name, app-bundle framework check, loaded ANGLE libraries, opt-in for other apps, NVMTL_ANGLE_METAL overrides")

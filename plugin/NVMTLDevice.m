@@ -676,19 +676,24 @@ static bool nvmtl_angle_chrome_family(void)
     }
     return false;
 }
+// WebKit draws WebGL with ANGLE too, inside its GPU process, so the same refusal loses a WebGL context as soon as it is
+// created wherever that process can load this plugin and ANGLE picks the NVIDIA device. With an integrated GPU in the
+// machine as well, only the contexts that ask for low power survive, on that GPU. The process is matched by its exact
+// name: Safari itself and the web content processes do not run ANGLE and stay as they are.
 __attribute__((constructor)) static void nvmtl_angle_allow_nvidia(void)
 {
     const char *opt = getenv("NVMTL_ANGLE_METAL");
     if (opt && !strcmp(opt, "0")) return;
     const char *me = getprogname();
-    if (!(opt && !strcmp(opt, "1")) && !nvmtl_angle_chrome_family()) return;
+    const bool webkit = me && !strcmp(me, "com.apple.WebKit.GPU");
+    if (!(opt && !strcmp(opt, "1")) && !webkit && !nvmtl_angle_chrome_family()) return;
     const char *key = "ANGLE_FEATURE_OVERRIDES_DISABLED", *rule = "disableMetalOnNvidia";
     const char *cur = getenv(key);
     if (cur && strstr(cur, rule)) return;
     // One line per process, outside nvlog's release failure filter: a field report must show whether the rule was
     // active in this process.
     syslog(LOG_NOTICE, "NullMoth: angle: Metal allowed in %s (%s; NVMTL_ANGLE_METAL=0 disables)", me ? me : "?",
-           (opt && !strcmp(opt, "1")) ? "NVMTL_ANGLE_METAL=1" : "Chrome family");
+           (opt && !strcmp(opt, "1")) ? "NVMTL_ANGLE_METAL=1" : (webkit ? "WebKit GPU" : "Chrome family"));
     char v[1024];
     if (cur && *cur) snprintf(v, sizeof v, "%s:%s", cur, rule); else snprintf(v, sizeof v, "%s", rule);
     setenv(key, v, 1);
