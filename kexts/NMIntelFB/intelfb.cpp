@@ -790,7 +790,9 @@ IOService *NMIntelFB::probe(IOService *provider, SInt32 *score)
 static bool ifb_pci_ok(IOPCIDevice *pci, uint8_t *ver)
 {
     uint8_t &fVer = *ver;
-    if (PE_parse_boot_argn("-nmintelfboff", nullptr, 0)) { IFBLOG("off by boot-arg"); return false; }
+    // Off unless nmintelfb=1: where another driver lights the Intel panel, this one must not take it as well.
+    { uint32_t on = 0; PE_parse_boot_argn("nmintelfb", &on, sizeof on);
+      if (!on || PE_parse_boot_argn("-nmintelfboff", nullptr, 0)) { IFBLOG("off: no nmintelfb=1"); return false; } }
     // nmx-intel: "Start once without NVIDIA driver" (-nvoff) also leaves the panel to the firmware framebuffer, so a
     // hang never needs the Recovery; and with the AMD/Intel test driver on (nmxintel=1) i915 owns this GPU's display
     if (PE_parse_boot_argn("-nvoff", nullptr, 0)) { IFBLOG("off: -nvoff"); return false; }

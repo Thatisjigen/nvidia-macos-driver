@@ -108,6 +108,7 @@ Optional boot arguments, for troubleshooting:
 | `nvfbheads=N` | publishes N display heads instead of four. |
 | `nvkmssmooth=1` | tells NVKMS which head the firmware left scanning out, so it can take that raster over. Off by default, as every install ran with `-nvkmsnosmooth`. |
 | `nvrmtgp=0` | leaves a laptop GPU at its VBIOS power limit on AC: the power-budget manager does not run. It is on by default here (upstream: only with `nvrmtgp=1`); `debug.nvrm_tgp_enable=0` holds the VBIOS limit at run time. Giving `nvrmtgp=1` adds one thing: the resource manager's notebook question is then also answered from ACPI (the NVPCF device or a control-method battery), for a laptop whose battery macOS does not publish. The GPS and NVPCF `_DSM` calls stay behind `nvrmgps=1` and `nvrmnvpcf=1`. |
+| `nmintelfb=1` | lets NMIntelFB drive the Intel built-in panel. Off by default: here another driver lights that panel. |
 | `-nvrmnoflip` | keeps the composited frame on the copy path: NVRM never turns on zero-copy scan-out (`debug.nvaccel_iop_flip`), so the display reads a finished copy instead of the surface the GPU may still be drawing. Try it first when the desktop flashes or tears while the cursor moves. |
 | `-nvrmnogo` | the driver idles until `nvrmctl go <pass>` instead of starting the GPU itself. |
 | `-nvrmnobootscreen` | do not snapshot the boot screen. |
