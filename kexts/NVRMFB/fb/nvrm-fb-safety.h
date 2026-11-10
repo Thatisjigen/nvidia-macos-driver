@@ -217,6 +217,15 @@ static inline unsigned nvrmHdrLuminanceFromCode(unsigned code)
     v = v * frac[code % 32] / 1000;
     return v > 65535 ? 65535 : (unsigned)v;
 }
+// IOGraphics' colour-depth bits: the same values in a timing range (kIORangeBitsPerColorComponent*) and in a detailed timing
+// (kIOBitsPerColorComponent*).
+enum { kNvrmDepth8 = 0x2, kNvrmDepth10 = 0x4, kNvrmDepth12 = 0x8 };
+// macOS makes one timing per wire format it wants to try and drops, before it asks the driver, each format whose depth the
+// framebuffer's range does not list. It asks for HDR10 at 12 and at 10 bits, never at 8, so a range that offers HDR10 has to
+// list 10 bits or no HDR10 timing is ever made. With 10 bits listed it also tries every SDR timing at 10 bits before 8; only
+// an HDR10 mode has a 30-bit scanout here, so an SDR timing above 8 bits is refused and macOS installs the 8-bit one, as
+// it did while the range listed 8 bits alone.
+static inline bool nvrmTimingDepthOk(unsigned depth, bool hdr10) { return hdr10 || depth <= kNvrmDepth8; }
 // ---- Bounded waits ----
 // Try `tryFn()` until it succeeds or `totalMs` has passed, sleeping `stepMs` between tries. Returns whether it succeeded.
 // A WindowServer thread that waits forever on a lock someone else holds is killed by the watchdog after two minutes

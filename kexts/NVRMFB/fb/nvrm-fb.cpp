@@ -4071,6 +4071,7 @@ IOReturn NVRMNVDAFramebuffer::validateDetailedTiming(void *description, IOByteCo
     else if (d->scalerFlags & ~(UInt32)(kIOScaleStretchToFit | kIOScaleRotateFlags)) why = "unknown scaler flags";
     else if (d->horizontalBorderLeft | d->horizontalBorderRight | d->verticalBorderTop | d->verticalBorderBottom) why = "borders";
     else if (!d->pixelClock || !d->horizontalActive || !d->verticalActive) why = "empty timing";
+    else if (!nvrmTimingDepthOk(d->bitsPerColorComponent, d->dynamicRange == kIODynamicRangeHDR10)) why = "SDR above 8 bits per component";
     else if ((d->scalerFlags & kIOScaleRotateFlags) && !(d->horizontalScaled && d->verticalScaled)) why = "rotation without a desktop size";
     else if ((d->scalerFlags & kIOScaleRotateFlags) && fBootW && (d->horizontalActive < fBootW || d->verticalActive < fBootH))
         why = "rotated raster smaller than the boot raster";
@@ -4473,6 +4474,9 @@ IOReturn NVRMNVDAFramebuffer::setDetailedTimings(OSArray *array)
     publishStartupTiming();
     return kIOReturnSuccess;
 }
+static_assert((unsigned)kNvrmDepth8 == (unsigned)kIORangeBitsPerColorComponent8 && (unsigned)kNvrmDepth10 == (unsigned)kIORangeBitsPerColorComponent10 &&
+              (unsigned)kNvrmDepth8 == (unsigned)kIOBitsPerColorComponent8 && (unsigned)kNvrmDepth10 == (unsigned)kIOBitsPerColorComponent10 &&
+              (unsigned)kNvrmDepth12 == (unsigned)kIOBitsPerColorComponent12, "nvrm-fb-safety.h's depth bits are not IOGraphics'");
 void NVRMNVDAFramebuffer::publishTimingCaps()
 {
     IODisplayScalerInformation si; nvu_zero(&si, sizeof si);
@@ -4505,6 +4509,7 @@ void NVRMNVDAFramebuffer::publishTimingCaps()
     if (gHdrOn && fHdrCapable) {   // a PQ-capable display: HDR10 timings in BT.2020/BT.2100 are offered next to the SDR ones
         r.supportedColorimetryModes |= kIORangeColorimetryBT2020 | kIORangeColorimetryBT2100;
         r.supportedDynamicRangeModes |= kIORangeDynamicRangeHDR10;
+        r.supportedBitsPerColorComponent |= kIORangeBitsPerColorComponent10;   // the depth macOS makes HDR10 timings at (nvrmTimingDepthOk)
     }
     OSData *g = OSData::withBytes(&r, sizeof r);
     if (g) { setProperty(kIOFBTimingRangeKey, g); g->release(); }
