@@ -5651,7 +5651,9 @@ IOReturn NVRMNVDAFramebuffer::setAttributeForConnection(IOIndex connectIndex, IO
 
 // ---- DDC/CI ----------------------------------------------------------------------------------------------------
 // IOGraphics creates an IOFramebufferI2CInterface in IOFramebuffer::open() from the IOFBI2CInterfaceInfo property, so the
-// property has to exist before super::start(). Publishing makes no RM call; the resource manager is reached on the first
+// property has to exist before super::start(). Each bus needs IOI2CInterfaceID: IOFramebufferI2CInterface::start() fails
+// without it, and then the framebuffer has no I2C interface for IOFBCopyI2CInterfaceForBus() to find. The ID is the bus
+// number doI2CRequest() is called with. Publishing makes no RM call; the resource manager is reached on the first
 // request. Off unless boot-arg nvrmfbddc=1 (NVRM reads the same switch before it registers its I2C adapters).
 void NVRMNVDAFramebuffer::publishDdcBus()
 {
@@ -5659,12 +5661,14 @@ void NVRMNVDAFramebuffer::publishDdcBus()
     fDdcOn = false;
     if (fInternal || !PE_parse_boot_argn("nvrmfbddc", &on, sizeof on) || !on) return;
     OSArray *buses = OSArray::withCapacity(1);
-    OSDictionary *bus = OSDictionary::withCapacity(3);
+    OSDictionary *bus = OSDictionary::withCapacity(4);
+    OSNumber *id = OSNumber::withNumber((UInt64)0, 32);
     OSNumber *type = OSNumber::withNumber((UInt64)kIOI2CBusTypeI2C, 32);
     OSNumber *tx = OSNumber::withNumber((UInt64)((1u << kIOI2CNoTransactionType) | (1u << kIOI2CSimpleTransactionType) |
                                                  (1u << kIOI2CDDCciReplyTransactionType)), 32);
     OSNumber *flags = OSNumber::withNumber((UInt64)0, 32);
-    if (buses && bus && type && tx && flags) {
+    if (buses && bus && id && type && tx && flags) {
+        bus->setObject(kIOI2CInterfaceIDKey, id);
         bus->setObject(kIOI2CBusTypeKey, type); bus->setObject(kIOI2CTransactionTypesKey, tx);
         bus->setObject(kIOI2CSupportedCommFlagsKey, flags);
         buses->setObject(bus);
@@ -5672,7 +5676,7 @@ void NVRMNVDAFramebuffer::publishDdcBus()
         fDdcOn = true;
         FBLOG("fb%u: DDC/CI bus published (nvrmfbddc=1)", fIndex);
     }
-    OSSafeReleaseNULL(flags); OSSafeReleaseNULL(tx); OSSafeReleaseNULL(type); OSSafeReleaseNULL(bus); OSSafeReleaseNULL(buses);
+    OSSafeReleaseNULL(flags); OSSafeReleaseNULL(tx); OSSafeReleaseNULL(type); OSSafeReleaseNULL(id); OSSafeReleaseNULL(bus); OSSafeReleaseNULL(buses);
 }
 // IOFramebufferI2CInterface::startIO refuses a request while !isPowered() (pendingPowerState == 0). This class replaces
 // setPowerState, which is what sets it in the family, so it stayed 0 and every request was answered "offline" before it
