@@ -40,9 +40,10 @@ static unsigned long long mach_absolute_time() { return 1; }
 struct NVRMNVDAFramebuffer {
     bool modeOk; unsigned long long fEnableAbs = 0; bool fHotplugBorn = true, fConnectFired = false; unsigned fIndex = 0;
     bool fProxy = false;   // an NVIDIA head, not the proxy for another GPU's panel (which returns before the mode set)
-    int notified = 0, audio = 0;
+    bool fDpyLost = false; unsigned fDisplay = 0x100, fHead = 0;   // fDpyLost: nothing on this output
+    int notified = 0, audio = 0, modeSets = 0;
     explicit NVRMNVDAFramebuffer(bool ok) : modeOk(ok) {}
-    bool applyMode() { return modeOk; }
+    bool applyMode() { modeSets++; return modeOk; }
     void refreshDisplayAudioProperties() { audio++; }
     void notifyConnectionChanged(int) { notified++; }
     IOReturn enableController();
@@ -53,6 +54,9 @@ int main() {
     IOReturn g = good.enableController(), b = bad.enableController();
     printf("RESULT good=%#x bad=%#x good_notified=%d bad_notified=%d bad_audio=%d\n", (unsigned)g, (unsigned)b,
            good.notified, bad.notified, bad.audio);
+    NVRMNVDAFramebuffer empty(false); empty.fDpyLost = true;
+    IOReturn e = empty.enableController();
+    printf("EMPTY open=%#x mode_sets=%d notified=%d audio=%d\n", (unsigned)e, empty.modeSets, empty.notified, empty.audio);
     return 0;
 }
 '''
@@ -74,6 +78,8 @@ arm("a framebuffer whose boot mode set failed still opens (no dead framebuffer, 
 arm("  and says so in the log", "the boot mode set failed -- opening anyway" in out, out)
 arm("  and does not announce a hot-plugged display it never lit", "bad_notified=0" in out and "good_notified=1" in out, out)
 arm("  nor publish its audio properties", "bad_audio=0" in out, out)
+# An output with no display on it: there is nothing to name in a mode set, so none is tried, and the open succeeds
+arm("a framebuffer with no display on its output opens, and no mode set is tried", "EMPTY open=0 mode_sets=0 notified=0 audio=0" in out, out)
 
 # the base file can be named directly where the tree has no git history (a build host's copy)
 base_file = os.environ.get("NVRMFB_BASE_SRC")
@@ -82,6 +88,7 @@ old = (subprocess.CompletedProcess([], 0, pathlib.Path(base_file).read_text(), "
 if old.returncode == 0:
     o = run(old.stdout)
     arm("negative control: 2.8.1's enableController fails the open on a failed mode set", "bad=0xe00002bc" in o, o)
+    arm("negative control: 2.8.1 tried the mode set on an output with no display", "EMPTY open=0xe00002bc mode_sets=1" in o, o)
 else:
     arm("negative control: 2.8.1's nvrm-fb.cpp is readable", False, old.stderr)
 print(f"{fails} failed")

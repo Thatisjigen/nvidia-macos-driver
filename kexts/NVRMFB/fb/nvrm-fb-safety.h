@@ -380,6 +380,31 @@ static inline unsigned nvrmSurroundOffset(const unsigned *widths, unsigned m) { 
 // starts a framebuffer for a display that appears). 6 tries, then it stays quiet like before. 0 = stop.
 enum { kNvrmBootRetries = 6 };
 static inline unsigned nvrmBootRetryDelayMs(unsigned attempt) { return attempt < kNvrmBootRetries ? 3000u : 0u; }
+// ---- An output with no display at start ----
+// macOS opens a GPU's framebuffers when WindowServer starts, and a framebuffer that registers later is never opened: a
+// monitor plugged into a card that had none at start stayed dark until a restart. A card with one output and no display
+// on it starts that output all the same, with its connection off. With several outputs, which one to keep would be a
+// guess and a monitor on another one would still start late, so nothing changes there; nor with the panel proxy asked for
+// (nvfbigpu), whose head stands in for another GPU's panel. `connected` = displays that answered, `handles` = displays
+// NVKMS lists for the card, `readable` = the output's connector and heads could be read. nvfbemptyout=0 turns it off.
+static inline bool nvrmKeepEmptyOutput(unsigned connected, unsigned handles, bool readable, bool proxyAsked, bool haveArg, unsigned argValue)
+{
+    return connected == 0 && handles == 1 && readable && !proxyAsked && !(haveArg && argValue == 0);
+}
+// The raster such an output starts on, with the timing of CTA-861 format 16 (1920x1080 at 60 Hz, sync positive on both),
+// which nothing is scanned out with: the scanout memory, the surface and the mode macOS is told about need a size before
+// there is a monitor to ask. refreshMilliHz is in NVKMS's unit, thousandths of a hertz.
+enum { kNvrmEmptyW = 1920, kNvrmEmptyH = 1080 };
+struct NvrmEmptyTiming { unsigned pixelClockHz, hVisible, hSyncStart, hSyncEnd, hTotal, vVisible, vSyncStart, vSyncEnd, vTotal, refreshMilliHz; };
+static inline NvrmEmptyTiming nvrmEmptyOutputTiming() { return { 148500000u, kNvrmEmptyW, 2008u, 2052u, 2200u, kNvrmEmptyH, 1084u, 1089u, 1125u, 60000u }; }
+// The first monitor's mode on that raster, one candidate at a time: is this one better than the best so far? The mode
+// NVKMS flags preferred wins; without one, the highest pixel clock, the raster's top rate.
+static inline bool nvrmFirstModeBetter(bool have, bool bestPreferred, unsigned bestClock, bool preferred, unsigned clock)
+{
+    if (!have) return true;
+    if (bestPreferred != preferred) return preferred;
+    return clock > bestClock;
+}
 // The master of a surround mask is its lowest connected index; a member is any other connected index in the mask.
 static inline unsigned nvrmSurroundMaster(unsigned mask, unsigned connected) { for (unsigned i = 0; i < 8 && i < connected; i++) if (mask & (1u << i)) return i; return 8; }
 static inline bool nvrmSurroundIsMember(unsigned mask, unsigned index, unsigned connected)

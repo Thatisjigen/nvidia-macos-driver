@@ -801,6 +801,11 @@ class NVRMNVDAFramebuffer : public IOFramebuffer {
     volatile SInt32 fWillSleepOff = 0;
     static IOReturn sleepTap(OSObject *self, void *, IOFramebuffer *, IOIndex event, void *info);
     bool fDpyLost = false;   // the connector is disconnected; re-sense after its EDID is restored
+    // This output started with no display on it (see gEmptyOut) and none has arrived since: its timing is the stand-in
+    // of nvrmEmptyOutputTiming, and the first monitor is taken up by takeFirstDisplay.
+    bool fNoDisplayYet = false;
+    void takeFirstDisplay();
+    void publishLinkTiming();
     // macOS pushes an all-black output LUT right after a display comes back; only that window is ignored so a
     // deliberate fade or blackout still applies.
     UInt64 fBlackLutDeadline = 0;
@@ -951,6 +956,20 @@ static int gNDpy = -1;
 // appeared after boot (hotplugFire adds it to gDpy and re-registers the idle nub), and that instance is the one that
 // has to tell the framework its connection is new -- see connectNotifyFire/enableController.
 static int gNDpyBoot = -1;
+// The output of a card that has one output and no display on it at start. WindowServer opens a GPU's framebuffers when
+// it starts and again only when a GPU is added: an IOFramebuffer that registers later is never opened, and no service
+// notification of WindowServer's looks for one. A framebuffer that started only once the monitor arrived (hotplugFire,
+// an idle nub matched again) therefore registered, found no connect handler, and the monitor stayed dark until a
+// restart. So the output starts with the card, with its connection reported off, as the framebuffer of a Mac's empty
+// port is there from boot and has no display under it; the monitor that arrives is then a connection change on a
+// framebuffer WindowServer already holds. See nvrmKeepEmptyOutput for when, and takeFirstDisplay for the monitor.
+static struct nvrm_dpy_rec gEmptyOut;
+static bool gHaveEmptyOut;
+static bool nvrmAnyDisplayConnected()
+{
+    for (int k = 0; k < gNDpy; k++) if (gDpy[k].connected) return true;
+    return false;
+}
 static int gBootHead = -2;
 static NvKmsKapiDisplay gBootDpy = 0;
 static struct NvKmsKapiDisplayMode gBootMode;
@@ -1306,11 +1325,18 @@ bool NVRMNVDAFramebuffer::kapiInit()
                 continue;
             }
             struct NvKmsKapiStaticDisplayInfo si = {};
-            NvBool gs = dd->connected ? fKms->getStaticDisplayInfo(fDev, handles[i], &si) : NV_FALSE;
+            // a card's only output is asked for its connector and heads with nothing on it too: see gEmptyOut
+            NvBool gs = (dd->connected || n == 1) ? fKms->getStaticDisplayInfo(fDev, handles[i], &si) : NV_FALSE;
             FBLOG("dpy %u/%u 0x%x: connected %u edid %u B connector 0x%x headMask 0x%x internal %u%s",
                   i, n, handles[i], dd->connected, dd->edid.bufferSize,
                   gs ? (unsigned)si.connectorHandle : 0u, gs ? (unsigned)si.headMask : 0u, gs ? (unsigned)si.internal : 0u,
                   (dd->connected && !gs) ? " STATIC INFO FAILED" : "");
+            if (!dd->connected && gs && !si.internal && !si.isDpMST && si.headMask) {
+                nvu_zero(&gEmptyOut, sizeof gEmptyOut);
+                gEmptyOut.handle = handles[i]; gEmptyOut.connector = si.connectorHandle; gEmptyOut.headMask = si.headMask;
+                gEmptyOut.hdaConnectorType = nvrmQueryHdaConnectorType(fKms, fDev, si.connectorHandle);
+                gHaveEmptyOut = true;
+            }
             if (!dd->connected || !gs) continue;
             if (gNDpy >= (int)(sizeof gDpy / sizeof gDpy[0])) { FBLOG("dpy table full at %d", gNDpy); break; }
             struct nvrm_dpy_rec *r = &gDpy[gNDpy++];
@@ -1321,17 +1347,31 @@ bool NVRMNVDAFramebuffer::kapiInit()
             nvu_copy(r->edid, dd->edid.buffer, r->edidSize);
         }
         IOFree(dd, sizeof *dd);
+        const int answered = gNDpy;
+        {   // no display, one output: it gets index 0 with nothing connected (gEmptyOut). Decided before the count is
+            // published, which is what NVRM's auto-go and the accelerator read to tell a card that will have a head
+            // from one that will have none.
+            int igpu = 0; PE_parse_boot_argn("nvfbigpu", &igpu, sizeof igpu);
+            UInt32 keep = 1; const bool haveKeep = PE_parse_boot_argn("nvfbemptyout", &keep, sizeof keep);
+            if (nvrmKeepEmptyOutput((unsigned)answered, n, gHaveEmptyOut, igpu != 0, haveKeep, keep)) {
+                gDpy[0] = gEmptyOut; gNDpy = 1;
+                FBLOG("no display on this card's only output 0x%x (connector 0x%x): it is started all the same, with its "
+                      "connection off, so that macOS has its framebuffer open when a monitor arrives (nvfbemptyout=0 turns this off)",
+                      (unsigned)gEmptyOut.handle, (unsigned)gEmptyOut.connector);
+            }
+        }
         if (getProvider()) getProvider()->setProperty("connected-displays", (unsigned long long)gNDpy, 32);
         FBLOG("ENUMERATED: %d connected display(s) of %u handle(s), %u heads available",
-              gNDpy, n, fNumHeads);
-        if (gNDpy == 0 && n > 0) {   // nothing answered yet: look again shortly (nvfbbootretry=0 turns this off)
+              answered, n, fNumHeads);
+        if (answered == 0 && n > 0) {   // nothing answered yet: look again shortly (nvfbbootretry=0 turns this off)
             UInt32 off = 1; PE_parse_boot_argn("nvfbbootretry", &off, sizeof off);
             gBootRetry = off ? 0 : kNvrmBootRetries;    // the counter counts up; kNvrmBootRetries = already used up
             if (off) FBLOG("no display answered at start: will look again %u times, %u s apart", (unsigned)kNvrmBootRetries, nvrmBootRetryDelayMs(0) / 1000);
             if (off) hotplugKick();
         }
         // NVKMS answered and nothing is plugged into this card (its displays are on another GPU): the driver is up as
-        // far as it will go, so this start counts as good for the boot guard (nvrm_off.h)
+        // far as it will go, so this start counts as good for the boot guard (nvrm_off.h). With an output to start
+        // (gEmptyOut) the guard is cleared where every started framebuffer clears it, once the scanout memory is there.
         if (n > 0 && gNDpy == 0) fbGuardCleared("NVKMS lists this card's connectors and none has a display");
     }
 
@@ -1406,7 +1446,10 @@ bool NVRMNVDAFramebuffer::kapiInit()
         struct nvrm_dpy_rec *r = &gDpy[fIndex];
         fDisplay = r->handle; fConnector = r->connector; fInternal = r->internal; fVrrSupported = r->vrr && vrrAllowed();
         if (fInternal) FBLOG("fb%u: display 0x%x is internal -- reporting kIOConnectionBuiltIn", fIndex, fDisplay);
-        takeEdid(r->edid, r->edidSize);
+        // An output with nothing on it (gEmptyOut, or a display that went away before this start): the connection
+        // reads as off from the first question macOS asks, and no EDID is offered.
+        fNoDisplayYet = fDpyLost = !r->connected;
+        takeEdid(r->edid, r->connected ? r->edidSize : 0);
         FBLOG("fb%u: EDID %u B, panel %ux%u mm (imageWidth/imageHeight)", fIndex, (unsigned)fEdidSize,
               (unsigned)fEdidMmW, (unsigned)fEdidMmH);
         publishDisplayAudioProperties();
@@ -1438,24 +1481,39 @@ bool NVRMNVDAFramebuffer::kapiInit()
     // rasters flood the mode table, which is why a second high-refresh display came up at 60/75 Hz or
     // black on some boots and correctly on others. Ties keep the higher pixel clock so the boot mode is
     // the native raster's top rate.
-    bool have = false; NvU64 bestArea = 0; NvU32 bestClock = 0;
-    for (NvU32 i = 0; i < 256; i++) {
-        struct NvKmsKapiDisplayMode m = {}; NvBool valid = NV_FALSE, preferred = NV_FALSE;
-        int r = fKms->getDisplayMode(fDev, fDisplay, i, &m, &valid, &preferred);
-        if (r < 0) break;
-        if (r == 0 || !valid) continue;
-        if (!nvrmKmsRasterValid(m.timings.hVisible, m.timings.vVisible)) {
-            FBLOG("skip mode %u with raster %ux%u outside NVKMS layer range", i,
-                  m.timings.hVisible, m.timings.vVisible);
-            continue;
+    if (fNoDisplayYet) {
+        // No display, so no mode list. The output starts on a stand-in timing that nothing is scanned out with: the
+        // scanout memory, the surface and the mode macOS is told about need a raster, and the first monitor's own mode
+        // at this raster takes its place (takeFirstDisplay).
+        const NvrmEmptyTiming e = nvrmEmptyOutputTiming();
+        nvu_zero(&fMode, sizeof fMode);
+        struct NvKmsKapiDisplayModeTimings &t = fMode.timings;
+        t.refreshRate = e.refreshMilliHz; t.pixelClockHz = e.pixelClockHz;
+        t.hVisible = e.hVisible; t.hSyncStart = e.hSyncStart; t.hSyncEnd = e.hSyncEnd; t.hTotal = e.hTotal;
+        t.vVisible = e.vVisible; t.vSyncStart = e.vSyncStart; t.vSyncEnd = e.vSyncEnd; t.vTotal = e.vTotal;
+        t.flags.hSyncPos = 1; t.flags.vSyncPos = 1;
+        FBLOG("fb%u: no display on output 0x%x -- stand-in raster %ux%u, head %u stays off until a monitor is there", fIndex,
+              fDisplay, t.hVisible, t.vVisible, fHead);
+    } else {
+        bool have = false; NvU64 bestArea = 0; NvU32 bestClock = 0;
+        for (NvU32 i = 0; i < 256; i++) {
+            struct NvKmsKapiDisplayMode m = {}; NvBool valid = NV_FALSE, preferred = NV_FALSE;
+            int r = fKms->getDisplayMode(fDev, fDisplay, i, &m, &valid, &preferred);
+            if (r < 0) break;
+            if (r == 0 || !valid) continue;
+            if (!nvrmKmsRasterValid(m.timings.hVisible, m.timings.vVisible)) {
+                FBLOG("skip mode %u with raster %ux%u outside NVKMS layer range", i,
+                      m.timings.hVisible, m.timings.vVisible);
+                continue;
+            }
+            if (preferred) { fMode = m; have = true; break; }
+            const NvU64 area = (NvU64)m.timings.hVisible * m.timings.vVisible;
+            if (!have || area > bestArea || (area == bestArea && m.timings.pixelClockHz > bestClock)) {
+                fMode = m; bestArea = area; bestClock = m.timings.pixelClockHz; have = true;
+            }
         }
-        if (preferred) { fMode = m; have = true; break; }
-        const NvU64 area = (NvU64)m.timings.hVisible * m.timings.vVisible;
-        if (!have || area > bestArea || (area == bestArea && m.timings.pixelClockHz > bestClock)) {
-            fMode = m; bestArea = area; bestClock = m.timings.pixelClockHz; have = true;
-        }
+        if (!have) { FBLOG("no valid mode"); return false; }
     }
-    if (!have) { FBLOG("no valid mode"); return false; }
     if (gBootHead < 0 && fIndex == 0) fBootConsole = true;
     fKmsMode = fMode; fHaveKmsMode = true;
     if (gBootHead >= 0 && fDisplay == gBootDpy && (int)fHead == gBootHead &&
@@ -1486,14 +1544,7 @@ bool NVRMNVDAFramebuffer::kapiInit()
               fMode.timings.hVisible, fMode.timings.vVisible);
     }
     fW = fMode.timings.hVisible; fH = fMode.timings.vVisible;
-    {
-        const struct NvKmsKapiDisplayModeTimings &k5t = fMode.timings;
-        UInt32 k5[13] = { 0x4b350001u, k5t.pixelClockHz, k5t.hVisible, k5t.hSyncStart, k5t.hSyncEnd, k5t.hTotal, k5t.vVisible, k5t.vSyncStart,
-                          k5t.vSyncEnd, k5t.vTotal, k5t.refreshRate, k5t.flags.hSyncNeg ? 0u : 1u, k5t.flags.vSyncNeg ? 0u : 1u };
-        OSData *k5d = OSData::withBytes(k5, sizeof k5);
-        if (k5d) { setProperty("NVRMTiming", k5d); k5d->release(); }
-        else FBLOG("K5: NVRMTiming NOT published (no memory) — AGDC link queries will answer NotFound");
-    }
+    publishLinkTiming();
     fPitch = (fW * 4 + pitchAlign - 1) & ~(pitchAlign - 1);
     fSize = ((NvU64)fPitch * fH + 0xffff) & ~0xffffull;
     {
@@ -1939,6 +1990,40 @@ void NVRMNVDAFramebuffer::adoptSwappedDisplay()
           (unsigned)fScalerMaxW, (unsigned)fScalerMaxH,
           short_ ? "; its largest modes need more scanout memory than this start reserved - full size after a restart" : "");
 }
+// The first monitor on an output that started with none (gEmptyOut). The stand-in timing gives way to one of this
+// monitor's own modes at the raster the output started on, so the scanout surface stays as it is: the preferred one,
+// else the raster's highest pixel clock, which is how a start picks its boot mode. For a monitor whose native raster
+// that is, the head ends up as a start with the monitor connected leaves it. A monitor with no mode at that raster
+// keeps the stand-in for the first mode set; macOS then sets one of the monitor's own modes. The timing range is
+// published again because what it offers (HDR10, variable refresh) comes from the EDID, and there was none at start.
+// The ceilings follow where every changed monitor gets them, in adoptSwappedDisplay. Called with the start lock held.
+void NVRMNVDAFramebuffer::takeFirstDisplay()
+{
+    fNoDisplayYet = false;
+    fEdidSwapped = true;
+    if (fIndex < (unsigned)gNDpy) fVrrSupported = gDpy[fIndex].vrr && vrrAllowed();
+    bool have = false, bestPreferred = false; NvU32 bestClock = 0;
+    struct NvKmsKapiDisplayMode best = {};
+    for (NvU32 i = 0; fKms && fDev && !fModeSet && i < 256; i++) {   // no mode set yet: fMode still is the stand-in
+        struct NvKmsKapiDisplayMode m = {}; NvBool valid = NV_FALSE, preferred = NV_FALSE;
+        int r = fKms->getDisplayMode(fDev, fDisplay, i, &m, &valid, &preferred);
+        if (r < 0) break;
+        const struct NvKmsKapiDisplayModeTimings &k = m.timings;
+        if (r == 0 || !valid || k.flags.interlaced || k.flags.doubleScan || !k.pixelClockHz) continue;
+        if (k.hVisible != fBootW || k.vVisible != fBootH) continue;
+        if (!nvrmFirstModeBetter(have, bestPreferred, bestClock, preferred != NV_FALSE, k.pixelClockHz)) continue;
+        best = m; have = true; bestPreferred = preferred != NV_FALSE; bestClock = k.pixelClockHz;
+    }
+    if (have) {
+        fMode = best; fKmsMode = best; fHaveKmsMode = true; fBootMode = best;
+        publishLinkTiming();
+        publishStartupTiming();
+    }
+    publishTimingCaps();
+    FBLOG("fb%u: first monitor on output 0x%x (EDID %u B): %s %ux%u @%u mHz pclk %u", fIndex, fDisplay, (unsigned)fEdidSize,
+          have ? "its mode at the output's raster is" : "it has no mode at the output's raster, the stand-in stays:",
+          fMode.timings.hVisible, fMode.timings.vVisible, fMode.timings.refreshRate, fMode.timings.pixelClockHz);
+}
 void NVRMNVDAFramebuffer::hotplugKick()
 {
     if (!gHotplug) return;
@@ -2047,6 +2132,7 @@ void NVRMNVDAFramebuffer::hotplugFire(thread_call_param_t, thread_call_param_t)
                         const struct nvrm_dpy_rec *r = &gDpy[kdpy];
                         fb->takeEdid(r->edid, r->edidSize);
                         fb->fDpyLost = false;
+                        if (fb->fNoDisplayYet) { gDpy[kdpy].vrr = dd->vrrSupported; fb->takeFirstDisplay(); }
                         fb->fRelightAudioValid = dd->edid.bufferSize >= 128;
                         fb->fBlackLutDeadline = 0;
                         clock_interval_to_deadline(15000, kMillisecondScale, &fb->fBlackLutDeadline);
@@ -2110,7 +2196,11 @@ void NVRMNVDAFramebuffer::hotplugFire(thread_call_param_t, thread_call_param_t)
             NVRMDisplayGate gate;
             asleep = fb->fHeadSlept && (!fb->fPowerOn || !fb->rmGpuReady());
             if (!asleep && gate.valid()) {
-                ok = fb->reflip();
+                // A head that never had a mode (its output started with no display, or its first mode set was refused)
+                // gets the first mode set, with its fallbacks, as enableController gives it; any other is lit again.
+                // An instance whose start failed has no surface, and reflip refuses it as it always did.
+                if (fb->fModeSet || !fb->fSurf) ok = fb->reflip();
+                else { ok = fb->applyMode(); fb->fReflipRc = ok ? fb->fFlipResult : -1; }
                 if (ok) fb->fHeadSlept = false;
             }
         }
@@ -2132,7 +2222,7 @@ void NVRMNVDAFramebuffer::hotplugFire(thread_call_param_t, thread_call_param_t)
     }
     surroundCheck();
     if (!added) {   // still nothing: a boot that found no display keeps looking, 3 s apart, a few times
-        if (gNDpy == 0 && gBootRetry < kNvrmBootRetries) {
+        if (!nvrmAnyDisplayConnected() && gBootRetry < kNvrmBootRetries) {
             const unsigned ms = nvrmBootRetryDelayMs(gBootRetry++);
             if (ms && gHotplug) { uint64_t d; clock_interval_to_deadline(ms, kMillisecondScale, &d); thread_call_enter_delayed(gHotplug, d); }
         }
@@ -3567,6 +3657,13 @@ IOReturn NVRMNVDAFramebuffer::enableController()
     FBLOG("enableController");
     if (fProxy) return kIOReturnSuccess;
     fEnableAbs = mach_absolute_time();
+    // Nothing on this output (it started empty, or its display went away before macOS opened it): there is no display
+    // to name in a mode set, and NVKMS refuses one. The framebuffer opens with its head off and its connection off;
+    // hotplugFire gives the head its first mode when a monitor is there, and then tells macOS.
+    if (fDpyLost) {
+        FBLOG("fb%u: no display on output 0x%x -- opened with head %u off", fIndex, fDisplay, fHead);
+        return kIOReturnSuccess;
+    }
     const bool ok = applyMode();
     // A failed boot mode set must not fail the open. IOFramebuffer::open() marks a framebuffer whose enableController
     // failed as dead for good, WindowServer's IOServiceOpen on it fails (xnu reports the masked error as
@@ -3630,6 +3727,16 @@ IOReturn NVRMNVDAFramebuffer::setDisplayMode(IODisplayModeID mode, IOIndex depth
     }
     if (result == kIOReturnSuccess) refreshDisplayAudioProperties();
     return result;
+}
+// The timing on the head, as the AGDC object reads it to answer macOS's link questions (NVRMAGDC, "NVRMTiming")
+void NVRMNVDAFramebuffer::publishLinkTiming()
+{
+    const struct NvKmsKapiDisplayModeTimings &k5t = fMode.timings;
+    UInt32 k5[13] = { 0x4b350001u, k5t.pixelClockHz, k5t.hVisible, k5t.hSyncStart, k5t.hSyncEnd, k5t.hTotal, k5t.vVisible, k5t.vSyncStart,
+                      k5t.vSyncEnd, k5t.vTotal, k5t.refreshRate, k5t.flags.hSyncNeg ? 0u : 1u, k5t.flags.vSyncNeg ? 0u : 1u };
+    OSData *k5d = OSData::withBytes(k5, sizeof k5);
+    if (k5d) { setProperty("NVRMTiming", k5d); k5d->release(); }
+    else FBLOG("K5: NVRMTiming NOT published (no memory) — AGDC link queries will answer NotFound");
 }
 void NVRMNVDAFramebuffer::publishStartupTiming()
 {
@@ -3763,7 +3870,7 @@ bool NVRMNVDAFramebuffer::edidModeFor(const IODetailedTimingInformationV2 *d, st
 void NVRMNVDAFramebuffer::computeScanoutCaps(NvU32 pitchAlign)
 {
     NvU32 pmw = 0, pmh = 0;
-    if (fKms && fDev && fDisplay) {
+    if (fKms && fDev && fDisplay && !fNoDisplayYet) {   // an output with no display has no list: one step up, below
         for (NvU32 i = 0; i < 256; i++) {
             struct NvKmsKapiDisplayMode m = {}; NvBool valid = NV_FALSE, pref = NV_FALSE;
             int r = fKms->getDisplayMode(fDev, fDisplay, i, &m, &valid, &pref);
@@ -4044,13 +4151,7 @@ IOReturn NVRMNVDAFramebuffer::switchMode(IODisplayModeID id, const struct NvKmsK
     fHwVblTries = 0;   // a new mode gets its own hardware-vblank tries (fModeSet stays set, so vblFire would not reset them)
     fCurTransform = transform;
     if (old && old != ns) fKms->destroySurface(fDev, old);
-    {
-        const struct NvKmsKapiDisplayModeTimings &k5t = fMode.timings;
-        UInt32 k5[13] = { 0x4b350001u, k5t.pixelClockHz, k5t.hVisible, k5t.hSyncStart, k5t.hSyncEnd, k5t.hTotal, k5t.vVisible, k5t.vSyncStart,
-                          k5t.vSyncEnd, k5t.vTotal, k5t.refreshRate, k5t.flags.hSyncNeg ? 0u : 1u, k5t.flags.vSyncNeg ? 0u : 1u };
-        OSData *k5d = OSData::withBytes(k5, sizeof k5);
-        if (k5d) { setProperty("NVRMTiming", k5d); k5d->release(); }
-    }
+    publishLinkTiming();
     setProperty("NVRMModeSwitches", (unsigned long long)fModeSwitches, 32);
     setProperty("NVRMRotation", (unsigned long long)transform, 32);
     publishStartupTiming();
