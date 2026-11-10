@@ -722,7 +722,6 @@ chmod 644 "$BLP" && chown root:wheel "$BLP" || die "backlight job permissions"
 ok "panel brightness is kept on disk too, for firmware that drops NVRAM writes"
 
 ba=$(nvram boot-args 2>/dev/null | cut -f2-)
-for a in nvfb=1 nvaccel=1; do case " $ba " in *" $a "*) ;; *) echo "   NOTE: boot-args lack '$a' — add it in your OpenCore config.plist (README: Install — by hand), or let the 1401 Mac app set OpenCore up";; esac; done
 # WindowServer is a platform binary: with AMFI enforcing it refuses the Metal plugin ("mapping process is a platform
 # binary, but mapped file is not"), reaches the desktop with no Metal device and asserts "Failed to create MetalDevice".
 # Two reports had boot-args with nvfb/nvaccel but neither AMFI argument.

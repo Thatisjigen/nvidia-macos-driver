@@ -852,8 +852,9 @@ public:
             ALOG("NMXGPU drives %04x:%04x - starting", pci->configRead16(0x00), pci->configRead16(0x02));
         }
 #else
-        uint32_t gate = 0;
-        if (!PE_parse_boot_argn("nvaccel", &gate, sizeof gate) || !gate) { ALOG("boot-arg nvaccel=1 absent: NOT starting (boot-loop guard)"); return false; }
+        uint32_t gate = 1;   // on unless nvaccel=0; a start that never lights a display is stopped by NVRM's start counter
+        PE_parse_boot_argn("nvaccel", &gate, sizeof gate);
+        if (!gate) { ALOG("nvaccel=0: NOT starting"); return false; }
         if (IOPCIDevice *pci = OSDynamicCast(IOPCIDevice, provider)) {
             unsigned waited = 0;
             while (pci->getProperty("nvrm-claimed") != kOSBooleanTrue && waited < 300) { IOSleep(100); waited++; }

@@ -3213,9 +3213,11 @@ bool NVRMNVDAFramebuffer::start(IOService *provider)
 {
     { if (nvrm_driver_off()) return false; }
     {
-        int gate = 0;
-        if (!PE_parse_boot_argn("nvfb", &gate, sizeof gate) || !gate) {
-            IOLog("NVRMFB: boot-arg nvfb=1 absent: NOT starting (boot-loop guard)\n");
+        // On unless nvfb=0. The start counter and -nvoff (nvrm_off.h) are what stops a driver that cannot light its display.
+        int gate = 1;
+        PE_parse_boot_argn("nvfb", &gate, sizeof gate);
+        if (!gate) {
+            IOLog("NVRMFB: nvfb=0: NOT starting\n");
             return false;
         }
     }
