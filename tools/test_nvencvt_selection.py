@@ -4,7 +4,8 @@
 Ada had no hardware encoder and no VP9 or AV1 decoder because the library registered only when a user switched it on in
 nvrm610.conf; and Safari, QuickTime and FaceTime, which decode inside VTDecoderXPCService, never saw it because that
 process registered only the built-in decoders. The selection function is compiled out of the plugin source and run
-on a table; the decode service's wiring is checked in the text around it.
+on a table; the decode service's wiring is checked in the text around it, and so is the wiring for WebKit's GPU
+process, which decodes in process where it can load the library.
 
 usage: test_nvencvt_selection.py [repo root]"""
 import pathlib, platform, shutil, subprocess, sys, tempfile
@@ -73,6 +74,23 @@ check('the built-in encoders declare low-latency rate control only when NVMTL_EN
       'NVMTL_ENCODER_LLRC' in src and src.count('nvmtl_encoder_registration_info(@"com.nvmtl.videoencoder') == 2
       and '"EnableLowLatencyRateControl"' in src or '@"EnableLowLatencyRateControl"' in src)
 check('device initialisation still registers the full library', 'nvmtl_nvencvt_register(false)' in src)
+# WebKit's GPU process plays video in process and picks from its own registry: it gets the decoders alone, by its
+# exact name, and is then asked to look for a VP9 hardware decoder again, because it keeps its first answer.
+init = function('- (instancetype)initWithAcceleratorPort:(mach_port_t)port {')
+wk = function('static bool nvmtl_is_webkit_gpu(')
+again = function('static void nvmtl_webkit_ask_vp9_again(')
+check("WebKit's GPU process is matched by its exact name", wk is not None and 'strcmp(me, "com.apple.WebKit.GPU")' in wk and 'strncmp' not in wk and 'strstr' not in wk)
+check("device initialisation gives WebKit's GPU process the decoders alone and everything else the full library",
+      init is not None and 'if (nvmtl_is_webkit_gpu(getprogname())) nvmtl_nvencvt_register(true);' in init
+      and 'else nvmtl_nvencvt_register(false);' in init
+      and init.index('nvmtl_nvenc_hevc_register()') < init.index('nvmtl_nvencvt_register(true)'))
+check('WebKit is asked about VP9 again only after a registration that worked, and only there',
+      reg is not None and 'if (!st && nvmtl_is_webkit_gpu(me)) nvmtl_webkit_ask_vp9_again();' in reg
+      and src.count('nvmtl_webkit_ask_vp9_again()') == 1)
+check("the question is put from the main run loop's next turn, by a name that may be missing",
+      again is not None and 'CFRunLoopPerformBlock(CFRunLoopGetMain(), kCFRunLoopCommonModes' in again
+      and 'CFRunLoopWakeUp(CFRunLoopGetMain())' in again
+      and 'dlsym(RTLD_DEFAULT, "_ZN7WebCore30registerSupplementalVP9DecoderEv")' in again and 'if (again) again();' in again)
 
 print(f'{fails} failed' if fails else 'all passed')
 sys.exit(1 if fails else 0)

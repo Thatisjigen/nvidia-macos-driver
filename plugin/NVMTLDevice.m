@@ -478,6 +478,30 @@ static void nvmtl_nmxvt_register(void)
         nvlog("nmxvt: AV1 and VP9 decoders %s in %s (%d)", st ? "NOT registered" : "REGISTERED", getprogname(), (int)st);
     });
 }
+// WebKit's GPU process (Safari's com.apple.WebKit.GPU) plays video itself and picks the decoder from its own registry:
+// a decoder registered only in the decode service is not the one it asks for. So where that process can load
+// libnvencvt (its sandbox must be told to let the library be mapped) it gets the decoders, and never the encoders.
+static bool nvmtl_is_webkit_gpu(const char *me)
+{
+    return me && !strcmp(me, "com.apple.WebKit.GPU");
+}
+// That process asks VideoToolbox once whether VP9 has a hardware decoder and keeps the answer; on a laptop a "no" makes
+// it tell pages that VP9 is not supported at all. The first time it asks is also what makes Metal load this plugin, so
+// the decoders register while VideoToolbox is still answering, too late to count. WebCore::registerSupplementalVP9Decoder()
+// is what WebKit itself calls when the set of VP9 decoders may have changed: it forgets a kept "no", and the next
+// question reaches VideoToolbox again. It belongs to the main thread, and the lock around the kept answer is held while
+// the first question is out, so it is called from the main run loop's next turn. Looked up by name: a WebKit that
+// does not export it keeps the answer it has.
+static void nvmtl_webkit_ask_vp9_again(void)
+{
+    CFRunLoopPerformBlock(CFRunLoopGetMain(), kCFRunLoopCommonModes, ^{
+        void (*again)(void) = (void (*)(void))dlsym(RTLD_DEFAULT, "_ZN7WebCore30registerSupplementalVP9DecoderEv");
+        if (again) again();
+        nvlog("nvencvt: WebKit %s", again ? "asked to look for a VP9 hardware decoder again"
+                                          : "exports no registerSupplementalVP9Decoder - FAILED to refresh its VP9 answer");
+    });
+    CFRunLoopWakeUp(CFRunLoopGetMain());
+}
 static void nvmtl_nvencvt_register(bool decodersOnly)
 {
     static dispatch_once_t once;
@@ -508,6 +532,7 @@ static void nvmtl_nvencvt_register(bool decodersOnly)
         int32_t st = r(rating);
         nvlog("nvencvt: %s %s in %s (%s -> %d, rating %d, %s)", decodersOnly ? "decoders" : "codecs",
               st ? "NOT registered" : "REGISTERED", me, entry, (int)st, rating, path);
+        if (!st && nvmtl_is_webkit_gpu(me)) nvmtl_webkit_ask_vp9_again();
     });
 }
 static void nvmtl_nvdec_hevc_register(void)
@@ -996,7 +1021,9 @@ static id nvmtl_refuse_before_init(id obj)
         nvmtl_nvenc_register();
         nvmtl_nvdec_hevc_register();
         nvmtl_nvenc_hevc_register();
-        nvmtl_nvencvt_register(false);   // last, so the external codecs register above ours
+        // last, so the external codecs register above ours; WebKit's GPU process gets the decoders alone
+        if (nvmtl_is_webkit_gpu(getprogname())) nvmtl_nvencvt_register(true);
+        else nvmtl_nvencvt_register(false);
     }
     SEL il = sel_registerName("initLimits");
     if ([self respondsToSelector:il]) {
