@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
-"""DDC/CI through the framebuffer's I2C bus: request translation, address whitelist, reply framing, opt-in on both kexts.
+"""DDC/CI through the framebuffer's I2C bus: request translation, address whitelist, reply framing, opt-in on both kexts,
+and a bus dictionary IOGraphics makes an interface from.
 
 The real doI2CRequest is compiled from nvrm-fb.cpp against a mocked transfer; the ABI header functions are compiled as
-they are. Arms are named. The control is the old driver: it published no I2C bus and had no doI2CRequest, so an
-IOFBCopyI2CInterfaceForBus client found nothing."""
+they are. The real publishDdcBus is compiled against stand-ins for the libkern containers and its dictionary is read the
+way IOFramebufferI2CInterface does. Arms are named. The control is the old driver: it published no I2C bus and had no
+doI2CRequest, so an IOFBCopyI2CInterfaceForBus client found nothing; the same goes for a bus without its interface ID."""
 import filecmp, pathlib, subprocess, tempfile
 root = pathlib.Path(__file__).resolve().parents[1]
 fb = (root / 'kexts/NVRMFB/fb/nvrm-fb.cpp').read_text()
@@ -94,8 +96,73 @@ int main() {
     puts("PASS: DDC/CI request translation, address whitelist, 40 ms reply wait, reply framing, dead display, opt-in");
 }
 '''
+# The bus dictionary. IOFramebufferI2CInterface::create() in IOGraphics makes one interface per dictionary of
+# IOFBI2CInterfaceInfo; its start() fails on a dictionary without a numeric IOI2CInterfaceID, create() stops there and the
+# framebuffer gets no interface. The ID's low 32 bits are the bus number startIO() passes to doI2CRequest.
+s = fb.index('void NVRMNVDAFramebuffer::publishDdcBus()')
+publish = fb[s:fb.index('\n}\n', s) + 3]
+bus_fixture = r'''
+#include <cassert>
+#include <cstdint>
+#include <cstdio>
+#include <cstring>
+#include <map>
+#include <string>
+#include <vector>
+typedef uint32_t UInt32; typedef uint64_t UInt64;
+#define kIOFBI2CInterfaceInfoKey "IOFBI2CInterfaceInfo"
+#define kIOI2CInterfaceIDKey "IOI2CInterfaceID"
+#define kIOI2CBusTypeKey "IOI2CBusType"
+#define kIOI2CTransactionTypesKey "IOI2CTransactionTypes"
+#define kIOI2CSupportedCommFlagsKey "IOI2CSupportedCommFlags"
+enum { kIOI2CBusTypeI2C = 1, kIOI2CNoTransactionType = 0, kIOI2CSimpleTransactionType = 1, kIOI2CDDCciReplyTransactionType = 2 };
+struct OSObject { virtual ~OSObject() {} };
+struct OSNumber : OSObject { UInt64 v; static OSNumber *withNumber(UInt64 v, unsigned) { OSNumber *n = new OSNumber; n->v = v; return n; } };
+struct OSDictionary : OSObject { std::map<std::string, OSObject *> m; static OSDictionary *withCapacity(unsigned) { return new OSDictionary; }
+    void setObject(const char *k, OSObject *o) { m[k] = o; } };
+struct OSArray : OSObject { std::vector<OSObject *> v; static OSArray *withCapacity(unsigned) { return new OSArray; } void setObject(OSObject *o) { v.push_back(o); } };
+#define OSSafeReleaseNULL(x) do { (void)(x); } while (0)   /* the stand-ins are not reference counted */
+#define FBLOG(...) do { } while (0)
+static UInt32 gArg;
+static bool PE_parse_boot_argn(const char *name, void *out, int) { if (strcmp(name, "nvrmfbddc") || !gArg) return false; *(UInt32 *)out = gArg; return true; }
+struct FB {
+    bool fDdcOn = false, fInternal = false; unsigned fIndex = 0; OSArray *published = nullptr;
+    void setProperty(const char *k, OSObject *o) { assert(!strcmp(k, kIOFBI2CInterfaceInfoKey)); published = dynamic_cast<OSArray *>(o); }
+    void publishDdcBus();
+};
+'''
+bus_checks = r'''
+// The bus numbers of the interfaces IOGraphics creates, or none when it refuses a dictionary
+static std::vector<UInt32> interfaces(OSArray *buses) {
+    std::vector<UInt32> ids;
+    if (!buses) return ids;
+    for (OSObject *o : buses->v) {
+        OSDictionary *d = dynamic_cast<OSDictionary *>(o);
+        OSNumber *id = d && d->m.count(kIOI2CInterfaceIDKey) ? dynamic_cast<OSNumber *>(d->m[kIOI2CInterfaceIDKey]) : nullptr;
+        if (!id) return {};
+        ids.push_back((UInt32)id->v);
+    }
+    return ids;
+}
+int main() {
+    FB fb; gArg = 1; fb.publishDdcBus();
+    assert(fb.fDdcOn && fb.published && fb.published->v.size() == 1);
+    std::vector<UInt32> ids = interfaces(fb.published);
+    assert(ids.size() == 1 && ids[0] == 0);                // one interface, on the only bus doI2CRequest answers (checked above)
+    OSDictionary *bus = dynamic_cast<OSDictionary *>(fb.published->v[0]);
+    assert(((OSNumber *)bus->m[kIOI2CTransactionTypesKey])->v == 7 && ((OSNumber *)bus->m[kIOI2CSupportedCommFlagsKey])->v == 0);
+    bus->m.erase(kIOI2CInterfaceIDKey);                    // control: the dictionary as it was published before
+    assert(interfaces(fb.published).empty());
+    FB off; gArg = 0; off.publishDdcBus(); assert(!off.fDdcOn && !off.published);                                   // opt-in
+    FB panel; gArg = 1; panel.fInternal = true; panel.publishDdcBus(); assert(!panel.fDdcOn && !panel.published);   // no bus on the internal panel
+    puts("PASS: the published bus has the interface ID IOGraphics needs, on the bus doI2CRequest answers");
+}
+'''
 with tempfile.TemporaryDirectory() as d:
     d = pathlib.Path(d)
     (d / 't.cpp').write_text(fixture + method.replace('NVRMNVDAFramebuffer::', 'FB::').replace('struct IOI2CBusTiming *', 'IOI2CBusTiming *').replace('struct IOI2CRequest *rq', 'IOI2CRequest *rq') + checks)
     subprocess.run(['clang++', '-std=c++17', '-Wall', f'-I{root}/kexts/NVRMFB', str(d / 't.cpp'), '-o', str(d / 't')], check=True)
     subprocess.run([str(d / 't')], check=True)
+    (d / 'b.cpp').write_text(bus_fixture + publish.replace('NVRMNVDAFramebuffer::', 'FB::') + bus_checks)
+    subprocess.run(['clang++', '-std=c++17', '-Wall', str(d / 'b.cpp'), '-o', str(d / 'b')], check=True)
+    subprocess.run([str(d / 'b')], check=True)
