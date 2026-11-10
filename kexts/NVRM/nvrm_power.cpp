@@ -4,9 +4,10 @@
  * SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
  *
  * Notebook power budget. A notebook GPU boots at the VBIOS default power limit; the laptop's real budget is applied by
- * telling the GPU firmware to enter TGP mode. With boot-arg nvrmtgp=1 this manager does that once the GPU is up, only
- * while on mains power, and follows the charger with a 5 s poll. Off by default: with the boot-arg absent nothing here
- * runs. The idea comes from the NvGfx project (watchthelight-labs/NvGfx); the code is ours.
+ * telling the GPU firmware to enter TGP mode. This manager does that once the GPU is up, only while on mains power, and
+ * follows the charger with a 5 s poll. In this fork it is on unless boot-arg nvrmtgp=0 is given (upstream: off unless
+ * nvrmtgp=1); with nvrmtgp=0 nothing here runs. A machine that reports no power source is sent nothing.
+ * The idea comes from the NvGfx project (watchthelight-labs/NvGfx); the code is NullMoth's.
  *
  *   debug.nvrm_tgp_enable       RW  1 follow the power source (default), 0 hold the VBIOS default (live rollback)
  *   debug.nvrm_tgp_state        RO  what the firmware was last told: 1 on, 0 off, -1 nothing yet
@@ -82,8 +83,9 @@ static void nvrm_tgp_tick(thread_call_param_t, thread_call_param_t)
 
 extern "C" void nvrm_power_start(nv_state_t *nv)
 {
-    int v = 0;
-    if (!PE_parse_boot_argn("nvrmtgp", &v, sizeof(v)) || !v) return;
+    int v = 1;   // on unless nvrmtgp=0
+    PE_parse_boot_argn("nvrmtgp", &v, sizeof(v));
+    if (!v) return;
     if (gTgpCall || !nv) return;
     static bool sysctlsUp;
     if (!sysctlsUp) {
@@ -96,7 +98,7 @@ extern "C" void nvrm_power_start(nv_state_t *nv)
     gTgpStopping = 0; gTgpPaused = 0; gTgpFails = 0; gTgpState = -1;
     gTgpCall = thread_call_allocate(nvrm_tgp_tick, NULL);
     if (!gTgpCall) { kprintf("NVRM-xnu: TGP: no thread call\n"); return; }
-    kprintf("NVRM-xnu: TGP mode manager armed (nvrmtgp=1), first check in %u ms\n", NVRM_TGP_FIRST_MS);
+    kprintf("NVRM-xnu: TGP mode manager armed (nvrmtgp=0 disables), first check in %u ms\n", NVRM_TGP_FIRST_MS);
     nvrm_tgp_arm(NVRM_TGP_FIRST_MS);
 }
 
