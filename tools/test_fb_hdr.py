@@ -81,7 +81,43 @@ int main() {
     puts("PASS: HDR block parsed from a CTA-861 extension, PQ required, luminance code decoded, HDR10 at 10 bits with SDR kept at 8");
 }
 '''
+# The boot raster is lit in SDR. macOS lists an HDR10 timing of the same raster and rate next to the SDR one, and
+# setDetailedTimings makes the first timing that is the boot raster the current mode, without a mode set: it has to be the SDR
+# one. The real dtIsBootRaster is compiled twice, as it is and without its HDR10 line (the control).
+boot = body('bool NVRMNVDAFramebuffer::dtIsBootRaster(') + '\n}\n'
+hdr_line = '    if (d.dynamicRange == kIODynamicRangeHDR10) return false;'
+assert hdr_line in boot, 'an HDR10 timing can be taken for the boot raster'
+before = '\n'.join(l for l in boot.splitlines() if not l.startswith(hdr_line)).replace('::dtIsBootRaster(', '::before(') + '\n'
+boot_fixture = r'''
+#include <cassert>
+#include <cstdint>
+#include <cstdio>
+typedef uint64_t UInt64; typedef uint32_t NvU32;
+enum { kIODynamicRangeSDR = 1, kIODynamicRangeHDR10 = 2 };
+struct IODetailedTimingInformationV2 { unsigned horizontalScaled, verticalScaled, horizontalActive, verticalActive, horizontalBlanking, verticalBlanking, dynamicRange; UInt64 pixelClock; };
+struct FB {
+    unsigned fBootW = 1920, fBootH = 1080; struct { struct { unsigned refreshRate; } timings; } fBootMode = { { 143998 } };
+    bool dtIsBootRaster(const IODetailedTimingInformationV2 &d) const; bool before(const IODetailedTimingInformationV2 &d) const;
+};
+'''
+boot_checks = r'''
+int main() {
+    FB fb;
+    IODetailedTimingInformationV2 sdr = { 0, 0, 1920, 1080, 160, 55, kIODynamicRangeSDR, 339950000 }, hdr = sdr, slow = sdr;
+    hdr.dynamicRange = kIODynamicRangeHDR10;
+    slow.horizontalBlanking = 280; slow.verticalBlanking = 45; slow.pixelClock = 148350000;      // the same raster at 60 Hz
+    const IODetailedTimingInformationV2 list[3] = { slow, hdr, sdr };                             // the HDR10 twin comes first
+    int now = -1, was = -1;
+    for (int i = 2; i >= 0; i--) { if (fb.dtIsBootRaster(list[i])) now = i; if (fb.before(list[i])) was = i; }
+    assert(now == 2);                                  // the SDR timing, wherever it is in the list
+    assert(was == 1);                                  // control: the HDR10 timing was taken for the boot raster
+    puts("PASS: the boot raster is its SDR timing, not the HDR10 timing of the same raster and rate");
+}
+'''
 with tempfile.TemporaryDirectory() as d:
     d = pathlib.Path(d); (d/'t.cpp').write_text(fixture)
     subprocess.run(['clang++','-std=c++17','-Wall','-Werror',f'-I{root}/kexts/NVRMFB/fb',str(d/'t.cpp'),'-o',str(d/'t')],check=True)
     subprocess.run([str(d/'t')],check=True)
+    (d/'b.cpp').write_text(boot_fixture + (boot + before).replace('NVRMNVDAFramebuffer::', 'FB::') + boot_checks)
+    subprocess.run(['clang++','-std=c++17','-Wall','-Werror',str(d/'b.cpp'),'-o',str(d/'b')],check=True)
+    subprocess.run([str(d/'b')],check=True)

@@ -3715,6 +3715,7 @@ static void dtRasterTurned(const IODetailedTimingInformationV2 *d, NvU32 *w, NvU
 bool NVRMNVDAFramebuffer::dtIsBootRaster(const IODetailedTimingInformationV2 &d) const
 {
     if (d.horizontalScaled || d.verticalScaled || d.horizontalActive != fBootW || d.verticalActive != fBootH) return false;
+    if (d.dynamicRange == kIODynamicRangeHDR10) return false;   // the boot raster is lit in SDR: its HDR10 twin is another mode
     const UInt64 tot = (UInt64)(d.horizontalActive + d.horizontalBlanking) * (d.verticalActive + d.verticalBlanking);
     return tot && (NvU32)((d.pixelClock + tot / 2) / tot) == (fBootMode.timings.refreshRate + 500) / 1000;
 }
