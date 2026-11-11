@@ -238,9 +238,10 @@ static void nvmtl_conf_settle(void)
     nvmtl_profile_ctx ctx = { p, 0 };
     for (unsigned i = 0; p && i < p->nknobs && i < 64; i++) if (getenv(p->knobs[i].key)) ctx.envBits |= 1ull << i;
     nvmtl_conf_read_file(forgot);
-    // Calendar's dynamic Dock tile loses its GPU channel with asynchronous NVK submission.
-    // Use the synchronous NVK path for Apple's tile host, before it opens its first device.
-    if (!strcmp(me, "com.apple.dock.extra") && !strcmp(bid, "com.apple.dock.extra"))
+    // Dock's dynamic tiles and shortcut menus can lose their GPU channels on the first
+    // asynchronous NVK upload. Select the synchronous queue before either host opens a device.
+    if ((!strcmp(me, "com.apple.dock.extra") && !strcmp(bid, "com.apple.dock.extra")) ||
+        (!strcmp(me, "DockHelper") && !strcmp(bid, "com.apple.dock.helper")))
         setenv("NVRM_ASYNC", "0", 0);
     nvmtl_os_version_override(me, bid);
     if (p && !nvmtl_app_profile_for(me, bid, getenv("NVMTL_APP_PROFILE"))) {
