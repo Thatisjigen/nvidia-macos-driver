@@ -256,6 +256,51 @@ static inline NvrmRateSeed nvrmRateSeed(const T *dt, unsigned n, unsigned fromMa
     }
     return s;
 }
+// ---- Hardware cursor on a scaled desktop ----
+// A scaled mode whose desktop is larger than the surface the head scans (macOS's HiDPI "looks like 1920x1080" on a
+// 1920x1080 panel: a 3840x2160 desktop shrunk by the head) gets the cursor image at the desktop's scale, while the cursor
+// plane draws it on the raster unscaled: the arrow showed at twice its size. The image goes to the plane shrunk by the
+// same ratio, and so does its hotspot. Leaving the cursor to macOS is not an option there: it kept sending cursor states
+// to the plane after the framebuffer stopped reporting a hardware cursor, and the arrow was not drawn at all.
+static inline bool nvrmDesktopShrunk(unsigned deskW, unsigned deskH, unsigned surfW, unsigned surfH)
+{
+    return deskW && deskH && surfW && surfH && (deskW > surfW || deskH > surfH);
+}
+// Box filter of a straight-alpha ARGB image (what convertCursorImage gives): each output pixel averages the source pixels
+// it covers, the colour weighted by alpha so transparent pixels add no dark fringe. src is w x h, dst gets ow x oh.
+static inline bool nvrmShrinkCursor(const unsigned *src, unsigned w, unsigned h, unsigned deskW, unsigned deskH,
+                                    unsigned surfW, unsigned surfH, unsigned *dst, unsigned *ow, unsigned *oh)
+{
+    if (!src || !dst || !ow || !oh || !w || !h || !deskW || !deskH || !surfW || !surfH) return false;
+    unsigned nw = (unsigned)(((unsigned long long)w * surfW + deskW - 1) / deskW);
+    unsigned nh = (unsigned)(((unsigned long long)h * surfH + deskH - 1) / deskH);
+    if (!nw) nw = 1;
+    if (!nh) nh = 1;
+    for (unsigned oy = 0; oy < nh; oy++) {
+        unsigned y0 = (unsigned)((unsigned long long)oy * deskH / surfH), y1 = (unsigned)((unsigned long long)(oy + 1) * deskH / surfH);
+        if (y0 >= h) y0 = h - 1;
+        if (y1 <= y0) y1 = y0 + 1;
+        if (y1 > h) y1 = h;
+        for (unsigned ox = 0; ox < nw; ox++) {
+            unsigned x0 = (unsigned)((unsigned long long)ox * deskW / surfW), x1 = (unsigned)((unsigned long long)(ox + 1) * deskW / surfW);
+            if (x0 >= w) x0 = w - 1;
+            if (x1 <= x0) x1 = x0 + 1;
+            if (x1 > w) x1 = w;
+            unsigned long long sa = 0, sr = 0, sg = 0, sb = 0, n = 0;
+            for (unsigned y = y0; y < y1; y++)
+                for (unsigned x = x0; x < x1; x++) {
+                    const unsigned p = src[y * w + x], a = p >> 24;
+                    sa += a; sr += ((p >> 16) & 255) * a; sg += ((p >> 8) & 255) * a; sb += (p & 255) * a; n++;
+                }
+            const unsigned a = n ? (unsigned)((sa + n / 2) / n) : 0;
+            const unsigned r = sa ? (unsigned)((sr + sa / 2) / sa) : 0, g = sa ? (unsigned)((sg + sa / 2) / sa) : 0,
+                           b = sa ? (unsigned)((sb + sa / 2) / sa) : 0;
+            dst[oy * nw + ox] = (a << 24) | (r << 16) | (g << 8) | b;
+        }
+    }
+    *ow = nw; *oh = nh;
+    return true;
+}
 // ---- Bounded waits ----
 // Try `tryFn()` until it succeeds or `totalMs` has passed, sleeping `stepMs` between tries. Returns whether it succeeded.
 // A WindowServer thread that waits forever on a lock someone else holds is killed by the watchdog after two minutes

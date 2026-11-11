@@ -654,6 +654,13 @@ class NVRMNVDAFramebuffer : public IOFramebuffer {
     bool fRotSizesOurs = false;   // the display's scale-resolutions were put there by publishRotatedSizes
     bool dtIsCurrent(const IODetailedTimingInformationV2 &d) const;
     bool dtIsBootRaster(const IODetailedTimingInformationV2 &d) const;
+    bool desktopShrunk() const;   // the mode on the head is a desktop larger than the scanned surface (nvrmDesktopShrunk)
+    bool fCurWasShrunk = false;   // desktopShrunk() at the last mode change: the cursor image is rebuilt when it was or is
+    // The last cursor image macOS gave, as convertCursorImage left it, and its hotspot: buildCursor() makes the plane's image
+    // from it, shrunk on a shrunk desktop, again after a mode change (fCurRebuild).
+    UInt32 *fCurSrc = nullptr; size_t fCurSrcBytes = 0; UInt32 fCurSrcW = 0, fCurSrcH = 0; SInt32 fCurSrcHotX = 0, fCurSrcHotY = 0;
+    volatile UInt32 fCurRebuild = 0;
+    bool buildCursor();
     IODetailedTimingInformationV2 fCurDT = {};
     volatile UInt32 fNewIdOnce = 0;
     NvU32 fPitchAlign = 256;
@@ -2870,6 +2877,11 @@ bool NVRMNVDAFramebuffer::cursorApply(bool imageChanged)
     NVRMHeadGate::waitForCursor(startLock(), fPrimaryGate);
     if (OSAddAtomic(0, &fStopping)) return false;
     if (!fKms || !fDev || !fCurSurf || !fModeSet) return false;
+    // a mode change into, out of or between shrunk desktops: the plane's image is made again for this desktop
+    if (OSCompareAndSwap(1, 0, &fCurRebuild) && fCurHaveImage && buildCursor()) {
+        __asm__ __volatile__("sfence" ::: "memory");
+        imageChanged = true;
+    }
     struct NvKmsKapiRequestedModeSetConfig *cfg =
         (struct NvKmsKapiRequestedModeSetConfig *)IOMalloc(sizeof *cfg);
     struct NvKmsKapiModeSetReplyConfig *rep =
@@ -2944,9 +2956,58 @@ IOReturn NVRMNVDAFramebuffer::setCursorImage(void *cursorImage)
     if (OSAddAtomic(0, &fStopping) || !fCurKva || !fCurSurf) return kIOReturnUnsupported;
     return setCursorImageLocked(cursorImage);
 }
+// The plane's image from the last cursor macOS gave (fCurSrc): shrunk when the desktop is larger than the raster
+// (nvrmShrinkCursor), turned with the head's rotation, then packed. The hotspot macOS offsets its positions by stays in
+// desktop units (fCurHotX/Y); the one the plane's position is offset by is on the raster (fCurTurnedHotX/Y).
+bool NVRMNVDAFramebuffer::buildCursor()
+{
+    if (!fCurSrc || !fCurSrcW || !fCurSrcH || !fCurKva || !fCurDim) return false;
+    const size_t bytes = (size_t)fCurDim * fCurDim * sizeof(UInt32);
+    UInt32 *small = nullptr, *turned = nullptr;
+    const UInt32 *img = fCurSrc; UInt32 w = fCurSrcW, h = fCurSrcH;
+    SInt32 hx = fCurSrcHotX, hy = fCurSrcHotY;
+    if (desktopShrunk()) {
+        const bool swap = (fCurTransform & kIOScaleSwapAxes) != 0;
+        const unsigned tw = swap ? fH : fW, th = swap ? fW : fH, dw = fCurDT.horizontalScaled, dh = fCurDT.verticalScaled;
+        unsigned ow = 0, oh = 0;
+        small = (UInt32 *)IOMalloc(bytes);
+        if (small && nvrmShrinkCursor(fCurSrc, w, h, dw, dh, tw, th, small, &ow, &oh)) {
+            hx = (SInt32)(((SInt64)hx * tw) / dw); hy = (SInt32)(((SInt64)hy * th) / dh);
+            img = small; w = ow; h = oh;
+        }
+    }
+    SInt32 thx = hx, thy = hy;
+    if (fCurTransform && w && h && (UInt64)w * h * sizeof(UInt32) <= bytes) {
+        const bool swap = (fCurTransform & kIOScaleSwapAxes) != 0;
+        const bool ix = (fCurTransform & kIOScaleInvertX) != 0, iy = (fCurTransform & kIOScaleInvertY) != 0;
+        const UInt32 dw = swap ? h : w, dh = swap ? w : h;
+        turned = (UInt32 *)IOMalloc(bytes);
+        if (turned) {
+            for (UInt32 y = 0; y < dh; y++) for (UInt32 x = 0; x < dw; x++) {
+                const UInt32 ux = iy ? dw - 1 - x : x, uy = ix ? dh - 1 - y : y;
+                const UInt32 sx = swap ? uy : ux, sy = swap ? ux : uy;
+                turned[y * dw + x] = img[sy * w + sx];
+            }
+            thx = swap ? hy : hx; thy = swap ? hx : hy;
+            if (iy) thx = (SInt32)dw - thx - 1;
+            if (ix) thy = (SInt32)dh - thy - 1;
+            img = turned; w = dw; h = dh;
+        }
+    }
+    const bool packed = nvrmPackCursor((UInt32 *)fCurKva, fCurDim, img, w, h);
+    if (packed) { fCurHotX = fCurSrcHotX; fCurHotY = fCurSrcHotY; fCurTurnedHotX = thx; fCurTurnedHotY = thy; }
+    if (turned) IOFree(turned, bytes);
+    if (small) IOFree(small, bytes);
+    return packed;
+}
 IOReturn NVRMNVDAFramebuffer::setCursorImageLocked(void *cursorImage)
 {
     size_t bytes = (size_t)fCurDim * fCurDim * sizeof(UInt32);
+    if (!fCurSrc) {
+        fCurSrc = (UInt32 *)IOMalloc(bytes);
+        if (!fCurSrc) return kIOReturnNoMemory;
+        fCurSrcBytes = bytes;
+    }
     UInt32 *staging = (UInt32 *)IOMalloc(bytes);
     if (!staging) return kIOReturnNoMemory;
     nvu_zero(staging, bytes);
@@ -2961,28 +3022,13 @@ IOReturn NVRMNVDAFramebuffer::setCursorImageLocked(void *cursorImage)
     ci.minorVersion = kHardwareCursorInfoMinorVersion;
     ci.hardwareCursorData = (UInt8 *)staging;
     bool converted = convertCursorImage(cursorImage, &d, &ci);
-    UInt32 w = ci.cursorWidth, h = ci.cursorHeight; const UInt32 *img = staging; UInt32 *turned = nullptr;
-    SInt32 hx = (SInt32)ci.cursorHotSpotX, hy = (SInt32)ci.cursorHotSpotY, thx = hx, thy = hy;
-    if (converted && fCurTransform && w && h && (UInt64)w * h * sizeof(UInt32) <= bytes) {
-        const bool swap = (fCurTransform & kIOScaleSwapAxes) != 0;
-        const bool ix = (fCurTransform & kIOScaleInvertX) != 0, iy = (fCurTransform & kIOScaleInvertY) != 0;
-        const UInt32 dw = swap ? h : w, dh = swap ? w : h;
-        turned = (UInt32 *)IOMalloc(bytes);
-        if (turned) {
-            for (UInt32 y = 0; y < dh; y++) for (UInt32 x = 0; x < dw; x++) {
-                const UInt32 ux = iy ? dw - 1 - x : x, uy = ix ? dh - 1 - y : y;
-                const UInt32 sx = swap ? uy : ux, sy = swap ? ux : uy;
-                turned[y * dw + x] = staging[sy * w + sx];
-            }
-            thx = swap ? hy : hx; thy = swap ? hx : hy;
-            if (iy) thx = (SInt32)dw - thx - 1;
-            if (ix) thy = (SInt32)dh - thy - 1;
-            img = turned; w = dw; h = dh;
-        }
+    const UInt32 w = ci.cursorWidth, h = ci.cursorHeight;
+    bool packed = false;
+    if (converted && w && h && (UInt64)w * h * sizeof(UInt32) <= fCurSrcBytes) {
+        nvu_copy(fCurSrc, staging, (size_t)w * h * sizeof(UInt32));
+        fCurSrcW = w; fCurSrcH = h; fCurSrcHotX = (SInt32)ci.cursorHotSpotX; fCurSrcHotY = (SInt32)ci.cursorHotSpotY;
+        packed = buildCursor();
     }
-    bool packed = converted && nvrmPackCursor((UInt32 *)fCurKva, fCurDim, img, w, h);
-    if (packed) { fCurHotX = hx; fCurHotY = hy; fCurTurnedHotX = thx; fCurTurnedHotY = thy; }
-    if (turned) IOFree(turned, bytes);
     IOFree(staging, bytes);
     if (!packed) {
         bool hadImage = fCurHaveImage;
@@ -3019,7 +3065,7 @@ IOReturn NVRMNVDAFramebuffer::setCursorState(SInt32 x, SInt32 y, bool visible)
             if (fCurTransform & kIOScaleInvertY) px = (SInt32)fW - 1 - px;
             if (fCurTransform & kIOScaleInvertX) py = (SInt32)fH - 1 - py;
             x = px - fCurTurnedHotX; y = py - fCurTurnedHotY;
-        } else { x = px - fCurHotX; y = py - fCurHotY; }
+        } else { x = px - fCurTurnedHotX; y = py - fCurTurnedHotY; }   // the hotspot on the raster: shrunk with the image
     }
     IOInterruptState state = IOSimpleLockLockDisableInterrupt(fCurStateLock);
     const bool same = x == fCurX && y == fCurY && visible == fCurVisible && fCurRc == NV_KMS_FLIP_RESULT_SUCCESS;
@@ -3593,6 +3639,7 @@ void NVRMNVDAFramebuffer::free()
 {
     if (fFlipCacheLock) { IOSimpleLockFree(fFlipCacheLock); fFlipCacheLock = nullptr; }
     if (fCurStateLock) { IOSimpleLockFree(fCurStateLock); fCurStateLock = nullptr; }
+    if (fCurSrc) { IOFree(fCurSrc, fCurSrcBytes); fCurSrc = nullptr; fCurSrcBytes = 0; }
     fConsKva = nullptr; OSSafeReleaseNULL(fConsMap); OSSafeReleaseNULL(fConsMem);
     OSSafeReleaseNULL(fPxMap);
     super::free();
@@ -3724,7 +3771,17 @@ IOReturn NVRMNVDAFramebuffer::setDisplayMode(IODisplayModeID mode, IOIndex depth
                 fPendingLoad = nvrmScalerLoad(dt.horizontalActive, dt.verticalActive, dt.horizontalScaled, dt.verticalScaled, hz);
             }
             result = switchMode(mode, m, w, h, dt.scalerFlags & kIOScaleRotateFlags);
-            if (result == kIOReturnSuccess) fCurDT = dt;
+            if (result == kIOReturnSuccess) {
+                fCurDT = dt;
+                // The cursor image on the plane was made for the desktop before: on a shrunk desktop, or coming out of one, it is
+                // made again from macOS's image at the next cursor apply (buildCursor).
+                const bool shrunk = desktopShrunk();
+                if (shrunk || fCurWasShrunk) {
+                    fCurWasShrunk = shrunk;
+                    OSCompareAndSwap(0, 1, &fCurRebuild);
+                    if (fCursorCall) scheduleCall(fCursorCall, 0);
+                }
+            }
         }
     }
     if (result == kIOReturnSuccess) refreshDisplayAudioProperties();
@@ -3820,6 +3877,12 @@ static void dtRasterTurned(const IODetailedTimingInformationV2 *d, NvU32 *w, NvU
 {
     const bool swap = (d->scalerFlags & kIOScaleSwapAxes) != 0;
     *w = swap ? d->verticalActive : d->horizontalActive; *h = swap ? d->horizontalActive : d->verticalActive;
+}
+bool NVRMNVDAFramebuffer::desktopShrunk() const
+{
+    if (fCurId == kModeId || !fCurDT.horizontalScaled || !fCurDT.verticalScaled) return false;
+    const bool swap = (fCurTransform & kIOScaleSwapAxes) != 0;
+    return nvrmDesktopShrunk(fCurDT.horizontalScaled, fCurDT.verticalScaled, swap ? fH : fW, swap ? fW : fH);
 }
 bool NVRMNVDAFramebuffer::dtIsBootRaster(const IODetailedTimingInformationV2 &d) const
 {
