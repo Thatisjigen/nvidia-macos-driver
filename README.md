@@ -106,6 +106,7 @@ Optional boot arguments, for troubleshooting:
 |---|---|
 | `nvfb=0`, `nvaccel=0` | the framebuffer or the accelerator does not start. Both are on by default; `-nvoff` and the start counter are what recovers a start that cannot light a display. |
 | `nvfbheads=N` | publishes N display heads instead of four. |
+| `nvfbemptyout=0` | a card with one output and no display on it at start does not start that output. By default it starts with the card, its connection off, so that a monitor plugged in later lights up: macOS opens a GPU's framebuffers when WindowServer starts, and one that starts with the monitor is opened only after WindowServer restarts. |
 | `nvkmssmooth=1` | tells NVKMS which head the firmware left scanning out, so it can take that raster over. Off by default, as every install ran with `-nvkmsnosmooth`. |
 | `nvrmtgp=0` | leaves a laptop GPU at its VBIOS power limit on AC: the power-budget manager does not run. It is on by default here (upstream: only with `nvrmtgp=1`); `debug.nvrm_tgp_enable=0` holds the VBIOS limit at run time. Giving `nvrmtgp=1` adds one thing: the resource manager's notebook question is then also answered from ACPI (the NVPCF device or a control-method battery), for a laptop whose battery macOS does not publish. The GPS and NVPCF `_DSM` calls stay behind `nvrmgps=1` and `nvrmnvpcf=1`. |
 | `nmintelfb=1` | lets NMIntelFB drive the Intel built-in panel. Off by default: here another driver lights that panel. |

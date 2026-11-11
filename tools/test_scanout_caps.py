@@ -39,6 +39,7 @@ struct Kms {
 };
 struct NVRMNVDAFramebuffer {
     Kms *fKms=nullptr;void *fDev=this;unsigned fDisplay=1,fIndex=0;
+    bool fNoDisplayYet=false;   // the output started with no display on it
     NvU32 fW=0,fH=0,fScalerMaxW=0,fScalerMaxH=0,fRasterMaxW=0;
     NvU64 fSize=0,fAllocSize=0,fModesAllocSize=0;
     void computeScanoutCaps(NvU32 pitchAlign);
@@ -78,6 +79,12 @@ int main() {
     NVRMNVDAFramebuffer e;Kms none;e.fKms=&none;e.fW=1920;e.fH=1080;e.fSize=1920ull*1080*4;
     e.computeScanoutCaps(256);
     assert(e.fScalerMaxW==3840 && e.fScalerMaxH==2160);
+
+    // an output that started with no display: whatever NVKMS would list for the absent display is not asked for, and the
+    // ceilings are one step up from its stand-in raster, the size reserved for the monitor that arrives
+    NVRMNVDAFramebuffer w;w.fKms=&uw;w.fNoDisplayYet=true;w.fW=1920;w.fH=1080;w.fSize=1920ull*1080*4;
+    w.computeScanoutCaps(256);
+    assert(w.fScalerMaxW==3840 && w.fScalerMaxH==2160 && w.fRasterMaxW==3840);
 
     // interlaced/doublescan rasters do not raise the ceiling
     Kms il;il.modes={mode(1920,1080,60)};il.modes[0].timings.flags.interlaced=true;

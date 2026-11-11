@@ -10,8 +10,12 @@ the idle nubs). nvfbbootretry=0 turns it off. The policy is compiled from nvrm-f
 import pathlib, subprocess, tempfile
 root = pathlib.Path(__file__).resolve().parents[1]
 src = (root / 'kexts/NVRMFB/fb/nvrm-fb.cpp').read_text()
-for need in ['PE_parse_boot_argn("nvfbbootretry"', 'gNDpy == 0 && gBootRetry < kNvrmBootRetries', 'nvrmBootRetryDelayMs(gBootRetry++)', 'if (gNDpy == 0 && n > 0)']:
+# "Nothing connected" is asked of the displays, not of the table's size: an output that starts with no display on it
+# (test_fb_empty_output.py) is in the table, and the scans have to go on until its monitor answers.
+for need in ['PE_parse_boot_argn("nvfbbootretry"', '!nvrmAnyDisplayConnected() && gBootRetry < kNvrmBootRetries', 'nvrmBootRetryDelayMs(gBootRetry++)', 'if (answered == 0 && n > 0)']:
     assert need in src, need
+any_connected = src[src.index('static bool nvrmAnyDisplayConnected()'):]
+assert 'if (gDpy[k].connected) return true;' in any_connected[:any_connected.index('\n}\n')]
 assert src.index('static unsigned gBootRetry') < src.index('gBootRetry = off ?'), 'declared after use'
 fixture = r'''
 #include <cassert>
