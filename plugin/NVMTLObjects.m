@@ -3776,6 +3776,7 @@ unsigned nvmtl_apps1_resolve_miss, nvmtl_apps1_resolve_extra, nvmtl_apps1_ds_res
 @end
 
 @interface NVMTLRenderCommandEncoder () { @public BOOL _hzFull; uint32_t _hzAttSkip; } @end   // NVMTL_HAZARD: keeps render passes; untracked attachments
+@interface NVMTLRenderCommandEncoder () { uint32_t _earlyColorClear; } @end
 // Metal does not order an untracked resource between encoders (nvmtl_hazard.h); NVMTL_HAZARD_HEAPS=all tracks everything.
 static int nvmtl_hz_untracked_res(id r) {
     return nvmtl_hz_mode() > 0 && !nvmtl_hz_heaps_all() && [r respondsToSelector:@selector(hazardTrackingMode)] &&
@@ -4224,6 +4225,7 @@ static BOOL nvmtl_pixel_sampler_update(NSMutableDictionary *states, NSString *in
 - (BOOL)nvmtlBuildPass:(MTLRenderPassDescriptor *)d {
     NVMTLCommandBuffer *cb = _cb;
     memset(&_pass, 0, sizeof _pass); cb->_c.depth_view = NULL; _hzAttSkip = 0;
+    _earlyColorClear = 0;
     for (int i = 0; i < NVMTL_NCOL; i++) _colTex[i] = nil;
     _tileW = (uint32_t)NVMTL_SINCE(11.0, NSUInteger, d.tileWidth, 0); _tileH = (uint32_t)NVMTL_SINCE(11.0, NSUInteger, d.tileHeight, 0); _tilePs = nil;
     MTLSamplePosition sample[8];
@@ -4270,6 +4272,14 @@ static BOOL nvmtl_pixel_sampler_update(NSMutableDictionary *states, NSString *in
         _pass.clear[i][0] = ta8 ? (float)cc.alpha : (float)cc.red; _pass.clear[i][1] = (float)cc.green; _pass.clear[i][2] = (float)cc.blue; _pass.clear[i][3] = (float)cc.alpha;
         if (ta8 == 2) { _pass.clear[i][0] = (float)cc.alpha; _pass.clear[i][1] = (float)cc.red; _pass.clear[i][2] = (float)cc.green; _pass.clear[i][3] = (float)cc.blue; }   // ARGB8 stored as RGBA8
         if (nvmtl_load_keeps(ca.loadAction)) load |= NVMTL_LOAD_COLOUR(i);
+        const nvk_image *im = _pass.col[i];
+        const MTLTextureUsage readWriteTarget = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite | MTLTextureUsageRenderTarget;
+        if (ca.loadAction == MTLLoadActionClear && t->_surf && !t->_parent && !t->_viewParent && NL == 1 &&
+            t->_fmt == MTLPixelFormatRGBA16Float && (t->_usage & readWriteTarget) == readWriteTarget &&
+            im->mtl_type == MTLTextureType2D && im->samples <= 1 && im->mips == 1 && im->layers == 1 &&
+            !_pass.col_level[i] && !_pass.col_layer[i] && (!tvk || tvk == im->fmt) &&
+            (im->usage & VK_IMAGE_USAGE_TRANSFER_DST_BIT))
+            _earlyColorClear |= 1u << i;
         if (cw < w) w = cw;
         if (ch < h) h = ch;
         any = YES;
@@ -4496,6 +4506,15 @@ static MTLPixelFormat nvmtl_swizzle_twin_mtl(MTLPixelFormat f) { return (MTLPixe
     if (nvmtl_hz_mode()) nvmtl_hz_render_writes(_cb, p);
     if (!_begun) {
         if (_refused) return;
+        // RenderBox samples its recycled FP16 colour target, sometimes after the first pipeline was bound.
+        // A render-pass load clear alone can leave old pixels visible through that sampled view. Clear the
+        // backing first for this IOSurface texture shape, then load the cleared pixels into the pass.
+        for (uint32_t pending = _earlyColorClear; pending; pending &= pending - 1) {
+            uint32_t i = (uint32_t)__builtin_ctz(pending), bit = NVMTL_LOAD_COLOUR(i);
+            nvmtl_vk_cmd_clear_image_before_render(&_cb->_c, _pass.col[i], _pass.clear[i]);
+            _pass.load |= bit; _load |= bit;
+        }
+        _earlyColorClear = 0;
         _cb->_c.hz_force_full = _hzFull; _cb->_c.hz_att_skip = _hzAttSkip;
         if (nvmtl_vk_cmd_begin_pass(&_cb->_c, &_pass, &p->_p)) {
             nvlog("encoder: begin render FAILED — nothing is recorded for this pipeline");

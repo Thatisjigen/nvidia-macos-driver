@@ -8534,27 +8534,44 @@ static void nvmtl_vk_zero_dummies(void)
           g_dummyStex.view ? ", storage -> GENERAL" : "; no storage dummy");
 }
 
-int nvmtl_vk_cmd_clear_image(nvk_cmdbuf *c, nvk_image *img, const float clear[4])
+static void nvmtl_clear_base_colour(nvk_cmdbuf *c, nvk_image *img, const float clear[4], int before_render)
 {
     VkImageSubresourceRange range = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
     VkImageMemoryBarrier toDst = { VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, NULL,
-        0, VK_ACCESS_TRANSFER_WRITE_BIT, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+        before_render ? VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT : 0,
+        VK_ACCESS_TRANSFER_WRITE_BIT, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
         VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED, (VkImage)img->img, range };
-    pvkCmdPipelineBarrier(c->cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+    pvkCmdPipelineBarrier(c->cb, before_render ? VK_PIPELINE_STAGE_ALL_COMMANDS_BIT : VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
                           0, 0, NULL, 0, NULL, 1, &toDst);
     VkClearColorValue cv; nvmtl_clear_colour(&cv, img->fmt, clear);
     hz_state *hzs = nvmtl_hz_mode() > 0 && !c->in_rp ? hz_get(c->cb, 1) : NULL;
     if (hzs) hzs->arm_any = 1;
     pvkCmdClearColorImage(c->cb, (VkImage)img->img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &cv, 1, &range);
     if (hzs) { hz_ent e = hz_key_image(img, 1); e.src = HZS_CLEAR; hz_append(hzs, &e); hz_close_region(hzs); hzs->debt = 1; HZC(HZC_CLEAR); }
+    VkPipelineStageFlags stages = VK_PIPELINE_STAGE_TRANSFER_BIT;
+    VkAccessFlags access = VK_ACCESS_TRANSFER_READ_BIT;
+    if (before_render) {
+        stages |= VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+        access |= VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+    }
     VkImageMemoryBarrier toSrc = { VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, NULL,
-        VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT,
+        VK_ACCESS_TRANSFER_WRITE_BIT, access,
         VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
         VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED, (VkImage)img->img, range };
-    pvkCmdPipelineBarrier(c->cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+    pvkCmdPipelineBarrier(c->cb, VK_PIPELINE_STAGE_TRANSFER_BIT, stages,
                           0, 0, NULL, 0, NULL, 1, &toSrc);
     img->layout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+}
+
+int nvmtl_vk_cmd_clear_image(nvk_cmdbuf *c, nvk_image *img, const float clear[4])
+{
+    nvmtl_clear_base_colour(c, img, clear, 0);
     return 0;
+}
+
+void nvmtl_vk_cmd_clear_image_before_render(nvk_cmdbuf *c, nvk_image *img, const float clear[4])
+{
+    nvmtl_clear_base_colour(c, img, clear, 1);
 }
 
 /*
