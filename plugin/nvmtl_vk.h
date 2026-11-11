@@ -256,6 +256,7 @@ int  nvmtl_vk_pipeline_create_vin_ms(const void *vs, size_t vn, const void *fs, 
 void nvmtl_vk_cmd_set_viewport(nvk_cmdbuf *c, float x, float y, float w, float h, float zn, float zf);
 void nvmtl_vk_cmd_draw(nvk_cmdbuf *c, uint32_t first, uint32_t count, uint32_t instances, uint32_t baseInstance);
 int  nvmtl_vk_cmd_clear_image(nvk_cmdbuf *c, nvk_image *img, const float clear[4]);
+void nvmtl_vk_cmd_clear_image_before_render(nvk_cmdbuf *c, nvk_image *img, const float clear[4]);
 void nvmtl_vk_cmd_set_scissor(nvk_cmdbuf *c, int32_t x, int32_t y, uint32_t w, uint32_t h);
 void nvmtl_vk_cmd_set_cull(nvk_cmdbuf *c, int mode);
 int  nvmtl_vk_cmd_set_topology(nvk_cmdbuf *c, unsigned mtlType);
