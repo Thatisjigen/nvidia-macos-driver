@@ -2767,7 +2767,7 @@ NSArray<NVMTLArgument *> *nvmtl_arguments_for_function(NVMTLFunction *fn)
         if (fn->_arguments) return fn->_arguments;
         NSDictionary *refl = nvmtl_function_reflection(fn);
         NSDictionary *names = nvmtl_air_names(fn) ?: @{ @"args": @{}, @"members": @{}, @"types": @{} };
-        NSMutableArray *out = [NSMutableArray new];
+        NSMutableArray *out = [NSMutableArray new], *param = [NSMutableArray new];   // param: each argument's parameter position
         NSMutableSet *seenBuf = [NSMutableSet new];
         for (NSDictionary *b in refl[@"bindings"]) {
             if (![b isKindOfClass:[NSDictionary class]]) continue;
@@ -2776,7 +2776,7 @@ NSArray<NVMTLArgument *> *nvmtl_arguments_for_function(NVMTLFunction *fn)
             if ([kind isEqualToString:@"Buffer"]) {
                 if ([seenBuf containsObject:@(idx)]) continue;
                 [seenBuf addObject:@(idx)];
-                [out addObject:nvmtl_build_buffer_argument(fn, idx, b, refl, names)];
+                [out addObject:nvmtl_build_buffer_argument(fn, idx, b, refl, names)]; [param addObject:b[@"param_index"]];
             } else if ([kind isEqualToString:@"Texture"] || [kind isEqualToString:@"TextureArray"] || [kind isEqualToString:@"StorageImage"]) {
                 NVMTLArgument *a = [NVMTLTextureArgument new]; a->_type = MTLBindingTypeTexture; a->_index = idx; a->_active = nvmtl_binding_active(b);
                 a->_name = names[@"args"][[NSString stringWithFormat:@"texture:%lu", (unsigned long)idx]] ?: [NSString stringWithFormat:@"texture%lu", (unsigned long)idx];
@@ -2790,16 +2790,29 @@ NSArray<NVMTLArgument *> *nvmtl_arguments_for_function(NVMTLFunction *fn)
                 a->_depth = [ttn isKindOfClass:[NSString class]] && [ttn rangeOfString:@"depth"].location != NSNotFound;
                 a->_texDataType = nvmtl_texdatatype_for_air_name(ttn);
                 id loc = b[@"descriptor"]; a->_arrayLength = [loc isKindOfClass:[NSDictionary class]] && [loc[@"count"] unsignedLongValue] > 1 ? [loc[@"count"] unsignedLongValue] : 1;
-                [out addObject:a];
+                [out addObject:a]; [param addObject:b[@"param_index"]];
             } else if ([kind isEqualToString:@"Sampler"]) {
                 NVMTLArgument *a = [NVMTLArgument new]; a->_type = MTLBindingTypeSampler; a->_index = idx; a->_active = nvmtl_binding_active(b); a->_arrayLength = 1;
                 a->_name = names[@"args"][[NSString stringWithFormat:@"sampler:%lu", (unsigned long)idx]] ?: [NSString stringWithFormat:@"sampler%lu", (unsigned long)idx];
-                [out addObject:a];
+                [out addObject:a]; [param addObject:b[@"param_index"]];
             }
         }
-        [out sortUsingComparator:^NSComparisonResult(NVMTLArgument *x, NVMTLArgument *y) {
+        // Apple lists a function's bindings in the order its parameters are declared, textures and buffers interleaved as
+        // written. VFX (Messages' animated backgrounds) compares a kernel's bindings, position by position, with the list
+        // recorded when the scene was authored on a Mac; WAS sorted by kind and index (every buffer, then every texture), so
+        // a kernel that declares a texture before its buffers never matched ("Script runtime data doesn't match authoring
+        // reflection"), its render graph was not built and the background drew without its textures.
+        NSMutableArray<NSNumber *> *order = [NSMutableArray arrayWithCapacity:out.count];
+        for (NSUInteger i = 0; i < out.count; i++) [order addObject:@(i)];
+        [order sortUsingComparator:^NSComparisonResult(NSNumber *i, NSNumber *j) {
+            const NSUInteger pi = [param[i.unsignedIntegerValue] unsignedIntegerValue], pj = [param[j.unsignedIntegerValue] unsignedIntegerValue];
+            if (pi != pj) return pi < pj ? NSOrderedAscending : NSOrderedDescending;
+            NVMTLArgument *x = out[i.unsignedIntegerValue], *y = out[j.unsignedIntegerValue];
             if (x->_type != y->_type) return x->_type < y->_type ? NSOrderedAscending : NSOrderedDescending;
             return x->_index < y->_index ? NSOrderedAscending : x->_index > y->_index ? NSOrderedDescending : NSOrderedSame; }];
+        NSMutableArray *declared = [NSMutableArray arrayWithCapacity:out.count];
+        for (NSNumber *i in order) [declared addObject:out[i.unsignedIntegerValue]];
+        out = declared;
         NSMutableString *s = [NSMutableString new];
         for (NVMTLArgument *a in out) [s appendFormat:@" %@(%lu)=%@%@", a->_type == MTLBindingTypeBuffer ? @"buffer" : a->_type == MTLBindingTypeTexture ? @"texture" : @"sampler",
                                        (unsigned long)a->_index, a->_name, a->_bufStruct ? [NSString stringWithFormat:@"[%lu members, %lu B]", (unsigned long)a->_bufStruct->_members.count, (unsigned long)a->_bufSize] : @""];
