@@ -40,6 +40,7 @@
 #include "nvmtl_copy_compat.h"
 #include "nvmtl_buffer_texture.h"
 #include "nvmtl_sampler_state.h"
+#include "nvmtl_spirv_stencil.h"
 static int g_sampler_anisotropy, g_sampler_mirror_clamp;
 static int g_scalar_layout;
 static uint32_t g_cbuf_limit, g_cbuf_dynamic_limit, g_cbuf_stage_limit;
@@ -5014,19 +5015,9 @@ static int nvmtl_fbfetch_on(void)
     }
     return on;
 }
-#define NVMTL_STENCIL_EMU_OFFSET 160u   /* the translator's native::stencil_export::STENCIL_EXPORT_PUSH_OFFSET */
-/* the translator's stencil-export lowering: a push-constant block member at offset 160 (stencil emulation, see NVMTL_SEMU_DRAW) */
 uint32_t nvmtl_spirv_stencil_emu(const void *code, size_t bytes)
 {
-    const uint32_t *w = (const uint32_t *)code; const size_t nw = bytes / 4;
-    if (nw < 5 || w[0] != 0x07230203u) return 0;
-    for (size_t i = 5; i < nw; ) {
-        uint32_t wc = w[i] >> 16, op = w[i] & 0xffffu;
-        if (!wc || i + wc > nw) break;
-        if (op == 72 && wc == 5 && w[i + 3] == 35 && w[i + 4] == 160u) return 1;   // OpMemberDecorate .. Offset 160
-        i += wc;
-    }
-    return 0;
+    return nvmtl_spirv_has_stencil_push(code, bytes);
 }
 uint32_t nvmtl_spirv_fetch_mask(const void *code, size_t bytes)
 {
