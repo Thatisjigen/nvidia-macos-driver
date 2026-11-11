@@ -5107,6 +5107,13 @@ IOReturn NVRMNVDAFramebuffer::callPlatformFunction(const OSSymbol *functionName,
             FBLOG("GPU going to standby: head %u off with it", fHead);
         } else if (st == 1) {
             if (fGpuWake) scheduleCall(fGpuWake, 0);
+            // An output with no display hears of a monitor through NVKMS's event, and a GPU without power sends none:
+            // nvKmsResume brings back what it had and asks no connector. A cable plugged in meanwhile is looked for now,
+            // with the scan the event runs (hotplugFire). An output that has its display is left to gpuWakeFire.
+            if (fDpyLost) {
+                FBLOG("GPU back with no display on output 0x%x (fb %u): looking for one", fDisplay, fIndex);
+                hotplugKick();
+            }
         } else {
             FBLOG("GPU lost on wake: head %u stays dark (restart needed)", fHead);
         }
