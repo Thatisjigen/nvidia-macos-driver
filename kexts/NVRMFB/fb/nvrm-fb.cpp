@@ -2430,15 +2430,17 @@ NvBool NVRMNVDAFramebuffer::submitConfig(struct NvKmsKapiRequestedModeSetConfig 
                                                         vh->flags.colorFormatChanged);
         if (full) nvrmApplyColorPrefs(vh);
         if (gHdrOn && fHdrCapable && vh->modeSetConfig.bActive) {
-            // HDR10: PQ in BT.2100 colorimetry, 10 bits, the composited pixels passed through untouched. Every config for the
-            // head says so (a flip that left it out would fall back to SDR); a full mode set also flags the change, and also
-            // when it turns HDR off.
+            // HDR10: PQ in BT.2100 colorimetry, 10 bits. Every config for the head says so (a flip that left it out would
+            // fall back to SDR); a full mode set also flags the change, and also when it turns HDR off.
+            // No colour passthrough: NVKMS takes it only where the display HAL has supportsColorPassthrough, which in 620 is
+            // one display class, and refuses the whole request elsewhere, Blackwell included (ValidateColorPassthroughFlipState), so
+            // every HDR10 mode set failed. The composited PQ pixels take the pipeline SDR takes: no output transfer function
+            // and the output LUT off.
             struct NvKmsKapiHeadModeSetConfig &mc = vh->modeSetConfig;
             if (fHdrActive) {
                 mc.hdrInfoFrame.enabled = NV_TRUE; mc.hdrInfoFrame.eotf = NVKMS_INFOFRAME_EOTF_ST2084;
                 mc.hdrInfoFrame.staticMetadata = fHdrMeta;
                 mc.colorimetry = NVKMS_OUTPUT_COLORIMETRY_BT2100;
-                mc.postcompColorPassthrough = NV_TRUE;
                 if (!gColorBpc && mc.colorBpc == 0) mc.colorBpc = 10;
                 mc.olut.enabled = NV_FALSE; mc.olut.lutSurface = NULL; mc.olut.lutEntries = 0;   // no gamma ramp on PQ content
             }

@@ -4,7 +4,7 @@
 Pixel conversions are tested in tools/test_iop_10bit.c; here: the display's HDR block is read from a real CTA-861 layout, the
 scanout reply flag is the same bit on both sides, and the call sites are present: HDR timings advertised only for PQ
 displays, an HDR10 timing is a different mode from the SDR timing of the same raster, a 30-bit surface for the mode set,
-the infoframe/colorimetry/passthrough on every config with the gamma ramp off, and the accelerator's converter keyed on the
+the infoframe and colorimetry on every config with the gamma ramp off and no colour passthrough, and the accelerator's converter keyed on the
 reply flag. The switch is read before the range is published, and the range that offers HDR10 lists the 10 bits macOS makes
 HDR10 timings at while SDR timings stay at 8. The control is the old driver: SDR only, an 8-bit surface, one copy loop."""
 import filecmp, pathlib, subprocess, tempfile
@@ -14,9 +14,12 @@ acc = (root / 'kexts/NVRM/accel/nvrm-accel.cpp').read_text()
 for need in ['r.supportedDynamicRangeModes |= kIORangeDynamicRangeHDR10', 'if (gHdrOn && fHdrCapable) {',
              '(d.dynamicRange == kIODynamicRangeHDR10) == fHdrActive', 'NvKmsSurfaceMemoryFormatX2B10G10R10',
              'r->flags = fScan30 ? NVRM_VRAM_SCANOUT_30BIT : 0;', 'mc.hdrInfoFrame.eotf = NVKMS_INFOFRAME_EOTF_ST2084',
-             'mc.colorimetry = NVKMS_OUTPUT_COLORIMETRY_BT2100', 'mc.postcompColorPassthrough = NV_TRUE', 'mc.olut.enabled = NV_FALSE',
+             'mc.colorimetry = NVKMS_OUTPUT_COLORIMETRY_BT2100', 'mc.olut.enabled = NV_FALSE',
              'attribute == kIOFBHDRMetaDataAttribute', 'PE_parse_boot_argn("nvfbhdr"', 'PE_parse_boot_argn("nvfb10bit"']:
     assert need in fb, 'missing in NVRMFB: ' + need
+# NVKMS 620 refuses any request with colour passthrough unless the display HAL has supportsColorPassthrough, which only
+# one class has; Blackwell's do not, and every HDR10 mode set that asked for it was refused.
+assert 'mc.postcompColorPassthrough = NV_TRUE' not in fb, 'HDR10 asks NVKMS for colour passthrough again'
 # The timing range is published from kapiInit() and offers HDR10 only if gHdrOn is set by then: start() has to read the
 # switch first, and under the start lock, or the first display to start never gets HDR10 in its range.
 def body(signature):
