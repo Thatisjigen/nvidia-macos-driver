@@ -93,6 +93,7 @@ extern "C" void nvrm_power_stop(void);
 extern "C" void nvrm_power_suspend(void);
 extern "C" void nvrm_power_resume(void);
 extern "C" int  nv_rtd3_before_system_resume(void);
+extern "C" int  nv_rtd3_armed(void);
 extern "C" int  nv_rtd3_power_off(IOACPIPlatformDevice *acpi);
 extern "C" int  nv_rtd3_power_on(IOACPIPlatformDevice *acpi);
 extern "C" nv_state_t *nv_xnu_gpu_state(void);
@@ -200,6 +201,8 @@ private:
     } fPciSave = {};
     void gpuSuspend();
     void gpuResume();
+    bool resumeOnOwnThread();   // system wake: gpuResume on a thread of its own, see setPowerState
+    static void resumeMain(void *p0, wait_result_t w);
     void rtd3Arm();   // opt-in D3cold (nvrtd3=1): kexts/NVRM/nv_rtd3.cpp
     void pciSaveForSleep();
     bool pciRestoreAfterWake();
@@ -2181,15 +2184,57 @@ void NVRM::free()
 
 extern "C" { void nvkms_xnu_suspend(NvU32 gpuId); void nvkms_xnu_resume(NvU32 gpuId, NvBool gpuOk); }
 
+// The time IOPM is told to wait for the acknowledgement of a resume run on its own thread. A resume takes 0.8 to 1.7 s;
+// a GSP that boots slowly can take tens of seconds, as at start-up (nvrmholdcap waits 120 s there).
+static const IOReturn kResumeAckWaitUs = 120 * 1000 * 1000;
+
 IOReturn NVRM::setPowerState(unsigned long ordinal, IOService *device)
 {
     nv_xnu_power_refresh();        // a wake can be a change of power source; this runs before the firmware asks
     const SInt32 pm = OSAddAtomic(0, &fGpuPm);
     if (ordinal == 0 && pm == kGpuPmRunning && fAdapter) gpuSuspend();
-    else if (ordinal != 0 && pm == kGpuPmSuspended) { nv_rtd3_before_system_resume(); gpuResume(); }
+    else if (ordinal != 0 && pm == kGpuPmSuspended) {
+        if (resumeOnOwnThread()) return kResumeAckWaitUs;
+        nv_rtd3_before_system_resume(); gpuResume();
+    }
     else LOG("power: setPowerState %lu (gpu %s, adapter %s) - nothing to do", ordinal,
              pm == kGpuPmRunning ? "running" : pm == kGpuPmSuspended ? "suspended" : "lost", fAdapter ? "up" : "down");
     return kIOPMAckImplied;
+}
+
+// IOPM calls every driver's setPowerState from a thread call of the kernel's "high" group, and the kernel runs that
+// group's calls one at a time: a queued call gets a thread only when no thread of the group is running; one that blocks
+// lets the next one start. RM resume takes 0.8 to 1.7 s and spends most of it polling the GSP without blocking, so the
+// power changes queued in the meantime waited until it returned - among them those of the USB ports and of the devices
+// they enumerate after a wake, which came back that much later (a USB disk whose port gives it back late is dropped by
+// its driver). The resume therefore runs on a thread of its own and IOPM waits for acknowledgeSetPowerState(). The power
+// children (the framebuffers) are still powered on only after it. The opt-in runtime D3 poll keeps the resume on the
+// power-management thread: it can suspend the GPU from its own thread call and does not expect a resume running beside
+// it. -nvrmsyncwake keeps it there too.
+bool NVRM::resumeOnOwnThread()
+{
+    char nb[8] = { 0 };
+    if (nv_rtd3_armed() || PE_parse_boot_argn("-nvrmsyncwake", nb, sizeof nb)) return false;
+    LOG("wake #%u: resuming on a thread of its own; power management waits for it", fPmCycles);
+    thread_t th = THREAD_NULL;
+    retain();   // released by the thread
+    if (kernel_thread_start(&NVRM::resumeMain, this, &th) != KERN_SUCCESS) {
+        release();
+        LOG("wake #%u: could not start the resume thread - resuming on the power-management thread", fPmCycles);
+        return false;
+    }
+    thread_deallocate(th);
+    return true;
+}
+
+void NVRM::resumeMain(void *p0, wait_result_t)
+{
+    NVRM *s = (NVRM *)p0;
+    nv_rtd3_before_system_resume();
+    s->gpuResume();
+    s->acknowledgeSetPowerState();   // may come before setPowerState has returned: IOPM takes it then too
+    s->release();   // the retain taken before the thread started
+    thread_terminate(current_thread());
 }
 
 // Linux order (nvidia_suspend): NVKMS first, while the GPU still serves the core channel, then RM standby. RM saves

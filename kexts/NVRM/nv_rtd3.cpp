@@ -106,6 +106,9 @@ extern "C" void nv_rtd3_arm(const struct nv_rtd3_ops *ops)
     kprintf("NVRM-xnu: RTD3 armed (idle %u s, resource %s)\n", NV_RTD3_IDLE_SECONDS, g_res);
 }
 
+/* Whether the poll runs: NVRM then keeps a system wake's resume on the power-management thread. */
+extern "C" int nv_rtd3_armed(void) { return g_call != nullptr; }
+
 extern "C" void nv_rtd3_disarm(void)
 {
     g_stop = 1;
