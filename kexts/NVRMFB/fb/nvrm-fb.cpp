@@ -4602,7 +4602,11 @@ void NVRMNVDAFramebuffer::publishTimingCaps()
     r.supportedPixelEncoding = kIORangePixelEncodingRGB444; r.supportedBitsPerColorComponent = kIORangeBitsPerColorComponent8;
     r.supportedColorimetryModes = kIORangeColorimetryNativeRGB | kIORangeColorimetrysRGB; r.supportedDynamicRangeModes = kIORangeDynamicRangeSDR;
     if (gHdrOn && fHdrCapable) {   // a PQ-capable display: HDR10 timings in BT.2020/BT.2100 are offered next to the SDR ones
-        r.supportedColorimetryModes |= kIORangeColorimetryBT2020 | kIORangeColorimetryBT2100;
+        // With HDR10 in the range macOS makes every timing as wire formats and declines, before it asks the driver, each
+        // one whose encoding, depth, colorimetry or dynamic range the range does not list ("Declined ... because fbRange").
+        // On an HDMI monitor its SDR formats are BT.709 only: without BT.709 here every SDR timing was declined, macOS kept
+        // HDR10 timings and scaled modes, no mode was the default one, and System Settings did not show the display.
+        r.supportedColorimetryModes |= kIORangeColorimetryBT709 | kIORangeColorimetryBT2020 | kIORangeColorimetryBT2100;
         r.supportedDynamicRangeModes |= kIORangeDynamicRangeHDR10;
         r.supportedBitsPerColorComponent |= kIORangeBitsPerColorComponent10;   // the depth macOS makes HDR10 timings at (nvrmTimingDepthOk)
     }
