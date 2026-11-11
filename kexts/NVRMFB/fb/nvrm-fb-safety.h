@@ -226,6 +226,36 @@ enum { kNvrmDepth8 = 0x2, kNvrmDepth10 = 0x4, kNvrmDepth12 = 0x8 };
 // an HDR10 mode has a 30-bit scanout here, so an SDR timing above 8 bits is refused and macOS installs the 8-bit one, as
 // it did while the range listed 8 bits alone.
 static inline bool nvrmTimingDepthOk(unsigned depth, bool hdr10) { return hdr10 || depth <= kNvrmDepth8; }
+// IOGraphics' HDR10 bit, the same value in a timing range (kIORangeDynamicRangeHDR10) and in a detailed timing
+// (kIODynamicRangeHDR10).
+enum { kNvrmDynamicRangeHDR10 = 0x2 };
+// What macOS's list says about one raster and refresh rate NVKMS validated, before the driver adds that rate itself: whether the
+// raster is listed (raster), whether the rate is listed unscaled (have), and which of macOS's timings the copy starts from
+// (tmpl, -1 for none). The rates added this way are SDR desktop modes. With HDR10 in the range macOS lists HDR10 timings too,
+// and an HDR10 timing is another mode, as it is for the boot raster and for the mode on the head: it lists neither the raster
+// nor the rate in SDR, and it is never the template. A rate copied from one was an HDR10 timing itself, at a rate macOS had
+// not proposed in HDR10: it was never taken for the boot raster, and when macOS asked for it the mode set was an HDR10 one
+// that the head refused, so a monitor stayed on the driver's stand-in mode.
+// Only an unscaled entry is the refresh rate on the panel: macOS's scaled desktops built on a rate the driver offered must not
+// hide that rate's own mode (e.g. 1344x756@100 listed, 1920x1080@100 gone). T has IODetailedTimingInformationV2's fields.
+struct NvrmRateSeed { bool raster, have; int tmpl; };
+template <class T>
+static inline NvrmRateSeed nvrmRateSeed(const T *dt, unsigned n, unsigned fromMac, unsigned w, unsigned h, unsigned hz)
+{
+    NvrmRateSeed s = { false, false, -1 };
+    for (unsigned j = 0; j < n; j++) {
+        const T &d = dt[j];
+        if (d.horizontalActive != w || d.verticalActive != h) continue;
+        if (d.dynamicRange == kNvrmDynamicRangeHDR10) continue;
+        if (j < fromMac) s.raster = true;
+        if (d.horizontalScaled || d.verticalScaled) continue;
+        const unsigned long long t = (unsigned long long)(d.horizontalActive + d.horizontalBlanking) * (d.verticalActive + d.verticalBlanking);
+        const unsigned dhz = t ? (unsigned)((d.pixelClock + t / 2) / t) : 0;
+        if (dhz + 1 >= hz && dhz <= hz + 1) { s.have = true; break; }
+        if (s.tmpl < 0 && j < fromMac) s.tmpl = (int)j;
+    }
+    return s;
+}
 // ---- Bounded waits ----
 // Try `tryFn()` until it succeeds or `totalMs` has passed, sleeping `stepMs` between tries. Returns whether it succeeded.
 // A WindowServer thread that waits forever on a lock someone else holds is killed by the watchdog after two minutes

@@ -3939,19 +3939,9 @@ unsigned NVRMNVDAFramebuffer::addKmsRefreshModes(unsigned n)
         if (r == 0 || !valid) continue;
         if (k.flags.interlaced || k.flags.doubleScan || !k.pixelClockHz || k.hTotal <= k.hVisible || k.vTotal <= k.vVisible ||
             k.hSyncStart < k.hVisible || k.hSyncEnd < k.hSyncStart || k.vSyncStart < k.vVisible || k.vSyncEnd < k.vSyncStart) continue;
-        int tmpl = -1; bool have = false, raster = false;
-        for (unsigned j = 0; j < n; j++) {
-            const IODetailedTimingInformationV2 &d = fDT[j];
-            if (d.horizontalActive != k.hVisible || d.verticalActive != k.vVisible) continue;
-            if (j < fromMac) raster = true;
-            // only an unscaled entry is this refresh rate on the panel; macOS's scaled desktops built on a rate we
-            // offered must not hide that rate's own mode (e.g. 1344x756@100 listed, 1920x1080@100 gone)
-            if (d.horizontalScaled || d.verticalScaled) continue;
-            const UInt64 dt = (UInt64)(d.horizontalActive + d.horizontalBlanking) * (d.verticalActive + d.verticalBlanking);
-            const NvU32 dhz = dt ? (NvU32)((d.pixelClock + dt / 2) / dt) : 0;
-            if (dhz + 1 >= hz && dhz <= hz + 1) { have = true; break; }
-            if (tmpl < 0 && j < fromMac && !d.horizontalScaled && !d.verticalScaled) tmpl = (int)j;
-        }
+        // what macOS lists for this raster and rate, HDR10 timings left out (nvrmRateSeed)
+        const NvrmRateSeed seed = nvrmRateSeed(fDT, n, fromMac, k.hVisible, k.vVisible, hz);
+        const int tmpl = seed.tmpl; const bool have = seed.have; bool raster = seed.raster;
         // A raster macOS never proposed is offered too when NVKMS validated it for this display and it fits the scanout
         // memory and the scaler. Without this, rasters that exist only in the EDID's DisplayID extension (most 100-240 Hz
         // modes, issue #29) and every raster above a 1080p firmware raster (a 4K monitor stuck at 1920x1080, issue #49)
@@ -4033,6 +4023,7 @@ unsigned NVRMNVDAFramebuffer::addKmsRefreshModes(unsigned n)
             for (unsigned j = 0; j < n; j++) {
                 const IODetailedTimingInformationV2 &d = fDT[j];
                 if (d.horizontalActive != k.hVisible || d.verticalActive != k.vVisible || d.horizontalScaled || d.verticalScaled) continue;
+                if (d.dynamicRange == kIODynamicRangeHDR10) continue;   // an SDR copy, from an SDR timing (nvrmRateSeed)
                 const UInt64 dt = (UInt64)(d.horizontalActive + d.horizontalBlanking) * (d.verticalActive + d.verticalBlanking);
                 const NvU32 dhz = dt ? (NvU32)((d.pixelClock + dt / 2) / dt) : 0;
                 if (dhz + 1 >= dhzWant && dhz <= dhzWant + 1) listed = true;
@@ -4579,6 +4570,8 @@ IOReturn NVRMNVDAFramebuffer::setDetailedTimings(OSArray *array)
 static_assert((unsigned)kNvrmDepth8 == (unsigned)kIORangeBitsPerColorComponent8 && (unsigned)kNvrmDepth10 == (unsigned)kIORangeBitsPerColorComponent10 &&
               (unsigned)kNvrmDepth8 == (unsigned)kIOBitsPerColorComponent8 && (unsigned)kNvrmDepth10 == (unsigned)kIOBitsPerColorComponent10 &&
               (unsigned)kNvrmDepth12 == (unsigned)kIOBitsPerColorComponent12, "nvrm-fb-safety.h's depth bits are not IOGraphics'");
+static_assert((unsigned)kNvrmDynamicRangeHDR10 == (unsigned)kIODynamicRangeHDR10 &&
+              (unsigned)kNvrmDynamicRangeHDR10 == (unsigned)kIORangeDynamicRangeHDR10, "nvrm-fb-safety.h's HDR10 bit is not IOGraphics'");
 void NVRMNVDAFramebuffer::publishTimingCaps()
 {
     IODisplayScalerInformation si; nvu_zero(&si, sizeof si);
