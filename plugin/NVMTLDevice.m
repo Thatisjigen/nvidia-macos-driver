@@ -2949,7 +2949,13 @@ static void nvmtl_log_compute_descriptor(MTLComputePipelineDescriptor *d) {
             @"lod_min_clamp":@(sd.lodMinClamp),@"lod_max_clamp":@(sd.lodMaxClamp),
             @"border_color":(@[@"TransparentBlack",@"OpaqueBlack",@"OpaqueWhite"])[MIN(NVMTL_SINCE(10.12, NSUInteger, sd.borderColor, 0),2u)],
             @"reduction":@"WeightedAverage",@"lod_bias":@0};
-        nvlog("pixel sampler: %s",s->_pixelState.description.UTF8String);
+        // The dictionary's description is built only when the line can reach a log. WAS: on every call, for a log a
+        // release plugin drops unless the process opted in (NVMTL_PROCESS_ENV=1): WindowServer makes pixel samplers
+        // during animations and -[NSDictionary descriptionWithLocale:indent:] was 19 of the 23 main-thread samples
+        // in newSamplerStateWithDescriptor: (anim3 capture). The line holds no failure word, so release syslog never
+        // took it. NVMTL_SAMPLER_DESC_LAZY=0 builds it on every call again.
+        static int descLazy = -1; if (descLazy < 0) { const char *e = getenv("NVMTL_SAMPLER_DESC_LAZY"); descLazy = !(e && e[0] == '0'); }
+        if (!descLazy || !NVMTL_RELEASE || nvmtl_process_env_on()) nvlog("pixel sampler: %s",s->_pixelState.description.UTF8String);
     }
     int linear = (sd.minFilter == MTLSamplerMinMagFilterLinear || sd.magFilter == MTLSamplerMinMagFilterLinear);
     int repeat = (sd.sAddressMode == MTLSamplerAddressModeRepeat);
