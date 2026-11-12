@@ -685,9 +685,24 @@ static void nvmtl_prepare_submission_copies(NVMTLSubmissionPart *part) {
     }
     part->copyInputsPrepared = YES;
 }
+// A command buffer whose finish path has begun (_partsRetiring, set under the class lock before _executionDone) has nothing
+// left for the pass to submit: every part it will ever run is already on the GPU, and the finish path drops the rest. The
+// pass used to stop at it, and with it every later command buffer on the queue, until the worker had released its
+// reservation and come back from its next fence wait. A WindowServer-style loop (wsloop, diagnostic build) caught commits
+// landing in that window waiting 1.3-2.4 ms for "scheduled" instead of ~20 us. The pass now steps over such a command
+// buffer without reading its parts, so a part the finish path has passed is still never submitted (I-069). Completion
+// order is unchanged: the worker still retires command buffers in reservation order.
+// NVMTL_AHEAD_PAST_DONE=0: stop at it, as before.
+static BOOL nvmtl_ahead_past_done_on(void) {
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("NVMTL_AHEAD_PAST_DONE"); on = !(e && e[0] == '0');
+        nvlog("commit: submit-ahead %s a command buffer that is finishing (NVMTL_AHEAD_PAST_DONE=%s)", on ? "steps over" : "stops at", e ? e : "unset"); }
+    return on;
+}
 - (BOOL)nvmtlSubmitAhead {
+    if (_executionDone || _partsRetiring) return nvmtl_ahead_past_done_on();
     // a commit still putting its kernel marks in (nvmtlSubmitWithEvents) must not reach the GPU before them
-    if (_executionDone || _partsRetiring || _cbError || !_committed || _commitMarking) return NO;
+    if (_cbError || !_committed || _commitMarking) return NO;
     if (_nextSubmit < _nextPart) _nextSubmit = _nextPart;
     while (_nextSubmit < _parts.count) {
         if (atomic_load(&gsub_inflight) >= nvmtl_gsub_cap()) return NO;
