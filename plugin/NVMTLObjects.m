@@ -1388,8 +1388,14 @@ static void nvmtl_census(const char *what, uint32_t w, uint32_t h, int surf) {
 }
 static void nvmtl_frame_dump(const char *tag, const void *base, size_t row, uint32_t w, uint32_t h);
 static void nvmtl_surface_cpu_dump(NVMTLTexture *rt) {
+    // Runs for every setFragmentTexture:. A texture with no IOSurface cannot be dumped, so it returns before the clock,
+    // and the 250 ms poll of the request file reads the approximate clock (~5 ns here) instead of MONOTONIC_RAW (~24 ns,
+    // mach_continuous_time): 13 of setFragmentTexture's 172 samples in cabench were that clock read.
+    // NVMTL_DUMP_POLL_CHEAP=0 reads MONOTONIC_RAW on every call again.
+    static int cheap = -1; if (cheap < 0) { const char *e = getenv("NVMTL_DUMP_POLL_CHEAP"); cheap = !(e && e[0] == '0'); }
+    if (cheap && (!rt || !rt->_surf)) return;
     static uint64_t next; static int on;
-    uint64_t now = clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW);
+    uint64_t now = clock_gettime_nsec_np(cheap ? CLOCK_UPTIME_RAW_APPROX : CLOCK_MONOTONIC_RAW);
     if (now >= next) { next = now + 250000000ull; on = access("/tmp/nvmtl-dump-request", F_OK) == 0; }
     if (!on || !rt || !rt->_surf || IOSurfaceGetBytesPerElement(rt->_surf) != 4 || IOSurfaceGetPlaneCount(rt->_surf) > 1) return;
     if (IOSurfaceLock(rt->_surf, kIOSurfaceLockReadOnly, NULL) != kIOReturnSuccess) { static int said; if (!said++) nvlog("G16 cpu dump: IOSurfaceLock failed"); return; }
