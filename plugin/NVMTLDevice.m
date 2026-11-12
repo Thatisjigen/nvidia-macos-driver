@@ -3212,8 +3212,39 @@ static BOOL nvmtl_family_answer(NSInteger f, BOOL yes, const char *why)
         nvlog("QUERY supportsFamily %ld -> %s (%s; claim up to Apple%ld)", (long)f, yes ? "YES" : "NO", why, (long)nvmtl_apple_family_max());
     return yes;
 }
+// NVMTL_CA_APPLE3=1 (WindowServer only; 2 = any process, for tests; default 0 = off): answer YES to MTLGPUFamilyApple3 when,
+// and only when, Core Animation's context setup asks (the caller is QuartzCore's CA::OGL::new_metal_context).
+// Why: that setup stores the answer in its context, and on a GPU without Apple3 (every Intel/AMD Mac and this driver) the
+// context then waits for the GPU to finish everything (-[MTLCommandBuffer waitUntilCompleted] via MetalContext::finish)
+// on every 128th render-target switch within one frame (set_surface: switches % 128; every 64th it only commits). A
+// "show desktop" slide with many windows, sidebars and vibrancy passes 128 switches, and the compositor thread then sits
+// out the GPU's whole frame: 702 of 6826 samples of WindowServer's main thread in the anim2 capture were in that wait.
+// Measured with CARenderer (caprobe, 30 windows with backdrops, 161 switches a frame): 10.2 -> 2.8 ms wall per frame,
+// the same CPU, pixel-identical output. Nothing else about the device changes: Metal's own family queries (pixel-format
+// capability tables) still get NO. Inside Core Animation the bit also selects BGR10_XR for 'b3a8' IOSurfaces and one
+// extended-range image format, which this driver stores as 10:10:10:2 unorm (values above 1.0 clamp; Apple's XR bit
+// layout is not decoded), so extended-range (EDR) content could render differently - hence off by default.
+static int nvmtl_ca_apple3_on(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("NVMTL_CA_APPLE3"); const int v = e ? atoi(e) : 0;
+        const int ws = getprogname() && !strcmp(getprogname(), "WindowServer");
+        on = v == 2 || (v == 1 && ws);
+        if (v) nvlog("NVMTL_CA_APPLE3=%d: Core Animation's context setup %s told Apple3 (no forced GPU wait every 128 render-target switches)",
+                     v, on ? "IS" : "is NOT (not WindowServer)");
+    }
+    return on;
+}
+static BOOL nvmtl_ca_apple3_caller(const void *ra)
+{
+    Dl_info di = {0};
+    return dladdr(ra, &di) && di.dli_fname && di.dli_sname && strstr(di.dli_fname, "/QuartzCore") && strstr(di.dli_sname, "new_metal_context");
+}
 - (BOOL)supportsFamily:(MTLGPUFamily)f {
     if (nvmtl_mfx_profile_depth && (NSInteger)f >= 1001 && (NSInteger)f <= 1009) return NO;
+    if ((NSInteger)f == 1003 && nvmtl_ca_apple3_on() && nvmtl_ca_apple3_caller(__builtin_return_address(0)))
+        return nvmtl_family_answer(f, YES, "Core Animation context setup only, NVMTL_CA_APPLE3");
     switch ((NSInteger)f) {
         case MTLGPUFamilyMac2: case MTLGPUFamilyCommon1: case MTLGPUFamilyCommon2: case MTLGPUFamilyCommon3: return YES;
         case 2001 : return YES;
