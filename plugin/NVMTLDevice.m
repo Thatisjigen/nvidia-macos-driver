@@ -444,6 +444,18 @@ static bool nvmtl_nvencvt_selected(const char *sel, const char *me, const char *
     for (char *t = strtok(list, ", :"); t; t = strtok(NULL, ", :")) if (!strcmp(t, me)) return true;
     return false;
 }
+// The Aerial wallpaper and its preview in Settings > Displays play HEVC in their own processes. nvwallpaper=1 on the boot
+// line adds those two processes, by their exact names, to NVMTL_NVENCVT's list, so moving the wallpaper to NVDEC does not
+// mean editing nvrm610.conf; an explicit NVMTL_NVENCVT=0 still keeps the library out, and no other process is affected.
+static bool nvmtl_nvencvt_wallpaper(const char *sel, const char *me, const char *bootargs)
+{
+    if (!me || (strcmp(me, "WallpaperAerialsExtension") && strcmp(me, "DisplaysExt"))) return false;
+    if ((sel && !strcmp(sel, "0")) || !bootargs) return false;
+    char line[1024]; strlcpy(line, bootargs, sizeof line);
+    char *save = NULL;
+    for (char *t = strtok_r(line, " ", &save); t; t = strtok_r(NULL, " ", &save)) if (!strcmp(t, "nvwallpaper=1")) return true;
+    return false;
+}
 // decodersOnly is the decode service (VTDecoderXPCService): it decodes for the sandboxed Apple clients and never encodes.
 /* Hardware AV1 and VP9 decoding on AMD and Intel GPUs through Vulkan video decode (RADV, ANV): libnmxvt.dylib registers VideoToolbox
    decoders. Off unless NMXVT=1 in the environment or nmxvt=1 on the boot line, only for the AMD/Intel vendor, never in WindowServer,
@@ -509,7 +521,11 @@ static void nvmtl_nvencvt_register(bool decodersOnly)
         const char *me = getprogname();
         char gen[32] = "";
         bool haveGen = nvmtl_gpu_profile_string(CFSTR("generation"), gen, sizeof gen);
-        if (!nvmtl_nvencvt_selected(getenv("NVMTL_NVENCVT"), me, haveGen ? gen : NULL)) return;
+        const char *sel = getenv("NVMTL_NVENCVT");
+        if (!nvmtl_nvencvt_selected(sel, me, haveGen ? gen : NULL)) {
+            char bootargs[1024] = {0}; size_t n = sizeof bootargs - 1;
+            if (sysctlbyname("kern.bootargs", bootargs, &n, NULL, 0) != 0 || !nvmtl_nvencvt_wallpaper(sel, me, bootargs)) return;
+        }
         if (!strcmp(me, "WindowServer")) return;     // the codec registrars all stay out of it
         Dl_info di;
         if (!dladdr((const void *)nvmtl_nvencvt_register, &di) || !di.dli_fname) { nvlog("nvencvt: dladdr failed - not registering"); return; }

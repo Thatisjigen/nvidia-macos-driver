@@ -60,7 +60,40 @@ if sel and shutil.which('clang') and platform.system() == 'Darwin':
             check('a list registers only in the processes it names', got[(4, 0, 0)] and not got[(4, 0, 1)] and not got[(4, 0, 2)])
             check('naming the decode service registers there and nowhere else', got[(5, 5, 1)] and not got[(5, 0, 0)])
 
+wall = function('static bool nvmtl_nvencvt_wallpaper(')
+check('the plugin has a boot-line switch for the wallpaper processes', wall is not None)
+if wall and shutil.which('clang') and platform.system() == 'Darwin':
+    harness = ('#include <stdbool.h>\n#include <stdio.h>\n#include <string.h>\n' + wall +
+               'int main(void) {\n'
+               '  const char *sels[] = { NULL, "0", "com.apple.WebKit.GPU", "1" };\n'
+               '  const char *procs[] = { "WallpaperAerialsExtension", "DisplaysExt", "com.apple.WebKit.GPU", "QuickTime Player",'
+               ' "WallpaperAerialsExtensionX", "Wallpaper" };\n'
+               '  const char *boots[] = { NULL, "", "keepsyms=1 nvwallpaper=1 -v", "nvwallpaper=1", "nvwallpaper=0",'
+               ' "xnvwallpaper=1", "nvwallpaper=10", "-nvwallpaper=1" };\n'
+               '  for (int s = 0; s < 4; s++) for (int p = 0; p < 6; p++) for (int b = 0; b < 8; b++)\n'
+               '    printf("%d %d %d %d\\n", s, p, b, nvmtl_nvencvt_wallpaper(sels[s], procs[p], boots[b]));\n'
+               '  return 0; }\n')
+    with tempfile.TemporaryDirectory() as d:
+        d = pathlib.Path(d)
+        (d / 'w.c').write_text(harness)
+        r = subprocess.run(['clang', '-o', str(d / 'w'), str(d / 'w.c')], capture_output=True, text=True)
+        check('the wallpaper switch compiles on its own', r.returncode == 0, r.stderr.strip()[-300:])
+        if r.returncode == 0:
+            out = subprocess.run([str(d / 'w')], capture_output=True, text=True).stdout.split('\n')
+            got = {tuple(map(int, l.split()[:3])): bool(int(l.split()[3])) for l in out if l.strip()}
+            # sels: 0 unset, 1 "0", 2 Safari's list, 3 "1"; procs: 0 wallpaper, 1 Displays, 2 WebKit, 3 QuickTime,
+            # 4 and 5 near names; boots: 0 none, 1 empty, 2 among others, 3 alone, 4 =0, 5 prefixed, 6 =10, 7 dashed
+            on = {(s, p, b) for s in (0, 2, 3) for p in (0, 1) for b in (2, 3)}
+            check('nvwallpaper=1 selects the wallpaper and its preview, alone or among other arguments',
+                  all(got[k] for k in on))
+            check('nothing else is selected: other processes, near names, other values, no boot line, NVMTL_NVENCVT=0',
+                  not any(v for k, v in got.items() if k not in on))
+
 reg = function('static void nvmtl_nvencvt_register(')
+check('the registrar reads the boot line only for a process the conf did not select',
+      reg is not None and 'if (!nvmtl_nvencvt_selected(sel, me, haveGen ? gen : NULL)) {' in reg
+      and reg.index('nvmtl_nvencvt_selected(sel') < reg.index('sysctlbyname("kern.bootargs"')
+      < reg.index('nvmtl_nvencvt_wallpaper(sel, me, bootargs)'))
 svc = function('static void nvmtl_nvdec_in_decode_service(')
 check('the registrar can register decoders alone', reg is not None and 'NVEncVT_RegisterDecoders' in reg)
 check('the decode service asks for libnvencvt after the built-in decoders',

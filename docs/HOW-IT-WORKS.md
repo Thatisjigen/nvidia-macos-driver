@@ -170,6 +170,8 @@ The video codecs in `libnvencvt.dylib` are built from `vendor/nvenc` (mickys/nve
 package puts the library beside the plugin in `NVMTLDriver.bundle/Contents/MacOS/`; the plugin loads it only when it and
 its folder are root-owned. `NVMTL_NVENCVT` in `nvrm610.conf` decides where it registers: unset is automatic on Ada and
 Ampere, `0` is never, `1` is every process on any card the library accepts, and a list of process names limits it to those.
+`nvwallpaper=1` on the boot line adds the Aerial wallpaper (`WallpaperAerialsExtension`) and its preview in Settings >
+Displays (`DisplaysExt`) to that list without editing the conf; with `0` the library stays out of them too.
 The GPU's boost policy is `NVRM_610_BOOST`: unset is a short lease renewed while work is submitted, `hold` keeps one boost
 for the device's life, `0` never boosts.
 `NVRM_610_MAXPOWER_MW=<mW>` (off unless set) asks the GPU performance-scaling code for that maximum power through the public root-client GPS control and reads it back.
