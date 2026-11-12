@@ -281,12 +281,67 @@ static void nvmtl_clear_embedded_slot(NVMTLCommandBuffer *cb, uint32_t set, uint
         nvmtl_vk_bind_storage_view(&cb->_c, set, slot, NULL);
     }
 }
+/* A function whose only per-draw binding metadata is constexpr samplers (Core Animation's shaders: 114k of 248k
+ * bind calls in a CARenderer composite, the rest empty) binds them from a plan of plain C built once per function: slot,
+ * nvk_sampler and the keep mask. WAS on every draw, for each stage: two objc_getAssociatedObject lookups, an NSArray
+ * walk with an NSNumber unboxing per sampler, and an add of each sampler to the command buffer's resource set (lock,
+ * MRU scan, hash lookup) - 104 of WindowServer's 353 drawIndexed samples in the anim3 capture.
+ * The plan does not add the samplers to the command buffer's resources: a static sampler is created once for its
+ * function and held by it (the NVMTL_SSAMP_KEY array is never replaced), every caller passes a function its pipeline
+ * holds strongly (render _descVert/_descFrag, compute and mesh _function, all fixed at creation), and that pipeline is in
+ * the command buffer's resources (setRenderPipelineState / setComputePipelineState / the mesh draw add it, a sealed part
+ * hands its resources back to the restarted recording), so the sampler outlives every command that reads it.
+ * A function with embedded argument-buffer plans takes the general path below unchanged. NVMTL_BIND_PLAN=0 turns the plan
+ * off (every function takes the general path, as before). */
+typedef struct { uint32_t slot; nvk_sampler *s; } nvmtl_static_bind;
+typedef struct { uint32_t n, keep, general; nvmtl_static_bind e[]; } nvmtl_bind_plan;
+static int nvmtl_bind_plan_on(void)
+{
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("NVMTL_BIND_PLAN"); on = !(e && e[0] == '0');
+        nvlog("embedded: constexpr samplers bind from a per-function plan %s (NVMTL_BIND_PLAN=%s)", on ? "ON" : "OFF - general path on every draw", e ? e : "unset"); }
+    return on;
+}
+static const nvmtl_bind_plan *nvmtl_bind_plan_for(NVMTLFunction *fn)
+{
+    const nvmtl_bind_plan *p = (const nvmtl_bind_plan *)__atomic_load_n(&fn->_bindPlan, __ATOMIC_ACQUIRE);
+    if (p) return p;
+    NSArray<NSArray *> *statics = nvmtl_static_samplers_on() ? nvmtl_static_samplers(fn) : nil;
+    NSArray<NVMTLEmbeddedPlan *> *embedded = nvmtl_embedded_plan(fn);
+    NSMutableData *d = [NSMutableData dataWithLength:sizeof(nvmtl_bind_plan) + statics.count * sizeof(nvmtl_static_bind)];
+    if (!d) return NULL;
+    nvmtl_bind_plan *np = (nvmtl_bind_plan *)d.mutableBytes;
+    np->general = embedded.count != 0;
+    for (NSArray *pair in statics) {
+        const uint32_t i = [pair[0] unsignedIntValue]; NVMTLSamplerState *s = pair[1];
+        np->e[np->n++] = (nvmtl_static_bind){ i, &s->_s };
+        if (i < 32) np->keep |= 1u << i;
+    }
+    @synchronized (fn) {
+        p = (const nvmtl_bind_plan *)fn->_bindPlan;
+        if (!p) { fn->_bindPlanData = d; p = np; __atomic_store_n(&fn->_bindPlan, (const void *)np, __ATOMIC_RELEASE); }
+    }
+    return p;
+}
 void nvmtl_bind_embedded(NVMTLCommandBuffer *cb, uint32_t set, NVMTLFunction *fn, NVMTLBuffer *__strong const *bufAt, const NSUInteger *offAt)
 {
     if (!cb || !fn) return;
     // Cached metadata is immutable, but sampler restoration is recording-local and still required.
     if (__atomic_load_n(&fn->_bindingMetadataEmpty, __ATOMIC_ACQUIRE)) {
         nvmtl_vk_parked_samplers_keep(&cb->_c, set, 0);
+        return;
+    }
+    const nvmtl_bind_plan *bp = nvmtl_bind_plan_on() ? nvmtl_bind_plan_for(fn) : NULL;
+    if (bp && !bp->general) {
+        if (!bp->n) {
+            __atomic_store_n(&fn->_bindingMetadataEmpty, 1, __ATOMIC_RELEASE);
+            nvmtl_vk_parked_samplers_keep(&cb->_c, set, 0);
+            return;
+        }
+        nvmtl_vk_parked_samplers_keep(&cb->_c, set, bp->keep);
+        for (uint32_t k = 0; k < bp->n; k++)
+            if (nvmtl_vk_bind_parked_sampler(&cb->_c, set, bp->e[k].slot, bp->e[k].s))
+                nvlog("static sampler slot %u: bind FAILED", bp->e[k].slot);
         return;
     }
     NSArray<NSArray *> *statics = nvmtl_static_samplers_on() ? nvmtl_static_samplers(fn) : nil;

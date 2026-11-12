@@ -305,6 +305,8 @@ void nvmtl_texture_desc_swizzle(NVMTLTexture *t, MTLTextureDescriptor *d);
 - (NVMTLResSet *)nvmtlTakeAll NS_RETURNS_RETAINED;
 @end
 @interface NVMTLFunction () { @public NSString *_label; } @end
+// The per-draw binding plan (NVMTLEmbedded.m, nvmtl_bind_plan): built once, published with release order, owned by _bindPlanData.
+@interface NVMTLFunction () { @public const void *_bindPlan; NSData *_bindPlanData; } @end
 // machine code compiled ahead of time for this function (NVMTLSass.m), nil otherwise
 @interface NVMTLFunction () { @public id _sassKernel; } @end
 @interface NVMTLLibrary () { @public NSString *_label; } @end
