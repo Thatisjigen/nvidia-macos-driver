@@ -4598,6 +4598,13 @@ static VkDescriptorSet nvmtl_snapshot_set_md(nvk_cmdbuf *c, uint32_t which, uint
 static VkDescriptorSet nvmtl_snapshot_set_m(nvk_cmdbuf *c, uint32_t which, uint32_t stex_hi, const uint64_t *mask, const uint64_t *tb)
 { return nvmtl_snapshot_set_md(c, which, stex_hi, mask, tb, VK_NULL_HANDLE, NULL, NULL); }
 #define NVMTL_COPY_HAS(m, i) ((m) && (((m)[(i) >> 6] >> ((i) & 63)) & 1))
+static int nvmtl_snap_walk_on(void)
+{
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("NVMTL_SNAP_WALK"); on = !(e && e[0] == '0');
+        nvlog("vk: descriptor snapshots visit %s (NVMTL_SNAP_WALK=%s)", on ? "only the bindings their mask names" : "every binding (OLD)", e ? e : "unset"); }
+    return on;
+}
 static VkDescriptorSet nvmtl_snapshot_set_md(nvk_cmdbuf *c, uint32_t which, uint32_t stex_hi, const uint64_t *mask, const uint64_t *tb,
                                              VkDescriptorSet from, const uint64_t *copym, const VkDescriptorBufferInfo *uniform)
 {
@@ -4701,7 +4708,14 @@ static VkDescriptorSet nvmtl_snapshot_set_md(nvk_cmdbuf *c, uint32_t which, uint
     VkDescriptorImageInfo  dummyS = { g_dummySampler, VK_NULL_HANDLE, VK_IMAGE_LAYOUT_UNDEFINED };
     nvmtl_bindtable *t = (nvmtl_bindtable *)c->table;
     uint32_t nw = 0;
-    for (uint32_t i = 0; i < NVMTL_STEX_BASE; i++) {
+    // Visit only the bindings the mask names, lowest first (the order the writes always had). WAS: a test of every one
+    // of the 193 bindings below the storage-texture band for every snapshot, ~50 of 171 samples in this function on a
+    // CARenderer composite where a set writes about three. NVMTL_SNAP_WALK=0 tests every binding again.
+    uint64_t walk[(NVMTL_STEX_BASE + 63) / 64];
+    for (uint32_t k = 0; k < (NVMTL_STEX_BASE + 63) / 64; k++) walk[k] = mask && nvmtl_snap_walk_on() ? mask[k] : ~0ull;
+    if (NVMTL_STEX_BASE & 63) walk[NVMTL_STEX_BASE >> 6] &= (1ull << (NVMTL_STEX_BASE & 63)) - 1;
+    for (uint32_t wi = 0; wi < (NVMTL_STEX_BASE + 63) / 64; wi++) for (uint64_t bits = walk[wi]; bits; ) {
+        const uint32_t i = wi * 64 + (uint32_t)__builtin_ctzll(bits); bits &= bits - 1;
         if (!NVMTL_E78_HAS(mask, i)) continue;
         VkDescriptorType ty = binding_type(i);
         const nvmtl_slot *sl = nvmtl_slot_checked(t ? &t->s[which][i] : NULL, which, i);
