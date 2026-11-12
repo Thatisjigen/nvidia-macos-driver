@@ -4836,44 +4836,51 @@ static NVMTLBuffer *nvmtl_bytes_ring(NVMTLCommandBuffer *cb, NSUInteger len, siz
     [self nvmtlCloseVisibility];
     if (_begun) nvmtl_vk_cmd_end_render(&_cb->_c);
     nvmtl_hz_encoder_end(&_cb->_c);
-    NSMutableDictionary *groups = [NSMutableDictionary new];
-    BOOL needScratch = NO;
-    for (NSArray *record in _visRecords) {
-        NSNumber *offset = record[1];
-        NSMutableArray *queries = groups[offset];
-        if (!queries) { queries = [NSMutableArray new]; groups[offset] = queries; }
-        [queries addObject:record[0]];
-        if (queries.count > 1) needScratch = YES;
-    }
-    NVMTLBuffer *scratch = nil;
-    if (needScratch) {
-        scratch = [NVMTLBuffer new];
-        if (nvmtl_vk_buffer_create(_visRecords.count * 8, 0, &scratch->_b)) {
-            [self nvmtlVisibilityError:[NSString stringWithFormat:@"visibility: accumulation scratch allocation failed"]]; scratch = nil;
-        } else {
-            if (!_cb->_scratch) _cb->_scratch = [NSMutableArray new];
-            [_cb->_scratch addObject:scratch];
+    // The visibility groups are built only when this encoder recorded visibility results. WAS: an empty dictionary was
+    // made and freed at every endEncoding; in cabench that was 53 of endEncoding's 122 samples (__NSDictionaryM_new,
+    // and free_tiny under its dealloc), for the ~200 encoders a Core Animation frame ends. NVMTL_ENDENC_LAZY=0 makes it
+    // for every encoder again.
+    static int visLazy = -1; if (visLazy < 0) { const char *e = getenv("NVMTL_ENDENC_LAZY"); visLazy = !(e && e[0] == '0'); }
+    if (_visRecords.count || !visLazy) {
+        NSMutableDictionary *groups = [NSMutableDictionary new];
+        BOOL needScratch = NO;
+        for (NSArray *record in _visRecords) {
+            NSNumber *offset = record[1];
+            NSMutableArray *queries = groups[offset];
+            if (!queries) { queries = [NSMutableArray new]; groups[offset] = queries; }
+            [queries addObject:record[0]];
+            if (queries.count > 1) needScratch = YES;
         }
-    }
-    size_t cursor = 0;
-    for (NSNumber *key in groups) {
-        NSArray *queries = groups[key]; size_t offset = key.unsignedLongLongValue;
-        if (queries.count > 1 && !scratch) continue;
-        nvk_buffer *dst = queries.count > 1 ? &scratch->_b : &_visBuf->_b;
-        size_t first = cursor;
-        for (NSNumber *value in queries) {
-            uint32_t query = value.unsignedIntValue;
-            size_t out = queries.count > 1 ? cursor++ * 8 : offset;
-            if (query == UINT32_MAX) {
-                if (nvmtl_vk_cmd_write_word(&_cb->_c, dst, out, 0) ||
-                    nvmtl_vk_cmd_write_word(&_cb->_c, dst, out + 4, 0))
-                    [self nvmtlVisibilityError:[NSString stringWithFormat:@"visibility: empty result write failed at offset %zu", out]];
-            } else if (nvmtl_vk_cmd_copy_occlusion(&_cb->_c, query, 1, dst, out))
-                [self nvmtlVisibilityError:[NSString stringWithFormat:@"visibility: result copy failed at offset %zu", out]];
+        NVMTLBuffer *scratch = nil;
+        if (needScratch) {
+            scratch = [NVMTLBuffer new];
+            if (nvmtl_vk_buffer_create(_visRecords.count * 8, 0, &scratch->_b)) {
+                [self nvmtlVisibilityError:[NSString stringWithFormat:@"visibility: accumulation scratch allocation failed"]]; scratch = nil;
+            } else {
+                if (!_cb->_scratch) _cb->_scratch = [NSMutableArray new];
+                [_cb->_scratch addObject:scratch];
+            }
         }
-        if (queries.count > 1 && nvmtl_vk_cmd_sum_occlusion(&_cb->_c, &scratch->_b, first,
-                                                          (uint32_t)queries.count, &_visBuf->_b, offset))
-            [self nvmtlVisibilityError:[NSString stringWithFormat:@"visibility: accumulation failed at offset %zu", offset]];
+        size_t cursor = 0;
+        for (NSNumber *key in groups) {
+            NSArray *queries = groups[key]; size_t offset = key.unsignedLongLongValue;
+            if (queries.count > 1 && !scratch) continue;
+            nvk_buffer *dst = queries.count > 1 ? &scratch->_b : &_visBuf->_b;
+            size_t first = cursor;
+            for (NSNumber *value in queries) {
+                uint32_t query = value.unsignedIntValue;
+                size_t out = queries.count > 1 ? cursor++ * 8 : offset;
+                if (query == UINT32_MAX) {
+                    if (nvmtl_vk_cmd_write_word(&_cb->_c, dst, out, 0) ||
+                        nvmtl_vk_cmd_write_word(&_cb->_c, dst, out + 4, 0))
+                        [self nvmtlVisibilityError:[NSString stringWithFormat:@"visibility: empty result write failed at offset %zu", out]];
+                } else if (nvmtl_vk_cmd_copy_occlusion(&_cb->_c, query, 1, dst, out))
+                    [self nvmtlVisibilityError:[NSString stringWithFormat:@"visibility: result copy failed at offset %zu", out]];
+            }
+            if (queries.count > 1 && nvmtl_vk_cmd_sum_occlusion(&_cb->_c, &scratch->_b, first,
+                                                              (uint32_t)queries.count, &_visBuf->_b, offset))
+                [self nvmtlVisibilityError:[NSString stringWithFormat:@"visibility: accumulation failed at offset %zu", offset]];
+        }
     }
     _visRecords = nil;
     if (_begun) return;
