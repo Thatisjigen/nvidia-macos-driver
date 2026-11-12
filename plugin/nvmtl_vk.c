@@ -3346,6 +3346,7 @@ typedef struct { nvmtl_slot s[2][NVMTL_NBIND];
                  uint8_t dirty[2]; VkDescriptorSet last[2]; unsigned last_idx[2]; uint32_t last_hi[2]; uint64_t lastw[2][4];
                  uint64_t chg[2][NVMTL_BINDING_WORDS]; uint64_t texgen[2]; const void *emb_fn[2]; uint64_t emb_gen[2]; uint32_t emb_n[2];
                  uint64_t address_tex[2][NVMTL_NTEX]; uint8_t address_tex_valid[2];
+                 uint64_t address_tex_dirty[2][(NVMTL_NTEX + 63) / 64];   /* entries of a valid address_tex whose slot changed since */
                  uint64_t emb_key[2][NVMTL_EMB_KEYMAX];
                  uint32_t lastdyn[2]; void *lasttab[2];
                  uint64_t lasttb[2][4];   /* the texel-buffer mask the last set was written with */
@@ -4072,6 +4073,26 @@ static void nvmtl_vk_bindless_drop_now(uint32_t slot)
 
 int nvmtl_vk_bind_buffer_offset(nvk_cmdbuf *c, uint32_t set, uint32_t index, size_t offset);
 
+// The address table's texture-index entries are kept per entry: a texture slot that changes marks its entry, and the
+// next snapshot recomputes only the marked ones. WAS: any texture change dropped the whole cache and the next snapshot
+// re-read all 128 slots (5 KB of bind table). Core Animation changes a fragment texture on ~80% of its draws, so that
+// rebuild ran for most draws: ~40% of nvmtl_address_snapshot's samples in cabench. NVMTL_ADDR_TEX_INC=0 rebuilds the
+// whole cache again; NVMTL_ADDR_TEX_VERIFY=1 also rebuilds it on every snapshot and logs a FAIL line on any difference.
+static int nvmtl_addr_tex_inc_on(void)
+{
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("NVMTL_ADDR_TEX_INC"); on = !(e && e[0] == '0');
+        nvlog("vk: address-table texture entries %s (NVMTL_ADDR_TEX_INC=%s)", on ? "recomputed per changed slot" : "rebuilt whole on any change (OLD)", e ? e : "unset"); }
+    return on;
+}
+static int nvmtl_addr_tex_verify_on(void)
+{
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("NVMTL_ADDR_TEX_VERIFY"); on = e && e[0] == '1';
+        if (on) nvlog("vk: address-table texture entries are checked against a full rebuild on every snapshot (NVMTL_ADDR_TEX_VERIFY=1)"); }
+    return on;
+}
+
 static int nvmtl_bind_slot(nvk_cmdbuf *c, uint32_t set, uint32_t binding, uint8_t kind, void *h, size_t off)
 {
     if (set > 1 || binding >= NVMTL_NBIND) return -1;
@@ -4094,7 +4115,11 @@ static int nvmtl_bind_slot(nvk_cmdbuf *c, uint32_t set, uint32_t binding, uint8_
         t->dirty[set] = 1;
         t->chg[set][binding >> 6] |= 1ull << (binding & 63);
         if (kind != NVMTL_SLOT_BUF || sl->kind != NVMTL_SLOT_BUF) t->texgen[set]++;
-        if (binding >= NVMTL_NBUF && binding < NVMTL_NBUF + NVMTL_NTEX) t->address_tex_valid[set] = 0;
+        if (binding >= NVMTL_NBUF && binding < NVMTL_NBUF + NVMTL_NTEX) {
+            const uint32_t k = binding - NVMTL_NBUF;
+            if (nvmtl_addr_tex_inc_on()) t->address_tex_dirty[set][k >> 6] |= 1ull << (k & 63);
+            else t->address_tex_valid[set] = 0;
+        }
     }
     if (sl->kind != kind || sl->h != h) nvmtl_hz_slot_bound(c, t, set, binding, kind, h);   // hazard keys change only with the handle
     sl->kind = kind; sl->h = h; sl->off = off;
@@ -4477,6 +4502,8 @@ static int nvmtl_address_snapshot(nvk_cmdbuf *c, uint32_t which, VkDescriptorBuf
     // texture-index portion in this recording's bind table, then copy it into
     // each immutable GPU snapshot. Texture/view/texel transitions invalidate it
     // in nvmtl_bind_slot; nvmtl_vk_bind_texture_view fills size before a snapshot.
+    // A changed slot marks its entry (nvmtl_addr_tex_inc_on); only the marked entries are recomputed here, after
+    // nvmtl_vk_bind_texture_view has written their size.
     if (t) {
         if (!t->address_tex_valid[which]) {
             for (unsigned i = 0; i < NVMTL_NTEX; ++i) {
@@ -4484,6 +4511,27 @@ static int nvmtl_address_snapshot(nvk_cmdbuf *c, uint32_t which, VkDescriptorBuf
                 t->address_tex[which][i] = s->kind == NVMTL_SLOT_TEX && s->h ? (uint64_t)s->size : 0;
             }
             t->address_tex_valid[which] = 1;
+            memset(t->address_tex_dirty[which], 0, sizeof t->address_tex_dirty[which]);
+        } else {
+            for (unsigned w = 0; w < (NVMTL_NTEX + 63) / 64; w++) {
+                for (uint64_t bits = t->address_tex_dirty[which][w]; bits; bits &= bits - 1) {
+                    const unsigned i = w * 64 + (unsigned)__builtin_ctzll(bits);
+                    if (i >= NVMTL_NTEX) break;
+                    const nvmtl_slot *s = &t->s[which][NVMTL_NBUF + i];
+                    t->address_tex[which][i] = s->kind == NVMTL_SLOT_TEX && s->h ? (uint64_t)s->size : 0;
+                }
+                t->address_tex_dirty[which][w] = 0;
+            }
+            if (nvmtl_addr_tex_verify_on()) {
+                static unsigned said;
+                for (unsigned i = 0; i < NVMTL_NTEX; ++i) {
+                    const nvmtl_slot *s = &t->s[which][NVMTL_NBUF + i];
+                    const uint64_t want = s->kind == NVMTL_SLOT_TEX && s->h ? (uint64_t)s->size : 0;
+                    if (t->address_tex[which][i] != want && said++ < 16)
+                        nvlog("vk: address-table texture entry %u of set %u FAILED its check: cached %llu, slot says %llu", i, which,
+                              (unsigned long long)t->address_tex[which][i], (unsigned long long)want);
+                }
+            }
         }
         memcpy(addresses + 2 * NVMTL_NBUF, t->address_tex[which], sizeof t->address_tex[which]);
     } else memset(addresses + 2 * NVMTL_NBUF, 0, NVMTL_NTEX * sizeof(uint64_t));
