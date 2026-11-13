@@ -189,6 +189,43 @@ static long nvmtl_gpu_wait_budget_ms(void)
     cached = (me && strcmp(me, "WindowServer") == 0) ? 5000 : 60000;
     return cached;
 }
+// A browser's GPU process sleeps on the GPU's completion event instead of polling for it. NVK's fence wait polls in every
+// process but WindowServer (sched_yield for the first millisecond, then usleep(50)): right for a game whose next frame
+// waits on the result, but WebGL is drawn by ANGLE in the browser's GPU process, whose completion thread (nvmtl.execution)
+// waits out every command buffer and so spun a core for as long as the GPU was busy. Measured with Firefox's ANGLE
+// (slow/agents/webglperf/bin/wglbench, 1280x720 frames presented into an IOSurface that is then locked and read, as
+// Firefox's software compositor does; medians of 3 interleaved runs): process CPU per frame 9.03 -> 4.78 ms with
+// index-converting draws (GPU-bound), 1.74 -> 1.39 ms in a mixed frame, 1.02 -> 0.92 ms with 500 plain draws; frame times
+// equal within 1-4% back to back and within noise at 60 fps (median 2.28 vs 2.30 ms, 6.48 vs 6.46 ms). NVK reads
+// NVRM_EVENT_WAIT once, at its first wait, so it is set here, before NVK is opened. Chosen for: Firefox's GPU process
+// ("Firefox GPU Helper", or -parentPid ... gpu), WebKit's GPU process, a Chromium or Electron "Helper (GPU)", and any process that has ANGLE loaded
+// when Metal comes up. A value from the environment or nvrm610.conf wins; NVMTL_ANGLE_EVENT_WAIT=0 keeps the polling.
+static int nvmtl_gecko_decoder_process_type(void);
+static const char *nvmtl_browser_gpu_process(void)
+{
+    const char *me = getprogname();
+    if (!me || !strcmp(me, "WindowServer")) return NULL;
+    if (nvmtl_gecko_decoder_process_type() == 2 || !strcmp(me, "Firefox GPU Helper")) return "Firefox GPU process";
+    if (!strcmp(me, "com.apple.WebKit.GPU")) return "WebKit GPU process";
+    const size_t n = strlen(me), k = strlen(" Helper (GPU)");
+    if (n > k && !strcmp(me + n - k, " Helper (GPU)")) return "Chromium GPU process";
+    for (uint32_t i = 0, c = _dyld_image_count(); i < c; i++) {
+        const char *path = _dyld_get_image_name(i), *base = path ? strrchr(path, '/') : NULL;
+        base = base ? base + 1 : path;
+        if (base && (!strcmp(base, "libGLESv2.dylib") || !strncmp(base, "libANGLE", 8))) return "ANGLE is loaded";
+    }
+    return NULL;
+}
+static void nvmtl_event_wait_choose(void)
+{
+    const char *e = getenv("NVMTL_ANGLE_EVENT_WAIT"), *set = getenv("NVRM_EVENT_WAIT");
+    if (set) return;   // the user's (environment or nvrm610.conf)
+    const char *why = nvmtl_browser_gpu_process();
+    if (!why) return;
+    if (e && e[0] == '0') { nvlog("vk: %s (%s) polls for GPU completion (NVMTL_ANGLE_EVENT_WAIT=0)", getprogname(), why); return; }
+    setenv("NVRM_EVENT_WAIT", "1", 0);
+    nvlog("vk: %s (%s): fence waits sleep on the GPU's completion event (NVMTL_ANGLE_EVENT_WAIT=0 polls)", getprogname(), why);
+}
 static size_t g_alloc_bytes;
 static uint64_t g_buf_made, g_buf_gone, g_img_made, g_img_gone;
 static uint64_t g_pool_blocks, g_pool_live, g_pool_bytes;
@@ -1227,6 +1264,7 @@ static int nvmtl_vk_initialize(void)
        though RADV compiles them. GCN 1/2 have no 16-bit ALU and keep shaderFloat16 off: their half modules stay refused,
        which is what keeps ACO from compiling half arithmetic it cannot lower there. A value the user set wins. */
     if (nvmtl_vk_vendor() == 0x1002) setenv("radv_enable_float16_gfx8", "true", 0);
+    if (nvmtl_vk_vendor() == 0x10de) nvmtl_event_wait_choose();
     g_lib = dlopen(NVMTL_ICD_LIB, RTLD_NOW | RTLD_LOCAL);
     if (g_lib) {
         pvkGetInstanceProcAddr = (PFN_vkGetInstanceProcAddr)dlsym(g_lib, "vkGetInstanceProcAddr");
