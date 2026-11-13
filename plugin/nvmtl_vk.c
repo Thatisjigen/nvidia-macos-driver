@@ -3384,6 +3384,7 @@ typedef struct { nvmtl_slot s[2][NVMTL_NBIND];
                  uint8_t dirty[2]; VkDescriptorSet last[2]; unsigned last_idx[2]; uint32_t last_hi[2]; uint64_t lastw[2][4];
                  uint64_t chg[2][NVMTL_BINDING_WORDS]; uint64_t texgen[2]; const void *emb_fn[2]; uint64_t emb_gen[2]; uint32_t emb_n[2];
                  uint64_t address_tex[2][NVMTL_NTEX]; uint8_t address_tex_valid[2];
+                 uint16_t address_tex_hw[2];   /* no address_tex entry at or past this index is non-zero (a high-water mark) */
                  uint64_t address_tex_dirty[2][(NVMTL_NTEX + 63) / 64];   /* entries of a valid address_tex whose slot changed since */
                  uint64_t emb_key[2][NVMTL_EMB_KEYMAX];
                  uint32_t lastdyn[2]; void *lasttab[2];
@@ -4190,7 +4191,12 @@ int nvmtl_vk_bind_buffer_offset(nvk_cmdbuf *c, uint32_t set, uint32_t index, siz
 
 #define NVMTL_TABLES_PER_PAGE 256
 #define NVMTL_TABLE_BYTES ((2 * NVMTL_NBUF + NVMTL_NTEX) * sizeof(uint64_t))
-typedef struct nvmtl_address_page { nvk_buffer buffer; struct nvmtl_address_page *next; nvmtl_pl_node life; } nvmtl_address_page;
+// lean: what nvmtl_address_snapshot knows a table slot of this page already holds (NVMTL_ADDR_SNAP_LEAN). self_buf/self_addr:
+// the page's device address, for the VkBuffer it was read from; self_done: slots whose self-pointer words are written;
+// tex_hw[slot]: no word past the first tex_hw texture-size entries of that slot is non-zero (NVMTL_NTEX: not known).
+typedef struct nvmtl_address_page { nvk_buffer buffer; struct nvmtl_address_page *next; nvmtl_pl_node life;
+                                    void *self_buf; uint64_t self_addr; uint64_t self_done[NVMTL_TABLES_PER_PAGE / 64];
+                                    uint8_t tex_hw[NVMTL_TABLES_PER_PAGE]; } nvmtl_address_page;
 // A cached command pool keeps its NVK memory chunks, and every chunk holds a user-client connection
 // for as long as it lives: nvrm_xnu maps with IOConnectMapMemory64(conn, 0, ...), which is ONE mapping
 // per connection by design, so live mappings and live connections are the same number. macOS refuses
@@ -4504,6 +4510,67 @@ static void nvmtl_perf_submit(unsigned sets, const uint64_t *pt)
             (unsigned long long)g_wit_ok, (unsigned long long)g_wit_waited, (unsigned long long)g_wit_leak,
             (unsigned long long)g_wit_blind, (unsigned long long)g_wit_ctl_fired, (unsigned long long)g_wit_ctl_run, s);
 }
+// A lean address-table snapshot. Every draw that changes a buffer binding writes a new 1.5 KB table (32 buffer addresses,
+// 32 self-pointers, 128 texture sizes) into a host-visible page, and ANGLE - every browser's WebGL - changes one on every
+// draw (setVertexBytes / setFragmentBytes for its default uniform block), so this ran twice per draw: 18% of the
+// driver's CPU per draw (slow/agents/webglperf/bin/bytesbench), two NVK calls for device addresses that never change,
+// 64 self-pointer words that are the same every time a page slot is used, and 1 KB of texture sizes that were nearly
+// all zero. Now the dummy buffer's and the page's addresses are read once, a slot's self-pointers are written the first
+// time the page uses it, and texture sizes up to the bind table's highest bound entry are copied, with zeros written
+// only over words an earlier snapshot of that slot left non-zero. Every word the GPU reads is the same as before.
+// NVMTL_ADDR_SNAP_LEAN=0 writes the whole table every time again.
+static int nvmtl_addr_snap_lean_on(void)
+{
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("NVMTL_ADDR_SNAP_LEAN"); on = !(e && e[0] == '0');
+        nvlog("vk: address-table snapshots %s (NVMTL_ADDR_SNAP_LEAN=%s)", on ? "write only the words that differ from what the page slot holds"
+              : "write the whole 1.5 KB table (OLD)", e ? e : "unset"); }
+    return on;
+}
+static uint64_t nvmtl_dummy_address(void)
+{
+    static void *buf; static uint64_t addr;
+    void *const b = g_dummyBuf.buf;
+    if (__atomic_load_n(&buf, __ATOMIC_ACQUIRE) != b || !addr) { addr = nvmtl_vk_buffer_address(&g_dummyBuf); __atomic_store_n(&buf, b, __ATOMIC_RELEASE); }
+    return addr;
+}
+// NVMTL_ADDR_SNAP_VERIFY=1 (a test switch): after every lean snapshot, the whole table as the old code wrote it is built
+// beside it and compared word by word; a difference logs a FAIL line (and a census of checks every 2^k snapshots).
+static int nvmtl_addr_snap_verify_on(void)
+{
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("NVMTL_ADDR_SNAP_VERIFY"); on = e && e[0] == '1';
+        if (on) nvlog("vk: lean address-table snapshots are checked against a full table on every snapshot (NVMTL_ADDR_SNAP_VERIFY=1)"); }
+    return on;
+}
+static void nvmtl_addr_snap_verify(nvk_cmdbuf *c, uint32_t which, nvmtl_address_page *page, unsigned slot, const uint64_t *addresses)
+{
+    static _Atomic unsigned long long checks, fails;
+    uint64_t want[2 * NVMTL_NBUF + NVMTL_NTEX];
+    const nvmtl_bindtable *t = c->table;
+    const uint64_t dummy = nvmtl_vk_buffer_address(&g_dummyBuf);
+    for (unsigned i = 0; i < NVMTL_NBUF; ++i) { const nvmtl_slot *sl = t ? &t->s[which][i] : NULL; want[i] = sl && sl->kind == NVMTL_SLOT_BUF ? sl->address + sl->off : dummy; }
+    uint64_t self = nvmtl_vk_buffer_address(&page->buffer); if (self) self += slot * NVMTL_TABLE_BYTES;
+    for (unsigned i = 0; i < NVMTL_NBUF; ++i) want[NVMTL_NBUF + i] = self ? self + i * sizeof(uint64_t) : 0;
+    for (unsigned i = 0; i < NVMTL_NTEX; ++i) { const nvmtl_slot *sl = t ? &t->s[which][NVMTL_NBUF + i] : NULL;
+        want[2 * NVMTL_NBUF + i] = sl && sl->kind == NVMTL_SLOT_TEX && sl->h ? (uint64_t)sl->size : 0; }
+    unsigned bad = 0, first = 0;
+    for (unsigned i = 0; i < 2 * NVMTL_NBUF + NVMTL_NTEX; ++i) if (addresses[i] != want[i]) { if (!bad) first = i; bad++; }
+    const unsigned long long n = atomic_fetch_add(&checks, 1) + 1;
+    if (bad) { const unsigned long long f = atomic_fetch_add(&fails, 1) + 1;
+        if (f <= 16) nvlog("vk: lean address-table snapshot FAILED its check: %u of %u words differ, first word %u (0x%llx, want 0x%llx), set %u slot %u",
+                           bad, 2 * NVMTL_NBUF + NVMTL_NTEX, first, (unsigned long long)addresses[first], (unsigned long long)want[first], which, slot); }
+    if (!(n & (n - 1)) && n >= 1024) nvlog_every("vk: lean address-table snapshot checks: %llu, %llu FAILED", n, (unsigned long long)atomic_load(&fails));
+}
+static void nvmtl_addr_tex_write(nvmtl_address_page *page, unsigned slot, uint64_t *addresses, const uint64_t *tex, unsigned hw)
+{
+    uint64_t *dst = addresses + 2 * NVMTL_NBUF;
+    if (hw > NVMTL_NTEX) hw = NVMTL_NTEX;
+    if (hw && tex) memcpy(dst, tex, hw * sizeof(uint64_t)); else hw = 0;
+    const unsigned was = page->tex_hw[slot] > NVMTL_NTEX ? NVMTL_NTEX : page->tex_hw[slot];
+    if (was > hw) memset(dst + hw, 0, (was - hw) * sizeof(uint64_t));
+    page->tex_hw[slot] = (uint8_t)hw;
+}
 static int nvmtl_address_snapshot(nvk_cmdbuf *c, uint32_t which, VkDescriptorBufferInfo *out) {
     if (c->icb_slot && c->icb_slot <= c->icb_ntabs && which < 2 && c->icb_tabs[which]) {   // GPU-encoded ICB replay: this slot's prepared table
         const uint64_t *e = c->icb_tabs[which] + 2u * (c->icb_slot - 1u);
@@ -4519,23 +4586,31 @@ static int nvmtl_address_snapshot(nvk_cmdbuf *c, uint32_t which, VkDescriptorBuf
             if (!page) return -1;
             if (nvmtl_vk_buffer_create(NVMTL_TABLE_BYTES * NVMTL_TABLES_PER_PAGE, 1, &page->buffer)) { nvmtl_vk_buffer_destroy(&page->buffer); free(page); return -1; }
             nvmtl_live_relabel(&page->buffer, NVMTL_LV_PAGE);
+            memset(page->tex_hw, NVMTL_NTEX, sizeof page->tex_hw);   // a new page's bytes are not known to be zero
         }
         page->next = c->address_pages; c->address_pages = page;
         pthread_mutex_lock(&g_pl_lock); nvmtl_pl_made(&g_pl); pthread_mutex_unlock(&g_pl_lock);
     }
     uint64_t *addresses = (uint64_t *)((uint8_t *)page->buffer.map + slot * NVMTL_TABLE_BYTES);
     nvmtl_bindtable *t = c->table;
+    const int lean = nvmtl_addr_snap_lean_on();
     // Every unbound buffer uses the same address. Query it once, rather than
     // calling through NVK for each of the usual 31 empty slots on every draw.
-    const uint64_t dummy = nvmtl_vk_buffer_address(&g_dummyBuf);
+    const uint64_t dummy = lean ? nvmtl_dummy_address() : nvmtl_vk_buffer_address(&g_dummyBuf);
     for (unsigned i = 0; i < NVMTL_NBUF; ++i) {
         nvmtl_slot *s = t ? &t->s[which][i] : NULL;
         addresses[i] = s && s->kind == NVMTL_SLOT_BUF ? s->address + s->off : dummy;
     }
-    uint64_t self = nvmtl_vk_buffer_address(&page->buffer);
-    if (!self) nvlog("address table: page has no device address - array_ref<void> arguments will read 0");
-    else self += slot * NVMTL_TABLE_BYTES;
-    for (unsigned i = 0; i < NVMTL_NBUF; ++i) addresses[NVMTL_NBUF + i] = self ? self + i * sizeof(uint64_t) : 0;
+    const uint64_t bit = 1ull << (slot & 63);
+    if (lean && page->self_buf != page->buffer.buf) { page->self_buf = page->buffer.buf; page->self_addr = nvmtl_vk_buffer_address(&page->buffer); memset(page->self_done, 0, sizeof page->self_done); }
+    if (!lean || !(page->self_done[slot >> 6] & bit)) {
+        uint64_t self = lean ? page->self_addr : nvmtl_vk_buffer_address(&page->buffer);
+        if (!self) nvlog("address table: page has no device address - array_ref<void> arguments will read 0");
+        else self += slot * NVMTL_TABLE_BYTES;
+        for (unsigned i = 0; i < NVMTL_NBUF; ++i) addresses[NVMTL_NBUF + i] = self ? self + i * sizeof(uint64_t) : 0;
+        if (lean && self) page->self_done[slot >> 6] |= bit;
+        else if (!lean) page->self_done[slot >> 6] &= ~bit;
+    }
     // Buffer offsets change much more often than texture bindings. Cache the
     // texture-index portion in this recording's bind table, then copy it into
     // each immutable GPU snapshot. Texture/view/texel transitions invalidate it
@@ -4544,10 +4619,13 @@ static int nvmtl_address_snapshot(nvk_cmdbuf *c, uint32_t which, VkDescriptorBuf
     // nvmtl_vk_bind_texture_view has written their size.
     if (t) {
         if (!t->address_tex_valid[which]) {
+            unsigned hw = 0;
             for (unsigned i = 0; i < NVMTL_NTEX; ++i) {
                 const nvmtl_slot *s = &t->s[which][NVMTL_NBUF + i];
                 t->address_tex[which][i] = s->kind == NVMTL_SLOT_TEX && s->h ? (uint64_t)s->size : 0;
+                if (t->address_tex[which][i]) hw = i + 1;
             }
+            t->address_tex_hw[which] = (uint16_t)hw;
             t->address_tex_valid[which] = 1;
             memset(t->address_tex_dirty[which], 0, sizeof t->address_tex_dirty[which]);
         } else {
@@ -4557,6 +4635,7 @@ static int nvmtl_address_snapshot(nvk_cmdbuf *c, uint32_t which, VkDescriptorBuf
                     if (i >= NVMTL_NTEX) break;
                     const nvmtl_slot *s = &t->s[which][NVMTL_NBUF + i];
                     t->address_tex[which][i] = s->kind == NVMTL_SLOT_TEX && s->h ? (uint64_t)s->size : 0;
+                    if (t->address_tex[which][i] && i + 1 > t->address_tex_hw[which]) t->address_tex_hw[which] = (uint16_t)(i + 1);
                 }
                 t->address_tex_dirty[which][w] = 0;
             }
@@ -4571,8 +4650,11 @@ static int nvmtl_address_snapshot(nvk_cmdbuf *c, uint32_t which, VkDescriptorBuf
                 }
             }
         }
-        memcpy(addresses + 2 * NVMTL_NBUF, t->address_tex[which], sizeof t->address_tex[which]);
-    } else memset(addresses + 2 * NVMTL_NBUF, 0, NVMTL_NTEX * sizeof(uint64_t));
+        if (lean) nvmtl_addr_tex_write(page, slot, addresses, t->address_tex[which], t->address_tex_hw[which]);
+        else { memcpy(addresses + 2 * NVMTL_NBUF, t->address_tex[which], sizeof t->address_tex[which]); page->tex_hw[slot] = NVMTL_NTEX; }
+    } else if (lean) nvmtl_addr_tex_write(page, slot, addresses, NULL, 0);
+    else { memset(addresses + 2 * NVMTL_NBUF, 0, NVMTL_NTEX * sizeof(uint64_t)); page->tex_hw[slot] = NVMTL_NTEX; }
+    if (lean && nvmtl_addr_snap_verify_on()) nvmtl_addr_snap_verify(c, which, page, slot, addresses);
     *out = (VkDescriptorBufferInfo){ page->buffer.buf, slot * NVMTL_TABLE_BYTES, NVMTL_TABLE_BYTES };
     c->address_count++;
     return 0;
