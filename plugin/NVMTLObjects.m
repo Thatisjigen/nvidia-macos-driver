@@ -2935,17 +2935,52 @@ NSDictionary *nvmtl_index_argument_fields(NSArray *fields) {
     }
     return [index copy];
 }
+// ANGLE (every browser's WebGL) puts uniform blocks in argument buffers: for each draw it asks the encoder its
+// encodedLength to place the next one and sets the block's buffer with setBuffer:offset:atIndex:. Both read the
+// layout's field dictionaries (an NSNumber-keyed lookup, then string-keyed ones) on every call: with Babylon's pattern
+// (wglbench ubo, one uniform block per draw) the two were 409 of the 1570 driver samples on the WebGL thread. The
+// answers never change for an encoder, so encodedLength is kept after its first answer and setBuffer: reads the field
+// offset from the same index -> offset table constantDataAtIndex: builds (first field of an [[id(n)]] wins in both, as
+// in nvmtl_index_argument_fields). wglbench ubo 1500 500 (PRESENT=flush, medians of 5 interleaved runs): WebGL thread
+// CPU 1.074 -> 1.021 ms a frame, wall 1.194 -> 1.129 ms. NVMTL_AE_FAST=0 reads the dictionaries every time again.
+static int nvmtl_ae_fast_on(void)
+{
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("NVMTL_AE_FAST"); on = !(e && e[0] == '0'); }
+    return on;
+}
+// The encoder's argument index -> field offset table (-1: no field there), built once; *n is its length.
+static const int64_t *nvmtl_ae_offsets(NVMTLArgumentEncoder *e, NSUInteger *n)
+{
+    int64_t *o = __atomic_load_n(&e->_offAt, __ATOMIC_ACQUIRE);
+    if (!o) {
+        NSUInteger mx = 0; for (NSDictionary *fd in e->_fields) { NSUInteger a = [fd[@"argument_index"] unsignedLongValue]; if (a > mx) mx = a; }
+        int64_t *b = (int64_t *)malloc((mx + 1) * sizeof *b);
+        if (!b) return NULL;
+        for (NSUInteger k = 0; k <= mx; k++) b[k] = -1;
+        for (NSDictionary *fd in e->_fields) { NSUInteger a = [fd[@"argument_index"] unsignedLongValue]; if (b[a] < 0) b[a] = (int64_t)[fd[@"field_offset"] unsignedLongValue]; }
+        __atomic_store_n(&e->_offN, mx + 1, __ATOMIC_RELAXED);   // the same value whichever thread builds it
+        int64_t *expect = NULL;
+        if (__atomic_compare_exchange_n(&e->_offAt, &expect, b, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) o = b; else { free(b); o = expect; }
+    }
+    *n = __atomic_load_n(&e->_offN, __ATOMIC_RELAXED);
+    return o;
+}
 @implementation NVMTLArgumentEncoder
 - (id<MTLDevice>)device { return (id<MTLDevice>)gNVMTLMainDevice; }
 - (NSString *)label { return _label; }
 - (void)setLabel:(NSString *)l { _label = [l copy]; }
 - (NSUInteger)encodedLength {
+    const int fast = nvmtl_ae_fast_on();
+    if (fast) { const NSUInteger kept = __atomic_load_n(&_encLen, __ATOMIC_RELAXED); if (kept) return kept; }
     NSUInteger end = 0;
     for (NSDictionary *f in _fields) {
         NSUInteger e = [f[@"field_offset"] unsignedLongValue] + 8;
         if (e > end) end = e;
     }
-    return MAX(end, _airSize) ?: 8;
+    const NSUInteger len = MAX(end, _airSize) ?: 8;
+    if (fast) __atomic_store_n(&_encLen, len, __ATOMIC_RELAXED);
+    return len;
 }
 - (NSUInteger)alignment { return _airAlign ?: 8; }
 - (void)setArgumentBuffer:(id<MTLBuffer>)b offset:(NSUInteger)off { _dst = (NVMTLBuffer *)b; _dstOffset = off; nvtrace("AE argbuf %p off %lu (%lu fields)", (__bridge void *)b, (unsigned long)off, (unsigned long)_fields.count); }
@@ -2969,10 +3004,18 @@ NSDictionary *nvmtl_index_argument_fields(NSArray *fields) {
     return _fieldByIndex[@(index)];
 }
 - (void)setBuffer:(id<MTLBuffer>)b offset:(NSUInteger)off atIndex:(NSUInteger)index {
-    NVMTLBuffer *nb = (NVMTLBuffer *)b;
+    __unsafe_unretained NVMTLBuffer *nb = (NVMTLBuffer *)b;   // the caller holds it for the call
     if (!_dst || !nvmtl_buf_cpu(_dst)) { nvlog("argument encoder: no argument buffer set (or it is not host-visible)"); return; }
-    NSDictionary *f = [self nvmtlFieldAt:index];
-    if (!f) { nvlog("argument encoder: this function has no [[id(%lu)]] field — REFUSED", (unsigned long)index); return; }
+    NSUInteger fieldOffset = 0;
+    NSUInteger n = 0; const int64_t *ot = nvmtl_ae_fast_on() ? nvmtl_ae_offsets(self, &n) : NULL;
+    if (ot) {
+        if (index >= n || ot[index] < 0) { nvlog("argument encoder: this function has no [[id(%lu)]] field — REFUSED", (unsigned long)index); return; }
+        fieldOffset = (NSUInteger)ot[index];
+    } else {
+        NSDictionary *f = [self nvmtlFieldAt:index];
+        if (!f) { nvlog("argument encoder: this function has no [[id(%lu)]] field — REFUSED", (unsigned long)index); return; }
+        fieldOffset = [f[@"field_offset"] unsignedLongValue];
+    }
     // The binding path checks the offset against the buffer length (nvmtl_vk_bind_buffer); this path
     // computes an address the shader will dereference, so it has to check the same thing.
     if (nb && off > nb->_b.size) {
@@ -2981,7 +3024,6 @@ NSDictionary *nvmtl_index_argument_fields(NSArray *fields) {
         return;
     }
     uint64_t addr = nb ? nvmtl_vk_buffer_address(&nb->_b) + off : 0;
-    const NSUInteger fieldOffset = [f[@"field_offset"] unsignedLongValue];
     const size_t size = _dst->_b.size;
     if (_dstOffset > size || fieldOffset > size - _dstOffset || 8 > size - _dstOffset - fieldOffset) {
         nvlog("argument encoder: field offset %lu+%lu does not fit %zu bytes — REFUSED", (unsigned long)_dstOffset, (unsigned long)fieldOffset, size); return;
@@ -3050,15 +3092,9 @@ NSDictionary *nvmtl_index_argument_fields(NSArray *fields) {
 - (void)setIndirectCommandBuffers:(const id<MTLIndirectCommandBuffer> __unsafe_unretained [])b withRange:(NSRange)r {
     for (NSUInteger k = 0; k < r.length; k++) [self setIndirectCommandBuffer:b ? b[k] : nil atIndex:r.location + k]; }
 - (void *)constantDataAtIndex:(NSUInteger)index {
-    if (!_offAt) {
-        NSUInteger mx = 0; for (NSDictionary *fd in _fields) { NSUInteger a = [fd[@"argument_index"] unsignedLongValue]; if (a > mx) mx = a; }
-        int64_t *o = (int64_t *)malloc((mx + 1) * sizeof *o);
-        if (o) { for (NSUInteger k = 0; k <= mx; k++) o[k] = -1;
-                 for (NSDictionary *fd in _fields) { NSUInteger a = [fd[@"argument_index"] unsignedLongValue]; if (o[a] < 0) o[a] = (int64_t)[fd[@"field_offset"] unsignedLongValue]; }
-                 _offN = mx + 1; _offAt = o; }
-    }
-    if (!_offAt || index >= _offN || _offAt[index] < 0 || !_dst || !nvmtl_buf_cpu(_dst)) return NULL;
-    const NSUInteger fieldOffset = (NSUInteger)_offAt[index];
+    NSUInteger n = 0; const int64_t *ot = nvmtl_ae_offsets(self, &n);
+    if (!ot || index >= n || ot[index] < 0 || !_dst || !nvmtl_buf_cpu(_dst)) return NULL;
+    const NSUInteger fieldOffset = (NSUInteger)ot[index];
     const size_t size = _dst->_b.size;
     if (_dstOffset >= size || fieldOffset >= size - _dstOffset) return NULL;
     return (uint8_t *)nvmtl_buf_cpu(_dst) + _dstOffset + fieldOffset;

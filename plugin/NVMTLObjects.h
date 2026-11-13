@@ -117,6 +117,7 @@ static inline uint32_t nvmtl_vk_layers_for_desc(uint32_t t, uint32_t n, uint32_t
   int64_t *_offAt; NSUInteger _offN;
   NVMTLBuffer *_dst; NSUInteger _dstOffset; NSString *_label;
   NSUInteger _airSize, _airAlign;
+  NSUInteger _encLen;   /* encodedLength, kept after its first answer (0: not yet; NVMTL_AE_FAST) */
 } @end
 extern id gNVMTLMainDevice;
 @interface NVMTLLibrary : NSObject <MTLLibrary> { @public NSDictionary<NSString *, NSData *> *_fns; NSMutableDictionary<NSString *, NSData *> *_compiledFns; NSDictionary<NSString *, NSString *> *_stages, *_airs; NSArray<NSString *> *_externs;
