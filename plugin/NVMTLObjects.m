@@ -829,13 +829,46 @@ static void nvmtl_purge_report(const char *why) {
 }
 static void nvmtl_pre_release(void *held) { @autoreleasepool { (void)CFBridgingRelease(held); } }
 static void nvmtl_zero_flush(void);
+// A Managed buffer uploads exactly the ranges didModifyRange named since its last upload. WAS one span from the lowest
+// to the highest named byte: bytes in between that the GPU had written since (a blit into the buffer) were overwritten
+// from the stale CPU copy at the next submit. ANGLE - the WebGL of every browser and Electron app - updates a buffer the
+// GPU is not using from the CPU and one it is using with a blit, so vertex, index and staging data lost blitted bytes
+// whenever CPU updates fell on both sides of them between two submits: map triangles flung across the screen, glyph
+// quads missing or garbled, flashing for a frame. mrange.m (CPU writes on both sides of a GPU-written range): 200 of 200
+// rounds lost the GPU's bytes; glstream (ANGLE on 4 threads): every frame lost glyph quads. NVMTL_MANAGED_RANGES=0
+// merges into one span again.
+static int nvmtl_managed_ranges_on(void) {
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("NVMTL_MANAGED_RANGES"); on = !(e && e[0] == '0');
+        nvlog("managed: didModifyRange uploads %s (NVMTL_MANAGED_RANGES=%s)", on ? "exactly the ranges it named"
+              : "one span from the lowest to the highest named byte (OLD: overwrites GPU writes in between)", e ? e : "unset"); }
+    return on;
+}
+static int nvmtl_range_cmp(const void *x, const void *y) {
+    const NSUInteger a = ((const NSUInteger *)x)[0], b = ((const NSUInteger *)y)[0]; return a < b ? -1 : a > b;
+}
+// Sorts the n [lo, hi) pairs and joins those that overlap or touch; returns the new count. Exact: no byte is added.
+static unsigned nvmtl_ranges_compact(NSUInteger *r, unsigned n) {
+    if (n < 2) return n;
+    qsort(r, n, 2 * sizeof *r, nvmtl_range_cmp);
+    unsigned w = 0;
+    for (unsigned i = 1; i < n; i++) {
+        if (r[2 * i] <= r[2 * w + 1]) { if (r[2 * i + 1] > r[2 * w + 1]) r[2 * w + 1] = r[2 * i + 1]; }
+        else { w++; r[2 * w] = r[2 * i]; r[2 * w + 1] = r[2 * i + 1]; }
+    }
+    return w + 1;
+}
 static void nvmtl_managed_flush(void) {
     if (!atomic_load(&gManagedAny) || gManagedInFlush) return;
     gManagedInFlush = 1;
     NSMutableArray *todo = [NSMutableArray new];
     os_unfair_lock_lock(&gManagedLock);
     for (NVMTLBuffer *b in gManagedDirty.allObjects) {
-        if (b->_dirtyHi > b->_dirtyLo) [todo addObject:@[b, @(b->_dirtyLo), @(b->_dirtyHi)]];
+        if (b->_dirtyN) {   // the named ranges move into the work item; the buffer starts a new list
+            [todo addObject:@[b, [NSData dataWithBytesNoCopy:b->_dirtyR length:(NSUInteger)b->_dirtyN * 2 * sizeof(NSUInteger) freeWhenDone:YES]]];
+            b->_dirtyR = NULL; b->_dirtyN = b->_dirtyCap = 0;
+        }
+        if (b->_dirtyHi > b->_dirtyLo) [todo addObject:@[b, @(b->_dirtyLo), @(b->_dirtyHi)]];   // knob off, or no memory for a list
         b->_dirtyLo = b->_dirtyHi = 0;
     }
     [gManagedDirty removeAllObjects]; atomic_store(&gManagedAny, 0);
@@ -844,27 +877,47 @@ static void nvmtl_managed_flush(void) {
     // snapshot. Claim its initial clear before uploading this dirty snapshot;
     // otherwise the next submission can clear data already uploaded here.
     if (todo.count) nvmtl_zero_flush();
-    if (todo.count && nvmtl_vk_pre_open()) {
-        for (NSArray *t in todo) {
-            NVMTLBuffer *b = t[0]; NSUInteger lo = [t[1] unsignedIntegerValue], n = [t[2] unsignedIntegerValue] - lo;
-            if (nvmtl_vk_pre_copy(&b->_shadow, lo, &b->_b, lo, n))
-                nvlog("managed: upload of %lu bytes at %lu FAILED - the GPU keeps the old bytes", (unsigned long)n, (unsigned long)lo);
-        }
-        nvmtl_pre_release_hook = nvmtl_pre_release;
-        nvmtl_vk_pre_hold((__bridge_retained void *)todo);
-    } else
+    const int pre = todo.count && nvmtl_vk_pre_open();
     for (NSArray *t in todo) {
-        NVMTLBuffer *b = t[0]; NSUInteger lo = [t[1] unsignedIntegerValue], n = [t[2] unsignedIntegerValue] - lo;
-        if (nvmtl_vk_copy_buffer(nvmtl_device_queue(), &b->_shadow, lo, &b->_b, lo, n))
-            nvlog("managed: upload of %lu bytes at %lu FAILED - the GPU keeps the old bytes", (unsigned long)n, (unsigned long)lo);
+        NVMTLBuffer *b = t[0];
+        NSUInteger one[2], *r = one; unsigned n = 1;
+        if (t.count == 2) { NSData *d = t[1]; r = (NSUInteger *)d.bytes; n = nvmtl_ranges_compact(r, (unsigned)(d.length / (2 * sizeof *r))); }
+        else { one[0] = [t[1] unsignedIntegerValue]; one[1] = [t[2] unsignedIntegerValue]; }
+        for (unsigned k = 0; k < n; k++) {
+            const NSUInteger lo = r[2 * k], len = r[2 * k + 1] - lo;
+            if (pre ? nvmtl_vk_pre_copy(&b->_shadow, lo, &b->_b, lo, len) : nvmtl_vk_copy_buffer(nvmtl_device_queue(), &b->_shadow, lo, &b->_b, lo, len))
+                nvlog("managed: upload of %lu bytes at %lu FAILED - the GPU keeps the old bytes", (unsigned long)len, (unsigned long)lo);
+        }
     }
+    if (pre) { nvmtl_pre_release_hook = nvmtl_pre_release; nvmtl_vk_pre_hold((__bridge_retained void *)todo); }
     gManagedInFlush = 0;
 }
 static void nvmtl_presubmit(void);
 static void nvmtl_managed_mark(NVMTLBuffer *b, NSUInteger lo, NSUInteger hi) {
+    if (hi <= lo) return;
     os_unfair_lock_lock(&gManagedLock);
     if (!gManagedDirty) gManagedDirty = [NSHashTable weakObjectsHashTable];
-    if (b->_dirtyHi <= b->_dirtyLo) { b->_dirtyLo = lo; b->_dirtyHi = hi; }
+    BOOL listed = NO;
+    if (nvmtl_managed_ranges_on()) {
+        NSUInteger *last = b->_dirtyN ? b->_dirtyR + 2 * (b->_dirtyN - 1) : NULL;
+        if (last && lo <= last[1] && hi >= last[0]) { last[0] = MIN(last[0], lo); last[1] = MAX(last[1], hi); listed = YES; }   // overlaps or touches: one range
+        else {
+            if (b->_dirtyN == b->_dirtyCap && b->_dirtyN >= 256) b->_dirtyN = nvmtl_ranges_compact(b->_dirtyR, b->_dirtyN);
+            if (b->_dirtyN == b->_dirtyCap) {
+                const unsigned cap = b->_dirtyCap ? b->_dirtyCap * 2 : 8;
+                NSUInteger *grown = cap > b->_dirtyCap ? realloc(b->_dirtyR, (size_t)cap * 2 * sizeof *grown) : NULL;
+                if (grown) { b->_dirtyR = grown; b->_dirtyCap = cap; }
+            }
+            if (b->_dirtyN < b->_dirtyCap) { b->_dirtyR[2 * b->_dirtyN] = lo; b->_dirtyR[2 * b->_dirtyN + 1] = hi; b->_dirtyN++; listed = YES; }
+            else { static int said; if (!said++) nvlog("managed: no memory for another modified range - this buffer's ranges are joined into one span (said once)"); }
+        }
+        if (!listed && b->_dirtyN) {   // out of memory: fold the list into the span (the old behaviour) rather than lose a range
+            for (unsigned k = 0; k < b->_dirtyN; k++) { lo = MIN(lo, b->_dirtyR[2 * k]); hi = MAX(hi, b->_dirtyR[2 * k + 1]); }
+            b->_dirtyR[0] = lo; b->_dirtyR[1] = hi; b->_dirtyN = 1; listed = YES;
+        }
+    }
+    if (listed) { /* the list carries it */ }
+    else if (b->_dirtyHi <= b->_dirtyLo) { b->_dirtyLo = lo; b->_dirtyHi = hi; }
     else { b->_dirtyLo = MIN(b->_dirtyLo, lo); b->_dirtyHi = MAX(b->_dirtyHi, hi); }
     @autoreleasepool { [gManagedDirty addObject:b]; } atomic_store(&gManagedAny, 1);
     nvmtl_pre_submit_hook = nvmtl_presubmit;
@@ -1140,6 +1193,7 @@ void nvmtl_vk_buffer_retire(nvk_buffer *b);
     if (_b.buf && nvmtl_trace_on()) nvtrace("BUFFREE 0x%llx len %zu", (unsigned long long)nvmtl_vk_buffer_address(&_b), _b.size);
     for (uint32_t k = 0; k < _nbpk; k++) nvmtl_vk_image_destroy(&_bpk[k].img);
     free(_bpk); _bpk = NULL; _nbpk = 0;
+    if (_dirtyR) { os_unfair_lock_lock(&gManagedLock); free(_dirtyR); _dirtyR = NULL; _dirtyN = _dirtyCap = 0; os_unfair_lock_unlock(&gManagedLock); }
     nvmtl_vk_buffer_retire(&_b); if (_shadow.buf) nvmtl_vk_buffer_retire(&_shadow);
     if (_swc) { nvmtl_swc_free((nvmtl_swc *)_swc); free(_swc); _swc = NULL; }
     if (_subHeap) { NVMTLHeap *h = _subHeap; NSUInteger c = _subCharge; _subHeap = nil; _subCharge = 0;

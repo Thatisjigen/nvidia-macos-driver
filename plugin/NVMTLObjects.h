@@ -29,7 +29,8 @@ static inline NSMutableData *nvmtl_fc_storage(NSUInteger count) {
     NVMTLHeap *_subHeap; NSUInteger _subCharge; BOOL _aliased;
     nvk_buffer _shadow; int _syncOut; int _zshadow;
     void *_swc;   /* nvmtl_swc*: this Shared buffer has a VRAM working copy (_b) and its system-memory side in _shadow */
-    NSUInteger _dirtyLo, _dirtyHi; } @end
+    NSUInteger _dirtyLo, _dirtyHi;
+    NSUInteger *_dirtyR; unsigned _dirtyN, _dirtyCap;   /* Managed: the [lo, hi) ranges didModifyRange named since the last upload (pairs) */ } @end
 #include <sched.h>
 static inline void nvmtl_buf_settle(NVMTLBuffer *b) {
     if (!__atomic_load_n(&b->_zshadow, __ATOMIC_ACQUIRE)) return;
