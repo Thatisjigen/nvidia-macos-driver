@@ -323,7 +323,34 @@ static const nvmtl_bind_plan *nvmtl_bind_plan_for(NVMTLFunction *fn)
     }
     return p;
 }
-void nvmtl_bind_embedded(NVMTLCommandBuffer *cb, uint32_t set, NVMTLFunction *fn, NVMTLBuffer *__strong const *bufAt, const NSUInteger *offAt)
+static void nvmtl_bind_embedded_full(NVMTLCommandBuffer *cb, uint32_t set, NVMTLFunction *fn, NVMTLBuffer *__strong const *bufAt, const NSUInteger *offAt);
+// The two per-draw answers - nothing embedded, or a built plan of static samplers only - without retaining the command
+// buffer and the function or probing the full path's 4 KB stack frame. Both stages ask on every draw: with ANGLE's
+// pattern (setVertexBytes + setFragmentBytes + draw) the entry's retains, releases and stack probe were 7% of the
+// driver's CPU per draw (bytesbench). Callers hold both objects for the call. NVMTL_BIND_EMB_FAST=0: always the full path.
+static int nvmtl_bind_emb_fast_on(void)
+{
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("NVMTL_BIND_EMB_FAST"); on = !(e && e[0] == '0'); }
+    return on;
+}
+void nvmtl_bind_embedded(__unsafe_unretained NVMTLCommandBuffer *cb, uint32_t set, __unsafe_unretained NVMTLFunction *fn, NVMTLBuffer *__strong const *bufAt, const NSUInteger *offAt)
+{
+    if (!cb || !fn) return;
+    if (nvmtl_bind_emb_fast_on()) {
+        if (__atomic_load_n(&fn->_bindingMetadataEmpty, __ATOMIC_ACQUIRE)) { nvmtl_vk_parked_samplers_keep(&cb->_c, set, 0); return; }
+        const nvmtl_bind_plan *bp = nvmtl_bind_plan_on() ? (const nvmtl_bind_plan *)__atomic_load_n(&fn->_bindPlan, __ATOMIC_ACQUIRE) : NULL;
+        if (bp && !bp->general && bp->n) {
+            nvmtl_vk_parked_samplers_keep(&cb->_c, set, bp->keep);
+            for (uint32_t k = 0; k < bp->n; k++)
+                if (nvmtl_vk_bind_parked_sampler(&cb->_c, set, bp->e[k].slot, bp->e[k].s))
+                    nvlog("static sampler slot %u: bind FAILED", bp->e[k].slot);
+            return;
+        }
+    }
+    nvmtl_bind_embedded_full(cb, set, fn, bufAt, offAt);
+}
+static void nvmtl_bind_embedded_full(NVMTLCommandBuffer *cb, uint32_t set, NVMTLFunction *fn, NVMTLBuffer *__strong const *bufAt, const NSUInteger *offAt)
 {
     if (!cb || !fn) return;
     // Cached metadata is immutable, but sampler restoration is recording-local and still required.
