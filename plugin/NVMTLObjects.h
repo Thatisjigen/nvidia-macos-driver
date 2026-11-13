@@ -263,7 +263,7 @@ uint32_t nvmtl_geoms_from_descriptor(id desc, nvmtl_geom *out, uint32_t max, int
 @end
 
 NSArray<NSDictionary *> *nvmtl_embedded_bindings(NVMTLFunction *function);
-void nvmtl_bind_embedded(NVMTLCommandBuffer *cb, uint32_t set, NVMTLFunction *fn, NVMTLBuffer *__strong const *bufAt, const NSUInteger *offAt);
+void nvmtl_bind_embedded(__unsafe_unretained NVMTLCommandBuffer *cb, uint32_t set, __unsafe_unretained NVMTLFunction *fn, NVMTLBuffer *__strong const *bufAt, const NSUInteger *offAt);
 void nvmtl_bind_embedded_enc(NVMTLCommandBuffer *cb, uint32_t set, NVMTLFunction *fn, NVMTLComputeCommandEncoder *e);
 // the NSArray form of one binding ({buffer, offset} or {buffer, offset, length, base}), for the few readers that want it
 static inline NSArray *nvmtl_bufat(NVMTLComputeCommandEncoder *e, NSUInteger i) {

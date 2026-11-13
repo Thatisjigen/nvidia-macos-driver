@@ -4668,7 +4668,7 @@ static MTLPixelFormat nvmtl_swizzle_twin_mtl(MTLPixelFormat f) { return (MTLPixe
     if (nvmtl_hz_bind_buffer(&_cb->_c, nvmtl_hz_untracked_buf(nb), NVMTL_SET_FRAGMENT, (uint32_t)i, &nb->_b, off)) nvlog("setFragmentBuffer: bind FAILED");
 }
 static NVMTLBuffer *nvmtl_bytes_ring(NVMTLCommandBuffer *cb, NSUInteger len, size_t *off);
-static void *nvmtl_bytes_ring_u(NVMTLCommandBuffer *cb, NSUInteger len, size_t *off);
+static void *nvmtl_bytes_ring_u(__unsafe_unretained NVMTLCommandBuffer *cb, NSUInteger len, size_t *off);
 static int nvmtl_bytes_norc_on(void);
 // setBytes without reference-count traffic on the ring chunk. ANGLE (every browser's WebGL) calls setVertexBytes and
 // setFragmentBytes on every draw, and each call retained and released the command buffer's current ring chunk twice
@@ -6433,11 +6433,12 @@ static int nvmtl_bytes_norc_on(void) {
 }
 static NVMTLBuffer *nvmtl_bytes_ring(NVMTLCommandBuffer *cb, NSUInteger len, size_t *off) { return (__bridge NVMTLBuffer *)nvmtl_bytes_ring_u(cb, len, off); }
 // The command buffer's current setBytes ring chunk, not retained: _scratch holds it until the command buffer completes.
-static void *nvmtl_bytes_ring_u(NVMTLCommandBuffer *cb, NSUInteger len, size_t *off) {
+static void *nvmtl_bytes_ring_u(__unsafe_unretained NVMTLCommandBuffer *cb, NSUInteger len, size_t *off) {
     size_t need = len < 16 ? 16 : len;
     if (!cb || need > NVMTL_E78_RING_MAX || !nvmtl_enc78_on(NVMTL_E78_H4)) return NULL;
     size_t at = (cb->_e78RingOff + NVMTL_E78_RING_ALIGN - 1) & ~(size_t)(NVMTL_E78_RING_ALIGN - 1);
-    if (!cb->_e78Ring || at + need > cb->_e78Ring->_b.size) {
+    __unsafe_unretained NVMTLBuffer *cur = cb->_e78Ring;
+    if (!cur || at + need > cur->_b.size) {
         NVMTLBuffer *r = [NVMTLBuffer new];
         if (nvmtl_vk_buffer_create(NVMTL_E78_RING, 1, &r->_b) || !r->_b.map) {
             static int said; if (!said++) nvlog("denc: setBytes ring chunk create failed - per-call buffers instead");
