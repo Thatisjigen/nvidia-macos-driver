@@ -4668,12 +4668,23 @@ static MTLPixelFormat nvmtl_swizzle_twin_mtl(MTLPixelFormat f) { return (MTLPixe
     if (nvmtl_hz_bind_buffer(&_cb->_c, nvmtl_hz_untracked_buf(nb), NVMTL_SET_FRAGMENT, (uint32_t)i, &nb->_b, off)) nvlog("setFragmentBuffer: bind FAILED");
 }
 static NVMTLBuffer *nvmtl_bytes_ring(NVMTLCommandBuffer *cb, NSUInteger len, size_t *off);
+static void *nvmtl_bytes_ring_u(NVMTLCommandBuffer *cb, NSUInteger len, size_t *off);
+static int nvmtl_bytes_norc_on(void);
+// setBytes without reference-count traffic on the ring chunk. ANGLE (every browser's WebGL) calls setVertexBytes and
+// setFragmentBytes on every draw, and each call retained and released the command buffer's current ring chunk twice
+// (the ring's return value, then the encoder's slot): four atomic operations on one object, 20% of the driver's CPU
+// per draw in slow/agents/webglperf/bin/bytesbench. The chunk is held by the command buffer (_scratch) until it
+// completes, so the call now borrows it, and the encoder's slot is stored only when it names a different buffer.
+// NVMTL_BYTES_NORC=0 restores the retaining path.
 - (void)nvmtlBindBytes:(const void *)bytes length:(NSUInteger)len atIndex:(NSUInteger)i set:(uint32_t)set {
     size_t roff = 0;
-    NVMTLBuffer *nb = nvmtl_bytes_ring(_cb, len, &roff);
+    NVMTLBuffer *own = nil;   // a buffer made for this one call (no ring), held here until _scratch has it
+    __unsafe_unretained NVMTLBuffer *nb = nil;
+    if (nvmtl_bytes_norc_on()) nb = (__bridge NVMTLBuffer *)nvmtl_bytes_ring_u(_cb, len, &roff);
+    else { own = nvmtl_bytes_ring(_cb, len, &roff); nb = own; }
     const BOOL ring = nb != nil;
     if (!ring) {
-        nb = [NVMTLBuffer new];
+        own = [NVMTLBuffer new]; nb = own;
         if (nvmtl_vk_buffer_create(len < 16 ? 16 : len, 1, &nb->_b)) { nvlog("setBytes: buffer create FAILED"); return; }
     }
     if (nb->_b.map) memcpy((uint8_t *)nb->_b.map + roff, bytes, len);
@@ -4683,8 +4694,8 @@ static NVMTLBuffer *nvmtl_bytes_ring(NVMTLCommandBuffer *cb, NSUInteger len, siz
         if (!_cb->_scratch) _cb->_scratch = [NSMutableArray new];
         [_cb->_scratch addObject:nb];
     }
-    if (i < NVMTL_NBUFAT && set == NVMTL_SET_VERTEX)        { _vbufAt[i] = nb; _vbufOff[i] = roff; }
-    else if (i < NVMTL_NBUFAT && set == NVMTL_SET_FRAGMENT) { _fbufAt[i] = nb; _fbufOff[i] = roff; }
+    if (i < NVMTL_NBUFAT && set == NVMTL_SET_VERTEX)        { if (_vbufAt[i] != nb) _vbufAt[i] = nb; _vbufOff[i] = roff; }
+    else if (i < NVMTL_NBUFAT && set == NVMTL_SET_FRAGMENT) { if (_fbufAt[i] != nb) _fbufAt[i] = nb; _fbufOff[i] = roff; }
 }
 - (void)setVertexBytes:(const void *)b length:(NSUInteger)l atIndex:(NSUInteger)i { [self nvmtlBindBytes:b length:l atIndex:i set:NVMTL_SET_VERTEX]; }
 - (void)setFragmentBytes:(const void *)b length:(NSUInteger)l atIndex:(NSUInteger)i { [self nvmtlBindBytes:b length:l atIndex:i set:NVMTL_SET_FRAGMENT]; }
@@ -6414,15 +6425,23 @@ static void nvmtl_g79_flush(NVMTLCommandBuffer *cb) {
 }
 @end
 enum { NVMTL_E78_RING = 64 * 1024, NVMTL_E78_RING_ALIGN = 256, NVMTL_E78_RING_MAX = 16 * 1024 };
-static NVMTLBuffer *nvmtl_bytes_ring(NVMTLCommandBuffer *cb, NSUInteger len, size_t *off) {
+static int nvmtl_bytes_norc_on(void) {
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("NVMTL_BYTES_NORC"); on = !(e && e[0] == '0');
+        nvlog("setBytes: the ring chunk is %s (NVMTL_BYTES_NORC=%s)", on ? "borrowed, no retain/release per call" : "retained per call (OLD)", e ? e : "unset"); }
+    return on;
+}
+static NVMTLBuffer *nvmtl_bytes_ring(NVMTLCommandBuffer *cb, NSUInteger len, size_t *off) { return (__bridge NVMTLBuffer *)nvmtl_bytes_ring_u(cb, len, off); }
+// The command buffer's current setBytes ring chunk, not retained: _scratch holds it until the command buffer completes.
+static void *nvmtl_bytes_ring_u(NVMTLCommandBuffer *cb, NSUInteger len, size_t *off) {
     size_t need = len < 16 ? 16 : len;
-    if (!cb || need > NVMTL_E78_RING_MAX || !nvmtl_enc78_on(NVMTL_E78_H4)) return nil;
+    if (!cb || need > NVMTL_E78_RING_MAX || !nvmtl_enc78_on(NVMTL_E78_H4)) return NULL;
     size_t at = (cb->_e78RingOff + NVMTL_E78_RING_ALIGN - 1) & ~(size_t)(NVMTL_E78_RING_ALIGN - 1);
     if (!cb->_e78Ring || at + need > cb->_e78Ring->_b.size) {
         NVMTLBuffer *r = [NVMTLBuffer new];
         if (nvmtl_vk_buffer_create(NVMTL_E78_RING, 1, &r->_b) || !r->_b.map) {
             static int said; if (!said++) nvlog("denc: setBytes ring chunk create failed - per-call buffers instead");
-            return nil;
+            return NULL;
         }
         if (!cb->_scratch) cb->_scratch = [NSMutableArray new];
         [cb->_scratch addObject:r];
@@ -6430,7 +6449,7 @@ static NVMTLBuffer *nvmtl_bytes_ring(NVMTLCommandBuffer *cb, NSUInteger len, siz
         nvmtl_enc78_count(E78C_RINGCHUNK, 1);
     }
     cb->_e78RingOff = at + need; *off = at;
-    return cb->_e78Ring;
+    return (__bridge void *)cb->_e78Ring;
 }
 
 #include "nvconv_lib.h"
