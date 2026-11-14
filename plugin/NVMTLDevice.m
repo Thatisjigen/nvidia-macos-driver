@@ -125,8 +125,9 @@ static int nvlog_dropped(const char *fmt, uint64_t *rep) {
 }
 const char *nvmtl_log_path(void) {
 #if NVMTL_RELEASE
-    // A release plugin writes no log unless this process opted into its own knobs (NVMTL_PROCESS_ENV=1).
-    if (!nvmtl_process_env_on()) return "/private/tmp/nvmtl-off.log";
+    // A release plugin writes no log unless this process opted into its own knobs (NVMTL_PROCESS_ENV=1) or root named it
+    // (nvmtl_log_on).
+    if (!nvmtl_log_on()) return "/private/tmp/nvmtl-off.log";
 #endif
     // A diagnostic probe needs its own file even when the system log is writable.
     // Otherwise the per-run fault watcher reads an empty file and misses GPU faults.
@@ -159,7 +160,7 @@ void nvlog_every(const char *fmt, ...) {
 static void nvlog_line(const char *t) {
 #if NVMTL_RELEASE
     if (nvmtl_log_failure(t)) syslog(LOG_ERR, "NullMoth: %s", t);
-    if (!nvmtl_process_env_on()) return;   // the file below is written only for a process that opted in
+    if (!nvmtl_log_on()) return;   // the file below is written only for a process that opted in, or that root named
 #else
     syslog(LOG_NOTICE, "NVMTL: %s", t);
 #endif
