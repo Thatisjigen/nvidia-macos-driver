@@ -1850,6 +1850,109 @@ declare i32 @air.clz.i32(i32, i1)
     }
 }
 
+// A vector bit-scan must keep its lane count on the comparison result and on every constant:
+// a scalar bool or a bare OpConstant against a vector type is not valid SPIR-V.
+fn assert_bit_scan_keeps_lanes(spv: &[u8], lanes: u32) {
+    let module = load_bytes(spv).expect("load lowered spv");
+    let globals = &module.types_global_values;
+    let bool_ty = globals
+        .iter()
+        .find(|inst| inst.class.opcode == Op::TypeBool)
+        .and_then(|inst| inst.result_id)
+        .expect("a bool type");
+    assert!(
+        globals.iter().any(|inst| inst.class.opcode == Op::TypeVector
+            && inst.operands.first() == Some(&Operand::IdRef(bool_ty))
+            && inst.operands.get(1) == Some(&Operand::LiteralBit32(lanes))),
+        "no {lanes}-lane bool vector for the per-lane compares"
+    );
+    assert!(
+        globals
+            .iter()
+            .any(|inst| inst.class.opcode == Op::ConstantComposite
+                && inst.operands.len() == lanes as usize),
+        "no {lanes}-lane splatted constant"
+    );
+}
+
+#[test]
+fn native_clz_vector_intrinsic_lowers() {
+    let ll = r#"
+target triple = "spirv-unknown-vulkan1.2"
+define void @main() {
+entry:
+  %v0 = insertelement <2 x i32> poison, i32 305419896, i32 0
+  %v1 = insertelement <2 x i32> %v0, i32 0, i32 1
+  %count = tail call <2 x i32> @air.clz.v2i32(<2 x i32> %v1, i1 false)
+  ret void
+}
+
+declare <2 x i32> @air.clz.v2i32(<2 x i32>, i1)
+"#;
+    let tmp = std::env::temp_dir().join(format!("metal2vulkan_native_clz_vec_{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&tmp);
+    let module = load_bytes(emit_vulkan_spirv(ll).expect("native emit")).expect("load native spv");
+    let out = passes::transform(module, Stage::Kernel, None, None, None, Some("main"))
+        .expect("vector clz must lower, not be refused")
+        .assemble()
+        .iter()
+        .flat_map(|w| w.to_le_bytes())
+        .collect::<Vec<_>>();
+    let asm = disassemble(&out).expect("disassemble transformed");
+    assert!(asm.contains("OpShiftLeftLogical"), "{asm}");
+    assert!(asm.contains("OpBitwiseAnd"), "{asm}");
+    assert!(asm.contains("OpIEqual"), "{asm}");
+    assert!(asm.contains("OpSelect"), "{asm}");
+    assert!(!asm.contains("OpFunctionCall"), "{asm}");
+    assert_bit_scan_keeps_lanes(&out, 2);
+    if std::process::Command::new("spirv-val")
+        .arg("--version")
+        .output()
+        .is_ok()
+    {
+        tools::spirv_val_bytes(&out, &tmp).expect("spirv-val");
+    }
+}
+
+#[test]
+fn native_ctz_vector_intrinsic_lowers() {
+    let ll = r#"
+target triple = "spirv-unknown-vulkan1.2"
+define void @main() {
+entry:
+  %v0 = insertelement <4 x i32> poison, i32 305419896, i32 0
+  %v1 = insertelement <4 x i32> %v0, i32 0, i32 1
+  %count = tail call <4 x i32> @air.ctz.v4i32(<4 x i32> %v1, i1 false)
+  ret void
+}
+
+declare <4 x i32> @air.ctz.v4i32(<4 x i32>, i1)
+"#;
+    let tmp = std::env::temp_dir().join(format!("metal2vulkan_native_ctz_vec_{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&tmp);
+    let module = load_bytes(emit_vulkan_spirv(ll).expect("native emit")).expect("load native spv");
+    let out = passes::transform(module, Stage::Kernel, None, None, None, Some("main"))
+        .expect("vector ctz must lower, not be refused")
+        .assemble()
+        .iter()
+        .flat_map(|w| w.to_le_bytes())
+        .collect::<Vec<_>>();
+    let asm = disassemble(&out).expect("disassemble transformed");
+    assert!(asm.contains("OpShiftRightLogical"), "{asm}");
+    assert!(asm.contains("OpBitwiseAnd"), "{asm}");
+    assert!(asm.contains("OpIEqual"), "{asm}");
+    assert!(asm.contains("OpSelect"), "{asm}");
+    assert!(!asm.contains("OpFunctionCall"), "{asm}");
+    assert_bit_scan_keeps_lanes(&out, 4);
+    if std::process::Command::new("spirv-val")
+        .arg("--version")
+        .output()
+        .is_ok()
+    {
+        tools::spirv_val_bytes(&out, &tmp).expect("spirv-val");
+    }
+}
+
 #[test]
 fn native_fast_tan_and_fmod_lower() {
     let ll = r#"

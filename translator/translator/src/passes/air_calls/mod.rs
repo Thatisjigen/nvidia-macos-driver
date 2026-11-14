@@ -163,6 +163,16 @@ pub(super) fn shaped_u32_const(ctx: &mut Ctx, n: u32, value: u32) -> Word {
     }
 }
 
+// The constant takes the element type, so a narrow or signed lane keeps its width and sign.
+pub(super) fn shaped_int_const(ctx: &mut Ctx, ty: Word, n: u32, value: i64) -> Word {
+    let scalar = ctx.const_int_of(element_type(ctx, ty), value);
+    if n > 1 {
+        splat(ctx, ty, scalar, n)
+    } else {
+        scalar
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

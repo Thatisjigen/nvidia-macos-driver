@@ -465,6 +465,10 @@ pub(in crate::passes) fn int_scalar_width(ctx: &Ctx, ty: Word) -> Option<u32> {
     })
 }
 
+pub(in crate::passes) fn int_shape(ctx: &Ctx, ty: Word) -> Option<(u32, u32)> {
+    int_vector_width(ctx, ty).or_else(|| int_scalar_width(ctx, ty).map(|width| (1, width)))
+}
+
 pub(in crate::passes) fn rotate_left_i32(
     ctx: &mut Ctx,
     res: Word,
@@ -636,16 +640,19 @@ pub(in crate::passes) fn leading_zero_steps(width: u32) -> Vec<(i64, u32)> {
     steps
 }
 
-pub(in crate::passes) fn ctz_scalar(
+// Every op below is component-wise, so one lowering serves a scalar and a vector alike; only the
+// comparison result and the constants have to carry the lane count.
+pub(in crate::passes) fn ctz_shaped(
     ctx: &mut Ctx,
     res: Word,
     rty: Word,
     arg: Word,
+    lanes: u32,
     width: u32,
 ) -> Vec<Instruction> {
-    let bool_ty = ctx.ty_bool();
-    let zero = ctx.const_int_of(rty, 0);
-    let width_const = ctx.const_int_of(rty, i64::from(width));
+    let bool_ty = ty_bool_shaped(ctx, lanes);
+    let zero = shaped_int_const(ctx, rty, lanes, 0);
+    let width_const = shaped_int_const(ctx, rty, lanes, i64::from(width));
     let is_zero = ctx.module.fresh_id();
     let mut out = vec![Instruction::new(
         Op::IEqual,
@@ -657,8 +664,8 @@ pub(in crate::passes) fn ctz_scalar(
     let mut y = arg;
     let mut count = zero;
     for (mask, shift) in trailing_zero_steps(width) {
-        let mask = ctx.const_int_of(rty, mask);
-        let shift = ctx.const_int_of(rty, i64::from(shift));
+        let mask = shaped_int_const(ctx, rty, lanes, mask);
+        let shift = shaped_int_const(ctx, rty, lanes, i64::from(shift));
         let masked = ctx.module.fresh_id();
         let take = ctx.module.fresh_id();
         let shifted = ctx.module.fresh_id();
@@ -725,16 +732,17 @@ pub(in crate::passes) fn ctz_scalar(
     out
 }
 
-pub(in crate::passes) fn clz_scalar(
+pub(in crate::passes) fn clz_shaped(
     ctx: &mut Ctx,
     res: Word,
     rty: Word,
     arg: Word,
+    lanes: u32,
     width: u32,
 ) -> Vec<Instruction> {
-    let bool_ty = ctx.ty_bool();
-    let zero = ctx.const_int_of(rty, 0);
-    let width_const = ctx.const_int_of(rty, i64::from(width));
+    let bool_ty = ty_bool_shaped(ctx, lanes);
+    let zero = shaped_int_const(ctx, rty, lanes, 0);
+    let width_const = shaped_int_const(ctx, rty, lanes, i64::from(width));
     let is_zero = ctx.module.fresh_id();
     let mut out = vec![Instruction::new(
         Op::IEqual,
@@ -746,8 +754,8 @@ pub(in crate::passes) fn clz_scalar(
     let mut y = arg;
     let mut count = zero;
     for (mask, shift) in leading_zero_steps(width) {
-        let mask = ctx.const_int_of(rty, mask);
-        let shift = ctx.const_int_of(rty, i64::from(shift));
+        let mask = shaped_int_const(ctx, rty, lanes, mask);
+        let shift = shaped_int_const(ctx, rty, lanes, i64::from(shift));
         let masked = ctx.module.fresh_id();
         let take = ctx.module.fresh_id();
         let shifted = ctx.module.fresh_id();

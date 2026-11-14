@@ -312,8 +312,8 @@ pub(in crate::passes) fn lower_integer_op(
         )]));
     }
     if name.starts_with("air.ctz.") && args.len() == 2 {
-        let width = int_scalar_width(ctx, rty)
-            .ok_or_else(|| format!("{name} result type is not a scalar integer"))?;
+        let (lanes, width) = int_shape(ctx, rty)
+            .ok_or_else(|| format!("{name} result type is not an integer scalar or vector"))?;
         if !matches!(width, 8 | 16 | 32 | 64) {
             return Err(format!("{name} unsupported result width {width}"));
         }
@@ -322,11 +322,11 @@ pub(in crate::passes) fn lower_integer_op(
         if arg_ty != rty {
             return Err(format!("{name} operand/result type mismatch"));
         }
-        return Ok(Some(ctz_scalar(ctx, res, rty, args[0], width)));
+        return Ok(Some(ctz_shaped(ctx, res, rty, args[0], lanes, width)));
     }
     if name.starts_with("air.clz.") && args.len() == 2 {
-        let width = int_scalar_width(ctx, rty)
-            .ok_or_else(|| format!("{name} result type is not a scalar integer"))?;
+        let (lanes, width) = int_shape(ctx, rty)
+            .ok_or_else(|| format!("{name} result type is not an integer scalar or vector"))?;
         if !matches!(width, 8 | 16 | 32 | 64) {
             return Err(format!("{name} unsupported result width {width}"));
         }
@@ -335,7 +335,7 @@ pub(in crate::passes) fn lower_integer_op(
         if arg_ty != rty {
             return Err(format!("{name} operand/result type mismatch"));
         }
-        return Ok(Some(clz_scalar(ctx, res, rty, args[0], width)));
+        return Ok(Some(clz_shaped(ctx, res, rty, args[0], lanes, width)));
     }
     if let Some(op) = wide_multiply_op(name, args.len()) {
         if int_scalar_width(ctx, rty) != Some(32) {
