@@ -63,6 +63,7 @@ typedef int (*nvmtl_to_uniform_fn)(const uint8_t *, size_t, uint8_t **, size_t *
 static nvmtl_to_uniform_fn xlate_to_uniform;   /* the table of an unlowered module moved to a Uniform block */
 static nvmtl_translate_fn xlate;
 #include "nvmtl_spvcache_name.h"
+#include "nvmtl_translator_tag.h"
 #include "nvmtl_pretranslate.h"
 #include "nvmtl_cache_file.h"
 int nvmtl_vk_lost(void);
@@ -74,25 +75,12 @@ static char gXlateTag[NVMTL_SPVCACHE_TAG_MAX] = "untagged";
 // The translator build alone, without the mode suffixes (-u2, -p5, ...) gXlateTag adds: the stale-entry sweep keys on it.
 static char gXlateBuildTag[NVMTL_SPVCACHE_TAG_MAX] = "untagged";
 static void nvmtl_translator_cache_tag(const char *path, char *tag, size_t capacity) {
-    int fd = open(path, O_RDONLY | O_CLOEXEC);
-    CC_SHA256_CTX context; CC_SHA256_Init(&context);
-    BOOL complete = fd >= 0; uint8_t buffer[65536];
-    if (fd >= 0) {
-        for (;;) {
-            ssize_t n = read(fd, buffer, sizeof buffer);
-            if (n > 0) { CC_SHA256_Update(&context, buffer, (CC_LONG)n); continue; }
-            if (n == 0) break;
-            if (errno == EINTR) continue;
-            complete = NO; break;
-        }
-        close(fd);
-    }
-    if (complete) {
-        uint8_t digest[CC_SHA256_DIGEST_LENGTH]; CC_SHA256_Final(digest, &context);
-        char hex[2 * CC_SHA256_DIGEST_LENGTH + 1];
-        for (size_t i = 0; i < sizeof digest; ++i) snprintf(hex + 2*i, 3, "%02x", digest[i]);
-        snprintf(tag, capacity, "sha256-%s", hex);
-    } else {
+    // The translator's content without its code signature (nvmtl_translator_tag.h): signing the same build again must
+    // not make every process sweep its shader cache. The file is mapped, not copied (about 16 MB).
+    NSData *image = [NSData dataWithContentsOfFile:@(path) options:NSDataReadingMappedIfSafe error:NULL];
+    const int how = image.length ? nvmtl_translator_tag_of_image(image.bytes, image.length, tag, capacity) : 0;
+    if (how == 1) nvlog("translator cache: %s is not a thin 64-bit Mach-O; its tag is the whole file's digest", path);
+    if (!how) {
         snprintf(tag, capacity, "private-%d-%llx", getpid(),
                  (unsigned long long)clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW));
         nvlog("translator cache: content read failed; using process-private identity");
