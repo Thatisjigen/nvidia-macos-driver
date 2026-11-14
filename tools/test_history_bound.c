@@ -75,6 +75,13 @@ int main(void)
         /* an address inside a live memory still resolves to it, with the offset the report prints */
         char line[300]; nvmtl_mm_describe(&mm, 0x300000000ull + 2048, line, sizeof line);
         ARM("an address in a live memory still resolves to it with its offset", strstr(line, "memory 0xa000000") != NULL && strstr(line, "+ offset 2048") != NULL);
+        /* the bucket index must answer what the scan answered: the newest record of a reissued handle, and the
+           older record of the same handle still reachable by the address it held */
+        nvmtl_mm_add(&mm, h(0xa000000, 0), 0x500000000ull, 8192, 1, "reuse", 900);
+        const nvmtl_mm_entry *me = nvmtl_mm_by_mem(&mm, h(0xa000000, 0));
+        ARM("a reissued memory handle resolves to its newest record through the index", me && me->base == 0x500000000ull && me->seq == 900 && !me->died);
+        ARM("  and the older record of that handle is still found by its address", nvmtl_mm_at(&mm, 0x300000000ull + 2048) != NULL);
+        ARM("a handle never added is not found (negative control)", nvmtl_mm_by_mem(&mm, h(0xb000000, 7)) == NULL);
         free(mm.e); }
 
     printf("test_history_bound: %d failed\n", fails);
