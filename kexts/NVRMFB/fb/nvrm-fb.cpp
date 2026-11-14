@@ -580,6 +580,9 @@ class NVRMNVDAFramebuffer : public IOFramebuffer {
     bool trialScaledMode(const IODetailedTimingInformationV2 &d);
     void probeScalerLimit();
     bool fHdrCapable = false, fHdrActive = false, fScan30 = false, fHdrMetaSet = false; unsigned fHdrMaxLumCode = 0;
+    // HDR10 in YCbCr 4:2:2 (nvrmHdr422Needed): the HDMI sink's TMDS limit when it takes 4:2:2 at 10 bits, 0 otherwise; the mode
+    // being set (fYccWant) and the one on the head (fYccActive) go out in 4:2:2.
+    unsigned fHdr422TmdsMHz = 0; bool fYccWant = false, fYccActive = false;
     struct NvKmsHDRStaticMetadata fHdrMeta = {};
     IOReturn setHdrMeta(const void *meta);
     static bool vrrAllowed();
@@ -1158,6 +1161,7 @@ static void nvrmHeadOlut(struct NvKmsKapiHeadRequestedConfig *hr, struct NvKmsKa
 // to). Member detection keeps this file building against 615 headers, which have no such field, for baseline builds.
 // 3 = NV_KMS_DPY_ATTRIBUTE_REQUESTED_COLOR_FORMAT_UNKNOWN (620 nvkms-api-types.h; 615 has no such constant).
 static const NvU32 kNvrmColorFormatAuto = 3;
+static const NvU32 kNvrmColorFormatYCbCr422 = 1;   // NV_KMS_DPY_ATTRIBUTE_REQUESTED_COLOR_FORMAT_YCbCr422
 template <typename C> static auto nvrmAutoColorFormat(C *c, int) -> decltype(c->colorFormat = kNvrmColorFormatAuto, void())
 { c->colorFormat = kNvrmColorFormatAuto; }
 template <typename C> static void nvrmAutoColorFormat(C *, long) {}
@@ -1895,6 +1899,7 @@ void NVRMNVDAFramebuffer::takeEdid(const NvU8 *src, NvU32 size)
     nvrmEdidPanelSizeMm(fEdid, fEdidSize, &fEdidMmW, &fEdidMmH);
     if (!nvrmEdidVerticalRange(fEdid, fEdidSize, &fVrrMinHz, &fVrrMaxHz)) fVrrMinHz = fVrrMaxHz = 0;
     fHdrCapable = nvrmEdidHdrPq(fEdid, fEdidSize, &fHdrMaxLumCode);
+    fHdr422TmdsMHz = nvrmEdidHdmi422TmdsMHz(fEdid, fEdidSize);
     if (fEdidSize < 128) return;
     bool twin = false;
     for (int k = 0; k < gNDpy && !twin; k++) {
@@ -2340,16 +2345,21 @@ NvBool NVRMNVDAFramebuffer::submitConfig(struct NvKmsKapiRequestedModeSetConfig 
                                                         vh->flags.colorFormatChanged);
         if (full) nvrmApplyColorPrefs(vh);
         if (gHdrOn && fHdrCapable && vh->modeSetConfig.bActive) {
-            // HDR10: PQ in BT.2100 colorimetry, 10 bits, the composited pixels passed through untouched. Every config for the
-            // head says so (a flip that left it out would fall back to SDR); a full mode set also flags the change, and also
-            // when it turns HDR off.
+            // HDR10: PQ in BT.2100 colorimetry, 10 bits. Every config for the head says so (a flip that left it out would
+            // fall back to SDR); a full mode set also flags the change, and also when it turns HDR off.
+            // No colour passthrough: NVKMS takes it only where the display HAL has supportsColorPassthrough, which in 620 is
+            // one display class, and refuses the whole request elsewhere, Blackwell included (ValidateColorPassthroughFlipState), so
+            // every HDR10 mode set failed. The composited PQ pixels take the pipeline SDR takes: no output transfer function
+            // and the output LUT off.
             struct NvKmsKapiHeadModeSetConfig &mc = vh->modeSetConfig;
             if (fHdrActive) {
                 mc.hdrInfoFrame.enabled = NV_TRUE; mc.hdrInfoFrame.eotf = NVKMS_INFOFRAME_EOTF_ST2084;
                 mc.hdrInfoFrame.staticMetadata = fHdrMeta;
                 mc.colorimetry = NVKMS_OUTPUT_COLORIMETRY_BT2100;
-                mc.postcompColorPassthrough = NV_TRUE;
                 if (!gColorBpc && mc.colorBpc == 0) mc.colorBpc = 10;
+                // A timing RGB at 10 bits does not fit (nvrmHdr422Needed): NVKMS is told 4:2:2, the encoding macOS was offered for
+                // it, rather than left to fall back from RGB on its own. A colour format set by boot-arg or sysctl comes first.
+                if (fYccActive && (NvU32)gColorFormat == kNvrmColorFormatAuto) nvrmSetColorFormat(&mc, kNvrmColorFormatYCbCr422, 0);
                 mc.olut.enabled = NV_FALSE; mc.olut.lutSurface = NULL; mc.olut.lutEntries = 0;   // no gamma ramp on PQ content
             }
             if (full) {
@@ -3283,7 +3293,23 @@ bool NVRMNVDAFramebuffer::start(IOService *provider)
     setProperty("IOFBMemorySize", (unsigned long long)(8ull << 30), 64);
     IORecursiveLock *sl = startLock();
     if (!sl) { FBLOG("start lock alloc failed -- refusing to start"); return false; }
-    IORecursiveLockLock(sl); bool kapiOk = kapiInit();
+    IORecursiveLockLock(sl);
+    {   // output colour controls from the boot line (see gColorBpc); invalid values are ignored. Read before kapiInit(),
+        // whose publishTimingCaps() offers HDR10 only if gHdrOn is set by then, and under the start lock, so that no
+        // other instance publishes its range while this one is still reading.
+        static bool done; if (!done) { done = true;
+            UInt32 v = 0;
+            if (PE_parse_boot_argn("nvfbbpc", &v, sizeof v) && nvrmColorBpcValid(v)) gColorBpc = (int)v;
+            if (PE_parse_boot_argn("nvfbformat", &v, sizeof v) && nvrmColorFormatValid(v)) gColorFormat = (int)v;
+            if (PE_parse_boot_argn("nvfbrange", &v, sizeof v) && nvrmColorRangeValid(v)) gColorRange = (int)v;
+            if (PE_parse_boot_argn("nvfbvib", &v, sizeof v) && v <= 200) gVibrance = (int)v - 100;
+            gHdrOn = PE_parse_boot_argn("nvfbhdr", &v, sizeof v) && v;
+            gRotScale = PE_parse_boot_argn("nvfbrotscale", &v, sizeof v) && v;
+            gTenBit = PE_parse_boot_argn("nvfb10bit", &v, sizeof v) && v;
+            if (gHdrOn || gTenBit) FBLOG("%s%s", gTenBit ? "10-bit scanout on mode changes (nvfb10bit=1) " : "", gHdrOn ? "HDR10 advertised for PQ displays (nvfbhdr=1)" : "");
+            if (gColorBpc || gColorFormat != 3 || gColorRange || gVibrance)
+                FBLOG("colour controls: bpc %d format %d range %d vibrance %d", gColorBpc, gColorFormat, gColorRange, gVibrance); } }
+    bool kapiOk = kapiInit();
     if (!kapiOk && fOwnsHead) { gHeadsTaken &= ~(1u << fHead); fOwnsHead = false; }
     IORecursiveLockUnlock(sl);
     if (!kapiOk) {
@@ -3309,19 +3335,6 @@ bool NVRMNVDAFramebuffer::start(IOService *provider)
     }
     { char loc[12]; if (nvrmFbLocation(fIndex, loc, sizeof loc)) setLocation(loc); }   // distinct registry path per head
     if (fInternal) publishBacklight();   // before super::start(): IOFramebuffer::open looks for "backlight"
-    {   // output colour controls from the boot line (see gColorBpc); invalid values are ignored
-        static bool done; if (!done) { done = true;
-            UInt32 v = 0;
-            if (PE_parse_boot_argn("nvfbbpc", &v, sizeof v) && nvrmColorBpcValid(v)) gColorBpc = (int)v;
-            if (PE_parse_boot_argn("nvfbformat", &v, sizeof v) && nvrmColorFormatValid(v)) gColorFormat = (int)v;
-            if (PE_parse_boot_argn("nvfbrange", &v, sizeof v) && nvrmColorRangeValid(v)) gColorRange = (int)v;
-            if (PE_parse_boot_argn("nvfbvib", &v, sizeof v) && v <= 200) gVibrance = (int)v - 100;
-            gHdrOn = PE_parse_boot_argn("nvfbhdr", &v, sizeof v) && v;
-            gRotScale = PE_parse_boot_argn("nvfbrotscale", &v, sizeof v) && v;
-            gTenBit = PE_parse_boot_argn("nvfb10bit", &v, sizeof v) && v;
-            if (gHdrOn || gTenBit) FBLOG("%s%s", gTenBit ? "10-bit scanout on mode changes (nvfb10bit=1) " : "", gHdrOn ? "HDR10 advertised for PQ displays (nvfbhdr=1)" : "");
-            if (gColorBpc || gColorFormat != 3 || gColorRange || gVibrance)
-                FBLOG("colour controls: bpc %d format %d range %d vibrance %d", gColorBpc, gColorFormat, gColorRange, gVibrance); } }
     publishDdcBus();                     // before super::start() too: IOFramebuffer::open creates the I2C interface from it
     if (!super::start(provider)) {
         NVRMDisplayGate gate; if (gate.valid() && fOwnsHead) { gHeadsTaken &= ~(1u << fHead); fOwnsHead = false; }
@@ -3603,7 +3616,7 @@ IOReturn NVRMNVDAFramebuffer::setDisplayMode(IODisplayModeID mode, IOIndex depth
         fPendingScaled = false;
         result = fCurId == kModeId
             ? (applyMode() ? kIOReturnSuccess : kIOReturnError)
-            : (fHdrWant = false, switchMode(kModeId, fBootMode, fBootW, fBootH, 0));
+            : (fHdrWant = fYccWant = false, switchMode(kModeId, fBootMode, fBootW, fBootH, 0));
     } else {
         int i = dtIndex(mode);
         if (i < 0) return kIOReturnUnsupportedMode;
@@ -3615,6 +3628,12 @@ IOReturn NVRMNVDAFramebuffer::setDisplayMode(IODisplayModeID mode, IOIndex depth
             NvU32 w = 0, h = 0; dtSurfaceSize(&fDT[i], &w, &h);
             const IODetailedTimingInformationV2 dt = fDT[i];
             fHdrWant = gHdrOn && fHdrCapable && dt.dynamicRange == kIODynamicRangeHDR10;
+            // the HDR10 timings validateDetailedTiming takes in 4:2:2, whatever encoding macOS wrote in the one it installed
+            fYccWant = fHdrWant && nvrmHdr422Needed(dt.pixelClock, fHdr422TmdsMHz);
+            if (fYccWant)
+                FBLOG("fb%u: mode 0x%x HDR10 in YCbCr 4:2:2: pclk %llu Hz, RGB at 10 bits needs %llu MHz, the HDMI sink takes %u (macOS's encoding 0x%x, %s bits)",
+                      fIndex, (unsigned)mode, (unsigned long long)dt.pixelClock, (unsigned long long)(dt.pixelClock * 5 / 4000000), fHdr422TmdsMHz,
+                      (unsigned)dt.pixelEncoding, dt.bitsPerColorComponent == kIOBitsPerColorComponent12 ? "12" : "other");
             {   // is it a scaled mode, and how heavy
                 const UInt64 tot = (UInt64)(dt.horizontalActive + dt.horizontalBlanking) * (dt.verticalActive + dt.verticalBlanking);
                 const unsigned hz = tot ? (unsigned)((dt.pixelClock + tot / 2) / tot) : 0;
@@ -3712,6 +3731,7 @@ static void dtRasterTurned(const IODetailedTimingInformationV2 *d, NvU32 *w, NvU
 bool NVRMNVDAFramebuffer::dtIsBootRaster(const IODetailedTimingInformationV2 &d) const
 {
     if (d.horizontalScaled || d.verticalScaled || d.horizontalActive != fBootW || d.verticalActive != fBootH) return false;
+    if (d.dynamicRange == kIODynamicRangeHDR10) return false;   // the boot raster is lit in SDR: its HDR10 twin is another mode
     const UInt64 tot = (UInt64)(d.horizontalActive + d.horizontalBlanking) * (d.verticalActive + d.verticalBlanking);
     return tot && (NvU32)((d.pixelClock + tot / 2) / tot) == (fBootMode.timings.refreshRate + 500) / 1000;
 }
@@ -3828,19 +3848,9 @@ unsigned NVRMNVDAFramebuffer::addKmsRefreshModes(unsigned n)
         if (r == 0 || !valid) continue;
         if (k.flags.interlaced || k.flags.doubleScan || !k.pixelClockHz || k.hTotal <= k.hVisible || k.vTotal <= k.vVisible ||
             k.hSyncStart < k.hVisible || k.hSyncEnd < k.hSyncStart || k.vSyncStart < k.vVisible || k.vSyncEnd < k.vSyncStart) continue;
-        int tmpl = -1; bool have = false, raster = false;
-        for (unsigned j = 0; j < n; j++) {
-            const IODetailedTimingInformationV2 &d = fDT[j];
-            if (d.horizontalActive != k.hVisible || d.verticalActive != k.vVisible) continue;
-            if (j < fromMac) raster = true;
-            // only an unscaled entry is this refresh rate on the panel; macOS's scaled desktops built on a rate we
-            // offered must not hide that rate's own mode (e.g. 1344x756@100 listed, 1920x1080@100 gone)
-            if (d.horizontalScaled || d.verticalScaled) continue;
-            const UInt64 dt = (UInt64)(d.horizontalActive + d.horizontalBlanking) * (d.verticalActive + d.verticalBlanking);
-            const NvU32 dhz = dt ? (NvU32)((d.pixelClock + dt / 2) / dt) : 0;
-            if (dhz + 1 >= hz && dhz <= hz + 1) { have = true; break; }
-            if (tmpl < 0 && j < fromMac && !d.horizontalScaled && !d.verticalScaled) tmpl = (int)j;
-        }
+        // what macOS lists for this raster and rate, HDR10 timings left out (nvrmRateSeed)
+        const NvrmRateSeed seed = nvrmRateSeed(fDT, n, fromMac, k.hVisible, k.vVisible, hz);
+        const int tmpl = seed.tmpl; const bool have = seed.have; bool raster = seed.raster;
         // A raster macOS never proposed is offered too when NVKMS validated it for this display and it fits the scanout
         // memory and the scaler. Without this, rasters that exist only in the EDID's DisplayID extension (most 100-240 Hz
         // modes, issue #29) and every raster above a 1080p firmware raster (a 4K monitor stuck at 1920x1080, issue #49)
@@ -3922,6 +3932,7 @@ unsigned NVRMNVDAFramebuffer::addKmsRefreshModes(unsigned n)
             for (unsigned j = 0; j < n; j++) {
                 const IODetailedTimingInformationV2 &d = fDT[j];
                 if (d.horizontalActive != k.hVisible || d.verticalActive != k.vVisible || d.horizontalScaled || d.verticalScaled) continue;
+                if (d.dynamicRange == kIODynamicRangeHDR10) continue;   // an SDR copy, from an SDR timing (nvrmRateSeed)
                 const UInt64 dt = (UInt64)(d.horizontalActive + d.horizontalBlanking) * (d.verticalActive + d.verticalBlanking);
                 const NvU32 dhz = dt ? (NvU32)((d.pixelClock + dt / 2) / dt) : 0;
                 if (dhz + 1 >= dhzWant && dhz <= dhzWant + 1) listed = true;
@@ -3984,11 +3995,11 @@ IOReturn NVRMNVDAFramebuffer::switchMode(IODisplayModeID id, const struct NvKmsK
     sp.planes[0].memory = fMem; sp.planes[0].offset = 0; sp.planes[0].pitch = pitch;
     // A 30-bit mode (HDR10, or nvfb10bit=1) scans an X2B10G10R10 surface; the accelerator is told in the nvScanoutInfo reply.
     const bool ten = fHdrWant || gTenBit;
-    const bool hdrBefore = fHdrActive;
-    fHdrActive = fHdrWant;
+    const bool hdrBefore = fHdrActive, yccBefore = fYccActive;
+    fHdrActive = fHdrWant; fYccActive = fYccWant;
     sp.width = w; sp.height = h; sp.format = ten ? NvKmsSurfaceMemoryFormatX2B10G10R10 : NvKmsSurfaceMemoryFormatX8R8G8B8;
     struct NvKmsKapiSurface *ns = fKms->createSurface(fDev, &sp);
-    if (!ns) { fHdrActive = hdrBefore; FBLOG("switchMode 0x%x: createSurface %ux%u pitch %u FAILED", (unsigned)id, w, h, pitch); return kIOReturnNoMemory; }
+    if (!ns) { fHdrActive = hdrBefore; fYccActive = yccBefore; FBLOG("switchMode 0x%x: createSurface %ux%u pitch %u FAILED", (unsigned)id, w, h, pitch); return kIOReturnNoMemory; }
     struct NvKmsKapiRequestedModeSetConfig *cfg = (struct NvKmsKapiRequestedModeSetConfig *)IOMalloc(sizeof *cfg);
     struct NvKmsKapiModeSetReplyConfig *rep = (struct NvKmsKapiModeSetReplyConfig *)IOMalloc(sizeof *rep);
     if (!cfg || !rep) { if (cfg) IOFree(cfg, sizeof *cfg); if (rep) IOFree(rep, sizeof *rep); fKms->destroySurface(fDev, ns); return kIOReturnNoMemory; }
@@ -4019,7 +4030,7 @@ IOReturn NVRMNVDAFramebuffer::switchMode(IODisplayModeID id, const struct NvKmsK
     }
     IOFree(cfg, sizeof *cfg); IOFree(rep, sizeof *rep);
     if (!ok) {
-        fHdrActive = hdrBefore;
+        fHdrActive = hdrBefore; fYccActive = yccBefore;
         if (!fSubmissionFaulted) fKms->destroySurface(fDev, ns);
         if (fPendingScaled) {   // a scaled mode the head refused: remember how heavy, so validateDetailedTiming stops offering such modes
             const unsigned long long before = fScalerLimit;
@@ -4068,6 +4079,10 @@ IOReturn NVRMNVDAFramebuffer::validateDetailedTiming(void *description, IOByteCo
     else if (d->scalerFlags & ~(UInt32)(kIOScaleStretchToFit | kIOScaleRotateFlags)) why = "unknown scaler flags";
     else if (d->horizontalBorderLeft | d->horizontalBorderRight | d->verticalBorderTop | d->verticalBorderBottom) why = "borders";
     else if (!d->pixelClock || !d->horizontalActive || !d->verticalActive) why = "empty timing";
+    else if (!nvrmTimingDepthOk(d->bitsPerColorComponent, d->dynamicRange == kIODynamicRangeHDR10)) why = "SDR above 8 bits per component";
+    else if (d->pixelEncoding == kIOPixelEncodingYCbCr422 &&
+             !(d->dynamicRange == kIODynamicRangeHDR10 && gHdrOn && fHdrCapable && nvrmHdr422Needed(d->pixelClock, fHdr422TmdsMHz)))
+        why = "YCbCr 4:2:2 (only for an HDR10 timing RGB at 10 bits does not fit)";
     else if ((d->scalerFlags & kIOScaleRotateFlags) && !(d->horizontalScaled && d->verticalScaled)) why = "rotation without a desktop size";
     else if ((d->scalerFlags & kIOScaleRotateFlags) && fBootW && (d->horizontalActive < fBootW || d->verticalActive < fBootH))
         why = "rotated raster smaller than the boot raster";
@@ -4093,9 +4108,10 @@ IOReturn NVRMNVDAFramebuffer::validateDetailedTiming(void *description, IOByteCo
         }
     }
     if (fValidateCalls <= 48 || why == nullptr)
-        FBLOGV("fb%u validateDetailedTiming #%u id 0x%x %ux%u%s%ux%u rotation 0x%x pclk %llu -> %s", fIndex, fValidateCalls, (unsigned)d->detailedTimingModeID,
-              d->horizontalActive, d->verticalActive, d->horizontalScaled ? " desktop " : "", d->horizontalScaled, d->verticalScaled,
-              (unsigned)(d->scalerFlags & kIOScaleRotateFlags), (unsigned long long)d->pixelClock, why ? why : "OK");
+        FBLOGV("fb%u validateDetailedTiming #%u id 0x%x %ux%u%s%ux%u rotation 0x%x pclk %llu enc 0x%x bpc 0x%x range 0x%x -> %s", fIndex, fValidateCalls,
+              (unsigned)d->detailedTimingModeID, d->horizontalActive, d->verticalActive, d->horizontalScaled ? " desktop " : "", d->horizontalScaled,
+              d->verticalScaled, (unsigned)(d->scalerFlags & kIOScaleRotateFlags), (unsigned long long)d->pixelClock, (unsigned)d->pixelEncoding,
+              (unsigned)d->bitsPerColorComponent, (unsigned)d->dynamicRange, why ? why : "OK");
     if (why) return kIOReturnUnsupportedMode;
     fValidateOk++;
     if (!d->minPixelClock) d->minPixelClock = d->pixelClock;
@@ -4470,6 +4486,11 @@ IOReturn NVRMNVDAFramebuffer::setDetailedTimings(OSArray *array)
     publishStartupTiming();
     return kIOReturnSuccess;
 }
+static_assert((unsigned)kNvrmDepth8 == (unsigned)kIORangeBitsPerColorComponent8 && (unsigned)kNvrmDepth10 == (unsigned)kIORangeBitsPerColorComponent10 &&
+              (unsigned)kNvrmDepth8 == (unsigned)kIOBitsPerColorComponent8 && (unsigned)kNvrmDepth10 == (unsigned)kIOBitsPerColorComponent10 &&
+              (unsigned)kNvrmDepth12 == (unsigned)kIOBitsPerColorComponent12, "nvrm-fb-safety.h's depth bits are not IOGraphics'");
+static_assert((unsigned)kNvrmDynamicRangeHDR10 == (unsigned)kIODynamicRangeHDR10 &&
+              (unsigned)kNvrmDynamicRangeHDR10 == (unsigned)kIORangeDynamicRangeHDR10, "nvrm-fb-safety.h's HDR10 bit is not IOGraphics'");
 void NVRMNVDAFramebuffer::publishTimingCaps()
 {
     IODisplayScalerInformation si; nvu_zero(&si, sizeof si);
@@ -4496,18 +4517,37 @@ void NVRMNVDAFramebuffer::publishTimingCaps()
     r.minVerticalBlankingClocks = 0;    r.maxVerticalBlankingClocks = 8192;
     r.minVerticalSyncOffsetClocks = 0;  r.maxVerticalSyncOffsetClocks = 8192;
     r.minVerticalPulseWidthClocks = 1;  r.maxVerticalPulseWidthClocks = 8192;
-    r.maxNumLinks = 1; r.minLink0PixelClock = 25000; r.maxLink0PixelClock = 1200000;
+    // No link limits, as Apple's own framebuffers publish them: with maxNumLinks 1 and a link-0 maximum of 1200000 kHz macOS
+    // declined every timing above 300 MHz before asking the driver ("Declined ... because fbRange_a", code NotPermitted),
+    // whatever its encoding: an HDMI monitor kept none of its own 1080p 144 Hz or 4K 50 and 60 Hz timings, only the SDR
+    // copies the driver adds itself, and so had no HDR10 mode there. The pixel clock is still bounded by maxPixelClock above,
+    // the sink's clock by macOS ("Display_ClockLimit"), and a raster the EDID does not list by NVKMS in validateDetailedTiming.
+    r.maxNumLinks = 0; r.minLink0PixelClock = 0; r.maxLink0PixelClock = 0;
     r.supportedPixelEncoding = kIORangePixelEncodingRGB444; r.supportedBitsPerColorComponent = kIORangeBitsPerColorComponent8;
     r.supportedColorimetryModes = kIORangeColorimetryNativeRGB | kIORangeColorimetrysRGB; r.supportedDynamicRangeModes = kIORangeDynamicRangeSDR;
     if (gHdrOn && fHdrCapable) {   // a PQ-capable display: HDR10 timings in BT.2020/BT.2100 are offered next to the SDR ones
-        r.supportedColorimetryModes |= kIORangeColorimetryBT2020 | kIORangeColorimetryBT2100;
+        // With HDR10 in the range macOS makes every timing as wire formats and declines, before it asks the driver, each
+        // one whose encoding, depth, colorimetry or dynamic range the range does not list ("Declined ... because fbRange").
+        // On an HDMI monitor its SDR formats are BT.709 only: without BT.709 here every SDR timing was declined, macOS kept
+        // HDR10 timings and scaled modes, no mode was the default one, and System Settings did not show the display.
+        r.supportedColorimetryModes |= kIORangeColorimetryBT709 | kIORangeColorimetryBT2020 | kIORangeColorimetryBT2100;
         r.supportedDynamicRangeModes |= kIORangeDynamicRangeHDR10;
+        r.supportedBitsPerColorComponent |= kIORangeBitsPerColorComponent10;   // the depth macOS makes HDR10 timings at (nvrmTimingDepthOk)
+        if (fHdr422TmdsMHz) {
+            // An HDMI sink that takes 4:2:2: macOS makes it at 12 bits, after HDR10 RGB at 10 bits declined for the sink's clock
+            // ("Display_ClockLimit"). validateDetailedTiming keeps it to the HDR10 timings RGB does not fit (nvrmHdr422Needed),
+            // and SDR above 8 bits stays refused, so every other timing is installed in RGB as before.
+            r.supportedPixelEncoding |= kIORangePixelEncodingYCbCr422;
+            r.supportedBitsPerColorComponent |= kIORangeBitsPerColorComponent12;
+        }
     }
     OSData *g = OSData::withBytes(&r, sizeof r);
     if (g) { setProperty(kIOFBTimingRangeKey, g); g->release(); }
     setProperty(kIOFBProbeOptionsKey, (unsigned long long)kNVRMFBSetTransform, 32);
     FBLOG("fbmodes: published IOFBScalerInfo (up+down+rotate, max %ux%u) + IOFBTimingRange (25 MHz..%u MHz, 23..%u Hz) + IOFBProbeOptions 0x%x",
           fScalerMaxW, fScalerMaxH, (unsigned)kNvrmMaxPixelClockMHz, (unsigned)kNvrmMaxFrameRate, (unsigned)kNVRMFBSetTransform);
+    if (r.supportedPixelEncoding & kIORangePixelEncodingYCbCr422)
+        FBLOG("fb%u: HDR10 also in YCbCr 4:2:2 for the timings RGB at 10 bits does not fit (HDMI sink, TMDS %u MHz)", fIndex, fHdr422TmdsMHz);
 }
 IOReturn NVRMNVDAFramebuffer::getInformationForDisplayMode(IODisplayModeID mode, IODisplayModeInformation *info)
 {
