@@ -229,6 +229,49 @@ static inline bool nvrmTimingDepthOk(unsigned depth, bool hdr10) { return hdr10 
 // IOGraphics' HDR10 bit, the same value in a timing range (kIORangeDynamicRangeHDR10) and in a detailed timing
 // (kIODynamicRangeHDR10).
 enum { kNvrmDynamicRangeHDR10 = 0x2 };
+// ---- HDR10 in YCbCr 4:2:2 over HDMI ----
+// RGB at 10 bits sends 1.25 TMDS characters per pixel; 4:2:2 is carried at 12 bits in the clock of 8-bit RGB. So 3840x2160 at
+// 60 Hz (594 MHz) fits an HDMI 2.0 sink's 600 MHz in RGB at 8 bits and in 4:2:2, but not in RGB at 10 bits (742.5 MHz): with
+// RGB the only encoding offered, macOS had no HDR10 timing for 4K at 50 and 60 Hz. NVKMS takes 4:2:2 with BT.2100 on HDMI
+// (its AVI infoframe says BT.2020 YCC); 4:2:0 with BT.2100 it refuses (nvChooseCurrentColorFormatAndRangeEvo).
+// IOGraphics' encoding bits, the same values in a timing range and in a detailed timing.
+enum { kNvrmEncodingRGB444 = 0x1, kNvrmEncodingYCbCr422 = 0x4 };
+// The TMDS limit in MHz of an HDMI sink that takes YCbCr 4:2:2 at 10 bits, from its EDID, the way NVKMS reads it: the HDMI
+// Forum block's (or SCDB's) maximum TMDS character rate, at least 340 and at most HDMI 2.0's 600; 340 with only the HDMI 1.4
+// block. 0 when the sink is not HDMI, has no 10-bit deep colour, or does not list 4:2:2 (EDID 1.4: the feature byte and at
+// least 10 bits per component; earlier: the CTA extension's YCbCr 4:2:2 flag).
+static inline unsigned nvrmEdidHdmi422TmdsMHz(const unsigned char *e, unsigned n)
+{
+    if (!e || n < 256 || e[18] != 1) return 0;
+    bool ycc422 = false, hdmi = false, dc30 = false; unsigned hfMHz = 0;
+    if (e[19] >= 4) ycc422 = (e[20] & 0x80) && (e[24] & 0x10) && ((e[20] >> 4) & 7) >= 3 && ((e[20] >> 4) & 7) <= 6;
+    for (unsigned blk = 128; blk + 128 <= n; blk += 128) {
+        const unsigned char *x = e + blk;
+        if (x[0] != 0x02) continue;
+        if (e[19] < 4 && x[1] >= 1 && (x[3] & 0x10)) ycc422 = true;
+        const unsigned end = x[2] < 4 ? 4 : (x[2] > 127 ? 127 : x[2]);
+        for (unsigned i = 4; i < end;) {
+            const unsigned tag = x[i] >> 5, len = x[i] & 31;
+            if (i + 1 + len > end) break;
+            const unsigned char *d = x + i + 1;
+            const unsigned oui = len >= 3 ? (unsigned)d[0] | ((unsigned)d[1] << 8) | ((unsigned)d[2] << 16) : 0;
+            if (tag == 3 && oui == 0x000c03) { hdmi = true; if (len >= 6 && (d[5] & 0x10)) dc30 = true; }
+            if (tag == 3 && oui == 0xc45dd8 && len >= 5) hfMHz = d[4] * 5u;
+            if (tag == 7 && len >= 5 && d[0] == 0x79) hfMHz = d[4] * 5u;   // HDMI Forum SCDB: the extended tag and 2 bytes where the OUI was
+            i += 1 + len;
+        }
+    }
+    if (!hdmi || !dc30 || !ycc422) return 0;
+    unsigned mhz = 340;
+    if (hfMHz > mhz) mhz = hfMHz;
+    return mhz > 600 ? 600 : mhz;
+}
+// An HDR10 timing goes out in 4:2:2 only when RGB at 10 bits does not fit the sink and 4:2:2 does; every other one stays RGB.
+static inline bool nvrmHdr422Needed(unsigned long long pixelClockHz, unsigned tmdsMHz)
+{
+    const unsigned long long limit = (unsigned long long)tmdsMHz * 1000000ull;
+    return tmdsMHz && pixelClockHz * 5 > limit * 4 && pixelClockHz <= limit;
+}
 // What macOS's list says about one raster and refresh rate NVKMS validated, before the driver adds that rate itself: whether the
 // raster is listed (raster), whether the rate is listed unscaled (have), and which of macOS's timings the copy starts from
 // (tmpl, -1 for none). The rates added this way are SDR desktop modes. With HDR10 in the range macOS lists HDR10 timings too,
