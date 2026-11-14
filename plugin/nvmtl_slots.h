@@ -87,11 +87,40 @@ static inline void nvmtl_sl_drop(nvmtl_sl_state *s, uint32_t slot, uint64_t seq)
     s->s[slot].state = 2; s->s[slot].drop_seq = seq; s->drops++;
 }
 
+/* The history is append-only, so a process that makes images all day grows it without limit: a compositor's image and
+   view histories reached 1920 MiB and 1408 MiB in 14 hours, and the next doubling would have taken 7 GiB. Past the cap,
+   drop the oldest DEAD records and keep every live one. A fault report names the images a slot's descriptors hold now
+   and the recent past, so the oldest deaths are the ones it can afford to lose. */
+enum { NVMTL_IM_MAX = 262144, NVMTL_IM_KEEP = NVMTL_IM_MAX / 2 };
+/* Sweep to half the cap, so the next sweep is a whole half-capacity of adds away. Call with the state lock held. */
+static inline void nvmtl_im_compact(nvmtl_im_state *s)
+{
+    uint32_t budget = s->live < NVMTL_IM_KEEP ? (uint32_t)(NVMTL_IM_KEEP - s->live) : 0;
+    for (uint32_t i = s->n; i-- > 0;) {          /* newest first: the deaths within the budget are the ones kept */
+        nvmtl_im_entry *e = &s->e[i];
+        if (!e->died) continue;
+        if (budget) budget--; else e->img = NULL;   /* a record no add can produce: the marker the sweep drops */
+    }
+    uint32_t w = 0;
+    memset(s->heads, 0, sizeof s->heads);
+    for (uint32_t i = 0; i < s->n; i++) {        /* keep the order: the chain walks newest-first by construction */
+        if (!s->e[i].img) continue;
+        if (w != i) s->e[w] = s->e[i];
+        nvmtl_im_entry *e = &s->e[w];
+        const uint32_t b = nvmtl_im_bucket(e->img);
+        e->chain = s->heads[b]; s->heads[b] = w + 1; w++;
+    }
+    s->n = w;
+}
 static inline uint32_t nvmtl_im_add(nvmtl_im_state *s, const void *img, const void *mem, uint64_t off, uint64_t size, const void *view,
                                     uint32_t w, uint32_t h, uint32_t fmt, uint32_t storage, uint32_t placed, uint32_t pooled, uint64_t seq)
 {
     if (!img) return 0;
-    if (s->n == s->cap) { const uint32_t cap = s->cap ? s->cap * 2 : 4096; nvmtl_im_entry *e = (nvmtl_im_entry *)realloc(s->e, (size_t)cap * sizeof *e); if (!e) return 0; s->e = e; s->cap = cap; }
+    if (s->n == s->cap) {
+        if (s->cap >= NVMTL_IM_MAX) nvmtl_im_compact(s);
+        /* still full: every record is live, and a live image must never be dropped to bound the table */
+        if (s->n == s->cap) { const uint32_t cap = s->cap ? s->cap * 2 : 4096; nvmtl_im_entry *e = (nvmtl_im_entry *)realloc(s->e, (size_t)cap * sizeof *e); if (!e) return 0; s->e = e; s->cap = cap; }
+    }
     nvmtl_im_entry *e = &s->e[s->n++];
     e->img = img; e->mem = mem; e->off = off; e->size = size; e->view = view; e->w = w; e->h = h; e->fmt = fmt; e->storage = storage; e->placed = placed; e->pooled = pooled; e->seq = seq; e->died = 0; e->parked = 0;
     { const uint32_t b = nvmtl_im_bucket(img); e->chain = s->heads[b]; s->heads[b] = s->n; }   /* s->n is already 1 + this entry */
@@ -113,10 +142,31 @@ static inline void nvmtl_im_died(nvmtl_im_state *s, const void *img, uint64_t se
 /* a texture object died but its image went to a park for reuse (alive, mapped, recyclable); and the reuse */
 static inline void nvmtl_im_parked(nvmtl_im_state *s, const void *img, uint64_t seq) { nvmtl_im_entry *e = nvmtl_im_by_img(s, img); if (e && !e->died) e->parked = seq ? seq : 1; }
 static inline void nvmtl_im_recycled(nvmtl_im_state *s, const void *img) { nvmtl_im_entry *e = nvmtl_im_by_img(s, img); if (e) e->parked = 0; }
+/* Same bound as the image history: keep every live view and the newest deaths, drop the oldest. */
+enum { NVMTL_VW_MAX = 524288, NVMTL_VW_KEEP = NVMTL_VW_MAX / 2 };
+static inline void nvmtl_vw_compact(nvmtl_vw_state *s)
+{
+    uint32_t live = 0;
+    for (uint32_t i = 0; i < s->n; i++) if (!s->e[i].died) live++;
+    uint32_t budget = live < NVMTL_VW_KEEP ? NVMTL_VW_KEEP - live : 0;
+    for (uint32_t i = s->n; i-- > 0;) {
+        nvmtl_vw_entry *e = &s->e[i];
+        if (!e->died) continue;
+        if (budget) budget--; else e->img = NULL;
+    }
+    uint32_t w = 0;
+    for (uint32_t i = 0; i < s->n; i++) { if (!s->e[i].img) continue; if (w != i) s->e[w] = s->e[i]; w++; }
+    s->n = w;
+    memset(s->live_heads, 0, sizeof s->live_heads);   /* also covers n == 0, where the sync below has nothing to walk */
+    s->indexed_n = 0; nvmtl_vw_live_sync(s);
+}
 static inline void nvmtl_vw_add_ex(nvmtl_vw_state *s, const void *view, const void *img, uint32_t type1, uint32_t base_layer, uint32_t layers, uint32_t base_mip, uint32_t mips)
 {
     if (!view || !img) return;
-    if (s->n == s->cap) { const uint32_t cap = s->cap ? s->cap * 2 : 4096; nvmtl_vw_entry *e = (nvmtl_vw_entry *)realloc(s->e, (size_t)cap * sizeof *e); if (!e) return; s->e = e; s->cap = cap; }
+    if (s->n == s->cap) {
+        if (s->cap >= NVMTL_VW_MAX) nvmtl_vw_compact(s);
+        if (s->n == s->cap) { const uint32_t cap = s->cap ? s->cap * 2 : 4096; nvmtl_vw_entry *e = (nvmtl_vw_entry *)realloc(s->e, (size_t)cap * sizeof *e); if (!e) return; s->e = e; s->cap = cap; }
+    }
     nvmtl_vw_live_sync(s);
     nvmtl_vw_entry *e = &s->e[s->n++]; e->view = view; e->img = img; e->type = type1; e->base_layer = base_layer; e->layers = layers; e->base_mip = base_mip; e->mips = mips;
     e->s_idx = e->t_idx = 0; e->s_addr = e->t_addr = 0; e->seq = 0; e->died = 0;
