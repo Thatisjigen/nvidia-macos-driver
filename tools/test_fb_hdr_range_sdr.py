@@ -64,9 +64,17 @@ def driver(fmt, pclk_mhz):           # validateDetailedTiming, as the two assert
     if enc == 0x4:
         return dyn == 0x2 and pclk_mhz * 5 / 4 > SINK_MHZ and pclk_mhz <= SINK_MHZ
     return True
-def installed(r, tries, pclk_mhz):   # the first wire format the range lists, the sink takes and the driver accepts
+# macOS's own check of the timing against the range ("fbRange_a"): with link limits published it declined every timing above
+# a quarter of the link-0 maximum, whatever the format (seen with 1200000 kHz: 297 MHz kept, 339.95 and 594 declined)
+link = re.search(r'r\.maxNumLinks = (\d+); r\.minLink0PixelClock = (\d+); r\.maxLink0PixelClock = (\d+);', body)
+assert link, 'the link fields of the range are not where the test reads them'
+LINK0_KHZ = int(link.group(3)) if int(link.group(1)) else 0
+def fits_range(pclk_mhz, link0_khz):
+    return not link0_khz or pclk_mhz * 1000 * 4 <= link0_khz
+def installed(r, tries, pclk_mhz, link0_khz=None):   # the first wire format the range lists, the sink takes and the driver accepts
+    link0_khz = LINK0_KHZ if link0_khz is None else link0_khz
     for f in tries:
-        if allowed(r, f) and fits_sink(f, pclk_mhz) and driver(f, pclk_mhz): return f
+        if allowed(r, f) and fits_sink(f, pclk_mhz) and fits_range(pclk_mhz, link0_khz) and driver(f, pclk_mhz): return f
     return None
 RGB8, RGB10, Y422 = (0x1, 0x2, 0x80, 0x1), (0x1, 0x4, 0x100, 0x2), (0x4, 0x8, 0x100, 0x2)
 now = rng(base, hdr, True)
@@ -79,6 +87,10 @@ for pclk in (594, 339.95, 297):
     assert installed(now, SDR, pclk) == RGB8, pclk
 assert installed(now, HDR, 594) == Y422
 assert installed(now, HDR, 339.95) == RGB10 and installed(now, HDR, 297) == RGB10
+assert LINK0_KHZ == 0, 'the range limits link 0 again'
+# control: with the link limit of before, macOS kept none of the LG's timings above 300 MHz, SDR included
+assert installed(now, HDR, 594, 1200000) is None and installed(now, SDR, 594, 1200000) is None
+assert installed(now, SDR, 339.95, 1200000) is None and installed(now, HDR, 297, 1200000) == RGB10
 # control: the range of before (RGB only) had no HDR10 timing at all at 4K 60 Hz, which is what macOS showed
 rgb_only = rng(base, hdr[:hdr.index('if (fHdr422TmdsMHz) {')], True)
 assert installed(rgb_only, HDR, 594) is None and installed(rgb_only, HDR, 297) == RGB10

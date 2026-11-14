@@ -4681,7 +4681,12 @@ void NVRMNVDAFramebuffer::publishTimingCaps()
     r.minVerticalBlankingClocks = 0;    r.maxVerticalBlankingClocks = 8192;
     r.minVerticalSyncOffsetClocks = 0;  r.maxVerticalSyncOffsetClocks = 8192;
     r.minVerticalPulseWidthClocks = 1;  r.maxVerticalPulseWidthClocks = 8192;
-    r.maxNumLinks = 1; r.minLink0PixelClock = 25000; r.maxLink0PixelClock = 1200000;
+    // No link limits, as Apple's own framebuffers publish them: with maxNumLinks 1 and a link-0 maximum of 1200000 kHz macOS
+    // declined every timing above 300 MHz before asking the driver ("Declined ... because fbRange_a", code NotPermitted),
+    // whatever its encoding: an HDMI monitor kept none of its own 1080p 144 Hz or 4K 50 and 60 Hz timings, only the SDR
+    // copies the driver adds itself, and so had no HDR10 mode there. The pixel clock is still bounded by maxPixelClock above,
+    // the sink's clock by macOS ("Display_ClockLimit"), and a raster the EDID does not list by NVKMS in validateDetailedTiming.
+    r.maxNumLinks = 0; r.minLink0PixelClock = 0; r.maxLink0PixelClock = 0;
     r.supportedPixelEncoding = kIORangePixelEncodingRGB444; r.supportedBitsPerColorComponent = kIORangeBitsPerColorComponent8;
     r.supportedColorimetryModes = kIORangeColorimetryNativeRGB | kIORangeColorimetrysRGB; r.supportedDynamicRangeModes = kIORangeDynamicRangeSDR;
     if (gHdrOn && fHdrCapable) {   // a PQ-capable display: HDR10 timings in BT.2020/BT.2100 are offered next to the SDR ones
