@@ -1230,6 +1230,15 @@ static void *nvmtl_storage_view_for(NVMTLCommandBuffer *cb, NVMTLTexture *t, BOO
             int made = ms ? (srgb ? -1 : nvmtl_vk_image_create_ms_storage(im->w, im->h, im->fmt, im->bpp, im->samples, &t->_stTwin))
                           : nvmtl_vk_image_create_typed(im->w, im->h, srgb ? 97u : im->fmt, srgb ? 8u : im->bpp, 0, 1, 1, 2, 1, &t->_stTwin);
             if (ms && !made) t->_stTwin.storage = 1;
+            // BGR10A2Unorm (A2R10G10B10) is not a storage format in Vulkan, but the same 10-bit layout in the other
+            // channel order (A2B10G10R10) is one every implementation must support. ImageIO writes its HDR output
+            // (an iPhone photo with a gain map) into a BGR10A2 IOSurface from a kernel, so every such photo decoded
+            // black. Its twin is the sibling format; the blits in and out convert by channel, as for sRGB above.
+            if (!ms && !srgb && (made || !t->_stTwin.storage) && im->fmt == 58u /* VK_FORMAT_A2R10G10B10_UNORM_PACK32 */) {
+                if (t->_stTwin.img) nvmtl_vk_image_destroy(&t->_stTwin);
+                memset(&t->_stTwin, 0, sizeof t->_stTwin);
+                made = nvmtl_vk_image_create_typed(im->w, im->h, 64u /* VK_FORMAT_A2B10G10R10_UNORM_PACK32 */, im->bpp, 0, 1, 1, 2, 1, &t->_stTwin);
+            }
             if (made || !t->_stTwin.storage) {
                 if (t->_stTwin.img) nvmtl_vk_image_destroy(&t->_stTwin);
                 memset(&t->_stTwin, 0, sizeof t->_stTwin);
