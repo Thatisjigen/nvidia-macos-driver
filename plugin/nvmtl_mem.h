@@ -19,10 +19,34 @@ typedef struct { nvmtl_mb_entry e[NVMTL_MB_N]; uint32_t n; } nvmtl_mb_state;   /
 
 /* "ALIVE" or "DIED at seq N" */
 static inline const char *nvmtl_mm_liveness(uint64_t died, char *buf, size_t cap) { if (died) snprintf(buf, cap, "DIED at seq %llu", (unsigned long long)died); else snprintf(buf, cap, "ALIVE"); return buf; }
+/* The allocation history is append-only too, and a compositor grew it to 352 MiB in 14 hours. Past the cap, drop the
+   oldest DEAD records and keep every live one: an address resolves to the memory that holds it now or held it recently. */
+enum { NVMTL_MM_MAX = 65536, NVMTL_MM_KEEP = NVMTL_MM_MAX / 2 };
+static inline void nvmtl_mm_compact(nvmtl_mm_state *s)
+{
+    uint32_t budget = s->live < NVMTL_MM_KEEP ? (uint32_t)(NVMTL_MM_KEEP - s->live) : 0;
+    for (uint32_t i = s->n; i-- > 0;) {
+        nvmtl_mm_entry *e = &s->e[i];
+        if (!e->died) continue;
+        if (budget) budget--; else e->mem = NULL;   /* a record no add can produce: the marker the sweep drops */
+    }
+    uint32_t w = 0; uint64_t unbased = 0;
+    for (uint32_t i = 0; i < s->n; i++) {
+        if (!s->e[i].mem) continue;
+        if (w != i) s->e[w] = s->e[i];
+        if (!s->e[w].base) unbased++;              /* the count describes the records that remain */
+        w++;
+    }
+    s->n = w; s->unbased = unbased;
+}
 static inline uint32_t nvmtl_mm_add(nvmtl_mm_state *s, const void *mem, uint64_t base, uint64_t size, uint32_t type, const char *kind, uint64_t seq)
 {
     if (!mem) return 0;
-    if (s->n == s->cap) { const uint32_t cap = s->cap ? s->cap * 2 : 1024; nvmtl_mm_entry *e = (nvmtl_mm_entry *)realloc(s->e, (size_t)cap * sizeof *e); if (!e) return 0; s->e = e; s->cap = cap; }
+    if (s->n == s->cap) {
+        if (s->cap >= NVMTL_MM_MAX) nvmtl_mm_compact(s);
+        /* still full: every record is live, and a live memory must never be dropped to bound the table */
+        if (s->n == s->cap) { const uint32_t cap = s->cap ? s->cap * 2 : 1024; nvmtl_mm_entry *e = (nvmtl_mm_entry *)realloc(s->e, (size_t)cap * sizeof *e); if (!e) return 0; s->e = e; s->cap = cap; }
+    }
     nvmtl_mm_entry *e = &s->e[s->n++];
     e->mem = mem; e->base = base; e->size = size; e->type = type; e->seq = seq; e->died = 0; snprintf(e->kind, sizeof e->kind, "%s", kind ? kind : "?");
     s->live++; if (!base) s->unbased++;
