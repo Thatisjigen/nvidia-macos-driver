@@ -7,6 +7,7 @@
    the vector it is given, so tools/test_env_knobs.c proves it without loading the plugin. */
 #ifndef NVMTL_ENV_KNOBS_H
 #define NVMTL_ENV_KNOBS_H
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
@@ -54,6 +55,28 @@ static inline int nvmtl_process_env_on(void)
 {
     static int on = -1;
     if (on < 0) { const char *e = getenv("NVMTL_PROCESS_ENV"); on = e && !strcmp(e, "1") && !nvmtl_env_privileged(); }
+    return on;
+}
+
+/* 1 when a release plugin writes its log in this process: it opted in itself (above), or root named it. A system
+   process (a screen saver or wallpaper extension, started by launchd in a sandbox) cannot be given an environment, and
+   its black screen cannot be diagnosed without the log. Root names it with an empty file
+   /Library/GPUBundles/nvmtl/log-on.<executable name>: a regular file owned by root that nobody else can write, in a
+   folder with the same properties. The log goes where nvmtl_log_path says (the process's own temporary folder when
+   /tmp is closed to it). Never for a privileged process. */
+static inline int nvmtl_log_on(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        on = nvmtl_process_env_on();
+        const char *me = getprogname();
+        if (!on && me && *me && !strchr(me, '/') && !nvmtl_env_privileged()) {
+            char p[512]; struct stat f, d;
+            snprintf(p, sizeof p, "/Library/GPUBundles/nvmtl/log-on.%s", me);
+            on = lstat(p, &f) == 0 && S_ISREG(f.st_mode) && f.st_uid == 0 && !(f.st_mode & 022)
+              && lstat("/Library/GPUBundles/nvmtl", &d) == 0 && S_ISDIR(d.st_mode) && d.st_uid == 0 && !(d.st_mode & 022);
+        }
+    }
     return on;
 }
 
