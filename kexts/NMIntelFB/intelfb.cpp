@@ -445,6 +445,7 @@ public:
     bool start(IOService *provider) override;
     bool startReal(IOService *provider);
     void stop(IOService *provider) override;
+    void startUnwind();   // undo everything start() published; shared by a failed start and stop()
 
     IOReturn enableController() override { IFB_ONCE("ec"); return kIOReturnSuccess; }
     // intelfb-0009: IOGraphics reads IOFBDependentIndex only in open() (controller->fFbs[index] = this) and walks fFbs[]
@@ -874,10 +875,11 @@ bool NMIntelFB::start(IOService *provider)
     if (!fVBuf || fVBuf->prepare() != kIOReturnSuccess) { IFBLOG("virtual: no contiguous buffer"); OSSafeReleaseNULL(fVBuf); return false; }
     bzero(fVBuf->getBytesNoCopy(), fVBuf->getLength());
     fApertureBase = fVBuf->getPhysicalSegment(0, nullptr, kIOMemoryMapperNone); fApertureLen = fVBuf->getLength();
-    if (!IOFramebuffer::start(provider)) { fVBuf->complete(); OSSafeReleaseNULL(fVBuf); return false; }
     fSurfMap = fVBuf->map();
+    // Before IOFramebuffer::start, so start() attaches the shared controller (see the panel path below).
     setProperty("IOFBDependentID", 0x4E56524D00000001ull, 64);
     setProperty("IOFBDependentIndex", 4ull, 32);
+    if (!IOFramebuffer::start(provider)) { OSSafeReleaseNULL(fSurfMap); fVBuf->complete(); OSSafeReleaseNULL(fVBuf); return false; }
     if (IOWorkLoop *wl = getWorkLoop()) {
         fTimer = IOTimerEventSource::timerEventSource(this, [](OSObject *o, IOTimerEventSource *t) {
             ((NMIntelFB *)o)->sample(); t->setTimeoutMS(2000); });
@@ -1317,19 +1319,30 @@ bool NMIntelFB::startReal(IOService *provider)
     if (!adoptFirmwareMode()) { OSSafeReleaseNULL(fMMIO); fRegs = nullptr; return false; }
     { char t[64]; snprintf(t, sizeof t, "mode-%c-%ux%u-s%x", 'A' + fPipe, fWidth, fHeight, fSurf); ifb_trail(t); }
     // Head 4 of the NVIDIA accelerator (NVAccel): WindowServer composites this panel on the NVIDIA card and the
-    // display pipe copies each frame into fSurfMap. Without NVAccel the panel stays a plain framebuffer.
+    // display pipe copies each frame into fSurfMap.
+    // The dependent ID and index must exist before IOFramebuffer::start. start() attaches the framebuffer to its
+    // shared controller only when it finds a dependent ID; set later, the controller stays unset until open(), and the
+    // power change queued by registerPowerDriver() below takes the controller's lock through a null pointer (page fault
+    // in IOFramebuffer::powerStateWillChangeTo at boot). NVRMFB sets them before start for the same reason.
+    // The mapping is made here, before publishBacklight publishes anything another thread can reach, so a failure to
+    // map needs nothing undone but the register mapping.
     if (IODeviceMemory *sm = IODeviceMemory::withRange(fApertureBase + fSurf, (IOPhysicalLength)fRowBytes * fHeight)) {
         fSurfMap = sm->map(kIOMapWriteCombineCache); sm->release();
     }
     ifb_trail(fSurfMap ? "surf" : "surf-fail");
-    // nmx-intel (RTX-2 hung in registerPowerDriver with these set after IOFramebuffer::start): the dependent ID decides
-    // the controller IOFramebuffer::start builds, so it goes in before, as NVRMFB does. nullmoth-intelfb-dep=0
-    // publishes a plain framebuffer, without joining NVAccel as head 4.
+    if (!fSurfMap) {
+        // Without the mapping there is no head 4 and no dependent ID, so no controller either: starting would hit the
+        // same null controller on the first power change. Leave the panel to the firmware framebuffer.
+        IFBLOG("the surface would not map write-combined: leaving the panel to the firmware framebuffer");
+        OSSafeReleaseNULL(fMMIO); fRegs = nullptr; return false;
+    }
+    // nmx-intel: nullmoth-intelfb-dep=0 publishes a plain framebuffer, without joining NVAccel as head 4. It has no
+    // dependent ID, so no controller before open(), and power management is left out for it below.
     // intelfb-0009: on a laptop with nothing on the NVIDIA ports no NVRMFB head ever starts (NVRM "heads 0x0"), so in
     // NVRM's group this panel sat alone at index 4 with fFbs[0] NULL. Default (dep=1): a controller of its own (see
     // open()); dep=2 keeps NVRM's group as before. Index 4 at publish is what makes NVAccel treat it as head 4.
     publishBacklight();   // intelfb-0020: before IOFramebuffer::start(), whose open() looks for "backlight"
-    uint32_t dep = fSurfMap ? ifb_knob("nullmoth-intelfb-dep", 1) : 0;
+    uint32_t dep = ifb_knob("nullmoth-intelfb-dep", 1);
     // dep=3 chooses at each boot, after the delay: NVRM's group when NVRMFB started a head 0 (a monitor on the
     // NVIDIA port at boot), its own group otherwise. Never two head 0s (WindowServer crashes)
     if (dep == 3) {
@@ -1349,8 +1362,13 @@ bool NMIntelFB::startReal(IOService *provider)
         uint32_t head = fOwnGroup ? ifb_knob("nullmoth-intelfb-head", 0) : 4;
         setProperty("IOFBDependentIndex", head == 4 ? 4ull : 0ull, 32);
         ifb_trail(!fOwnGroup ? "dep-nvrm" : head == 4 ? "dep-own-h4" : "dep-own-h0");
-    } else IFBLOG("the surface would not map write-combined, or nullmoth-intelfb-dep=0: NVIDIA rendering stays off for this panel");
-    if (!IOFramebuffer::start(provider)) { ifb_trail("fb-start-failed"); if (fBacklight) { fBacklight->detach(this); OSSafeReleaseNULL(fBacklight); } OSSafeReleaseNULL(fSurfMap); OSSafeReleaseNULL(fMMIO); fRegs = nullptr; return false; }
+    } else IFBLOG("nullmoth-intelfb-dep=0: NVIDIA rendering stays off for this panel");
+    if (!IOFramebuffer::start(provider)) {
+        // The backlight service and the nub's framebuffer pointer are already published: undo all of it.
+        ifb_trail("fb-start-failed");
+        startUnwind();
+        return false;
+    }
     ifb_trail("fb-started");
     setProperty("NMIntelFBPipe", fPipe, 32);
     setProperty("NMIntelFBDisplayVersion", fVer, 32);
@@ -1362,7 +1380,8 @@ bool NMIntelFB::startReal(IOService *provider)
     // inactive: a boot without it had pipe 1 "active 0", "Unable to find display pipe" and iop_ok_h4 0
     if ((fOwnGroup && ifb_knob("nullmoth-intelfb-head", 0) != 4) || gIfbDepNvrm) kapiInit();
     // nmx-intel: nullmoth-intelfb-pm=0 leaves power management out (RTX-2 hung inside this call)
-    if (ifb_knob("nullmoth-intelfb-pm", 1)) {
+    // nullmoth-intelfb-dep=0 leaves it out too: its framebuffer has no controller yet for the power change to lock
+    if (dep && ifb_knob("nullmoth-intelfb-pm", 1)) {
         ifb_trail("pm");
         registerPowerDriver(this, kPowerStates, 2);
         ifb_trail("power");
@@ -1395,7 +1414,11 @@ bool NMIntelFB::startReal(IOService *provider)
     return true;
 }
 
-void NMIntelFB::stop(IOService *provider)
+// Undoes what start() published: the VBL thread, the AGDC sysctl and the nub's framebuffer pointer, the USB-C port, the
+// RAM scan-out buffers with their GGTT entries, the debug sysctls, the NVKMS device, the backlight service, and the
+// mappings. A step whose part of start() never ran does nothing. Used by a failed start and by stop(), so the two
+// cannot drift apart.
+void NMIntelFB::startUnwind()
 {
     fStopping = true;
 #ifdef NMINTELFB_VIRTUAL
@@ -1423,6 +1446,11 @@ void NMIntelFB::stop(IOService *provider)
     kapiFree();
     if (fBacklight) { fBacklight->detach(this); OSSafeReleaseNULL(fBacklight); }
     OSSafeReleaseNULL(fSurfMap); OSSafeReleaseNULL(fMMIO); fRegs = nullptr;
+}
+
+void NMIntelFB::stop(IOService *provider)
+{
+    startUnwind();
     IOFramebuffer::stop(provider);
 }
 
@@ -2100,6 +2128,10 @@ SYSCTL_PROC(_debug, OID_AUTO, nmintelfb_agdc, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG
             ifb_agdc_sysctl, "I", "1 = list the Intel panel in an AppleGraphicsDeviceControl on the NVIDIA GPU (1 up, 2 starting, < 0 failed)");
 static void ifb_agdc_register(bool on)
 {
+    // startUnwind() also runs for a start that failed before registering: an OID is only unregistered once registered
+    static bool registered;
+    if (on == registered) return;
+    registered = on;
     if (on) sysctl_register_oid(&sysctl__debug_nmintelfb_agdc); else sysctl_unregister_oid(&sysctl__debug_nmintelfb_agdc);
 }
 
