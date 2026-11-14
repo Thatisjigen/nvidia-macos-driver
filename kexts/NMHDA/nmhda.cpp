@@ -291,9 +291,13 @@ static void onAudioFamilyLoaded(void *, KernelPatcher &patcher, size_t index, ma
     if (gVolumeApi.createVolumeControl) return;
     auto vol = patcher.solveSymbol(index, "__ZN19IOAudioLevelControl19createVolumeControlEiiiiijPKcjj", address, size);
     patcher.clearError();
-    auto mute = patcher.solveSymbol(index, "__ZN19IOAudioToggleControl17createMuteControlEbjPKcjj", address, size);
+    auto mute = patcher.solveSymbol(index, "__ZN20IOAudioToggleControl17createMuteControlEbjPKcjj", address, size);
     patcher.clearError();
-    if (!vol || !mute) return;
+    if (!vol || !mute) {
+        report("vol", "IOAudioFamily has no %s: no volume or mute for display audio",
+               !vol ? "IOAudioLevelControl::createVolumeControl" : "IOAudioToggleControl::createMuteControl");
+        return;
+    }
     gVolumeApi.createVolumeControl = reinterpret_cast<void *>(vol);
     gVolumeApi.createMuteControl = reinterpret_cast<void *>(mute);
     startVolumeWhenReady();
