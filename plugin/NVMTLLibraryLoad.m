@@ -1763,7 +1763,9 @@ NSData *nvmtl_translate_with_fc(NSString *ll, NSString *stage, const uint32_t *i
  * translator, so a warmed file is the file a live miss would have written. NVMTL_FCWARM_OFF=1 turns it off. */
 #define NVMTL_FCWARM_RECORD_MS 100      // chosen: a cached variant costs < 5 ms; the uber-shader variants cost 300-2000
 #define NVMTL_FCWARM_MAX_RECORDS 1024   // chosen: WindowServer held 67 such variants; bounds the file at ~1 MB
-#define NVMTL_FCWARM_JOIN_SEC 60        // chosen: longer than any measured translation (3.2 s), shorter than a hang
+// Longer than any measured translation (3.2 s), far short of WindowServer's watchdog (40 s since its last checkin):
+// the main thread asks for variant after variant, so several joins in a row have to fit inside one checkin interval.
+#define NVMTL_FCWARM_JOIN_SEC 5
 static int nvmtl_fcwarm_on(void) {
     static int on = -1;
     if (on < 0) { const char *e = getenv("NVMTL_FCWARM_OFF"); on = (e && *e && *e != '0') ? 0 : 1; }
@@ -1786,9 +1788,11 @@ static os_unfair_lock gFcWarmLock = OS_UNFAIR_LOCK_INIT;
 static NSMutableSet<NSString *> *gFcWarmRecorded;          // "<airhex> <base64 key>" lines in the file
 static NSMutableSet<NSString *> *gFcWarmKicked;            // AIR digests this process has warmed
 static NSMutableDictionary<NSString *, dispatch_group_t> *gFcWarmInFlight;   // cache path -> its background translation
+static NSMutableSet<NSString *> *gFcWarmStarted;            // paths whose translation holds a slot, so waiting for it can pay
 static void nvmtl_fcwarm_load_locked(NSString *file) {
     if (gFcWarmRecorded) return;
     gFcWarmRecorded = [NSMutableSet set]; gFcWarmKicked = [NSMutableSet set]; gFcWarmInFlight = [NSMutableDictionary dictionary];
+    gFcWarmStarted = [NSMutableSet set];
     NSString *text = file ? [NSString stringWithContentsOfFile:file encoding:NSUTF8StringEncoding error:NULL] : nil;
     for (NSString *line in [text componentsSeparatedByString:@"\n"])
         if (line.length > 65 && [line characterAtIndex:64] == ' ' && gFcWarmRecorded.count < NVMTL_FCWARM_MAX_RECORDS)
@@ -1884,6 +1888,9 @@ static void nvmtl_fcwarm_kick(NSString *ll, NVMTLAirDigest *ad, NSString *mine) 
         queued++;
         dispatch_group_async(g, nvmtl_fcwarm_queue(), ^{
             dispatch_semaphore_wait(nvmtl_fcwarm_slots(), DISPATCH_TIME_FOREVER);
+            os_unfair_lock_lock(&gFcWarmLock);
+            [gFcWarmStarted addObject:path];   // from here a join waits for work that is running, not for a queue
+            os_unfair_lock_unlock(&gFcWarmLock);
             const uint32_t *idx = packed.bytes, *sz = idx + n;
             const uint8_t *const *pay = (const uint8_t *const *)(sz + n);
             NSString *e = nil;
@@ -1895,6 +1902,7 @@ static void nvmtl_fcwarm_kick(NSString *ll, NVMTLAirDigest *ad, NSString *mine) 
             dispatch_semaphore_signal(nvmtl_fcwarm_slots());
             os_unfair_lock_lock(&gFcWarmLock);
             [gFcWarmInFlight removeObjectForKey:path];
+            [gFcWarmStarted removeObject:path];
             os_unfair_lock_unlock(&gFcWarmLock);
         });
     }
@@ -1905,8 +1913,12 @@ static BOOL nvmtl_fcwarm_join(NSString *path) {
     if (!path || !nvmtl_fcwarm_on()) return NO;
     os_unfair_lock_lock(&gFcWarmLock);
     dispatch_group_t g = gFcWarmInFlight[path];
+    const BOOL running = [gFcWarmStarted containsObject:path];
     os_unfair_lock_unlock(&gFcWarmLock);
     if (!g) return NO;
+    // Only two translations run at a time, so a queued sibling can sit behind dozens of others for longer than the
+    // caller may block. Waiting for it buys nothing: translate here and let the background write find the file present.
+    if (!running) { nvlog("fc warm-up: its background translation is still queued - translating here"); return NO; }
     const long timedOut = dispatch_group_wait(g, dispatch_time(DISPATCH_TIME_NOW, (int64_t)NVMTL_FCWARM_JOIN_SEC * NSEC_PER_SEC));
     nvlog("fc warm-up: JOINED the background translation%s", timedOut ? " - it did not finish in time, translating here" : "");
     return !timedOut;
