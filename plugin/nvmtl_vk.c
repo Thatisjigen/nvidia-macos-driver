@@ -2939,7 +2939,10 @@ int nvmtl_vk_surface_share_on(void)
     static int on = -1;
     if (on < 0) {
         const char *e = getenv("NVMTL_NO_SURFACE_SHARE");
-        on = pnvk_stage_import && g_extfd && g_linmod && !(e && e[0] == '1') && !nvmtl_gpu_headless();
+        // Chromium renders its page passes straight into the surface: in shared VRAM that is a pitch-linear target, ~10x slower
+        // per pass on NVIDIA than a tiled one (im.qq.com: 211 vs 20 us per 1259x1040 pass, 12.6 vs 4.8 ms GPU per frame).
+        // A private tiled image plus the copy out is faster there, so Chromium-family processes default to private.
+        on = pnvk_stage_import && g_extfd && g_linmod && (e ? e[0] != '1' : !nvmtl_angle_chrome_family()) && !nvmtl_gpu_headless();
         nvlog("item 7: IOSurface textures %s (NVK import %s, VK_KHR_external_memory_fd %s, DRM linear %s, NVMTL_NO_SURFACE_SHARE=%s)",
               on ? "live in the surface's family VRAM (one per surface, every process)" : "private per process (copies)",
               pnvk_stage_import ? "present" : "ABSENT", g_extfd ? "present" : "ABSENT", g_linmod ? "present" : "ABSENT", e ?: "unset");
