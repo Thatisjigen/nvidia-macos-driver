@@ -235,6 +235,14 @@ static inline void nvrmL10rSwapMatrix(int m[3][4])
     for (int r = 0; r < 3; r++) for (int c = 0; c < 4; c++) m[r][c] = 0;
     m[0][2] = 0x10000; m[1][1] = 0x10000; m[2][0] = 0x10000;
 }
+// ---- a head blocked by a flip that never landed ----
+// Tries to light it again and the wait before each: soon first, then further apart; after the last one it stays blocked.
+enum { kNvrmRecoverTries = 5 };
+static inline unsigned nvrmRecoverDelayMs(unsigned tries)
+{
+    static const unsigned kDelay[kNvrmRecoverTries] = { 250, 1000, 2000, 5000, 10000 };
+    return kDelay[tries < (unsigned)kNvrmRecoverTries ? tries : (unsigned)kNvrmRecoverTries - 1];
+}
 // IOGraphics' HDR10 bit, the same value in a timing range (kIORangeDynamicRangeHDR10) and in a detailed timing
 // (kIODynamicRangeHDR10).
 enum { kNvrmDynamicRangeHDR10 = 0x2 };
