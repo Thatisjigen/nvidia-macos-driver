@@ -596,7 +596,7 @@ class NVRMNVDAFramebuffer : public IOFramebuffer {
     IOReturn setHdrMeta(const void *meta);
     static bool vrrAllowed();
     IOReturn setVrr(bool on);
-    friend void nvrmfbColorChanged(bool needsModeset);   // a debug.nvrmfb_color_* sysctl changed: apply to every lit head
+    friend bool nvrmfbColorChanged(bool needsModeset);   // a debug.nvrmfb_color_* sysctl changed: apply to every lit head
     bool applyVibrance();
     NVRMBacklightHandler *fBacklight = nullptr;   // the panel's brightness control, see NVRMBacklightHandler
     void publishBacklight();
@@ -775,7 +775,14 @@ class NVRMNVDAFramebuffer : public IOFramebuffer {
     bool flipToMemory(struct NvKmsKapiMemory *mem, unsigned w, unsigned h, unsigned pitch, int *rcOut, bool pure = false, UInt64 cookie = 0,
                       bool l10r = false);
     bool fSubmissionSeen = false, fSubmissionFaulted = false;
+    // A flip that never landed blocked the head for good (fSubmissionFaulted) until reboot: after a refused colour mode set
+    // the next accepted flip never completed and the panel froze. recoverFire lights the head again on the driver's own
+    // surface, a few times apart (nvrmRecoverDelayMs); fRecovering keeps a fault inside that attempt from queueing another.
+    thread_call_t fRecover = nullptr; unsigned fRecoverTries = 0; bool fRecovering = false;
     bool fFrontL10r = false;   // the surface on the head is an l10r flip (FB swap in the FMT matrix)
+    static void recoverFire(thread_call_param_t, thread_call_param_t);
+    bool recoverHead();
+    void submissionFault(const char *why);
     // When the tracked flip was committed, so a flip still pending can be told late (another period will do) from
     // stuck (kFlipStuckUs since its submit, the head is faulted).
     uint64_t fFlipSubmitAbs = 0;
@@ -2443,6 +2450,69 @@ void NVRMNVDAFramebuffer::flipFaultLog(const char *why)
     FBLOG("presentation blocked: %s on head %u (%llu us since its submit; latch waits %d timeouts %d late %d max %d us)",
           why, fHead, (unsigned long long)(ns / 1000), gFlipLatchWaits, gFlipLatchTimeouts, gFlipLatchLate, gFlipLatchMaxUs);
 }
+void NVRMNVDAFramebuffer::submissionFault(const char *why)
+{
+    flipFaultLog(why);
+    fSubmissionFaulted = true;
+    if (fRecovering || !fRecover || fRecoverTries >= kNvrmRecoverTries) return;
+    uint64_t deadline = 0; clock_interval_to_deadline(nvrmRecoverDelayMs(fRecoverTries), kMillisecondScale, &deadline);
+    scheduleCall(fRecover, deadline);
+}
+void NVRMNVDAFramebuffer::recoverFire(thread_call_param_t p0, thread_call_param_t)
+{
+    NVRMNVDAFramebuffer *me = (NVRMNVDAFramebuffer *)p0;
+    NVRMCallReference callReference(me);
+    if (OSAddAtomic(0, &me->fStopping) || !me->fRecover) return;
+    if (me->recoverHead()) return;
+    if (++me->fRecoverTries >= kNvrmRecoverTries) {
+        FBLOG("head %u: still blocked after %u tries to light it again -- until reboot", me->fHead, me->fRecoverTries);
+        return;
+    }
+    uint64_t deadline = 0; clock_interval_to_deadline(nvrmRecoverDelayMs(me->fRecoverTries), kMillisecondScale, &deadline);
+    me->scheduleCall(me->fRecover, deadline);
+}
+// The flip that blocked the head may have landed late; otherwise the current mode is set again on the driver's own surface,
+// which the accelerator's copies kept current. The surfaces of the stuck flip stay alive in the flip cache as before.
+bool NVRMNVDAFramebuffer::recoverHead()
+{
+    NVRMDisplayGate gate; if (!gate.valid()) return false;
+    NVRMHeadGate primary(startLock(), fPrimaryGate, true);
+    if (!primary.valid() || OSAddAtomic(0, &fStopping)) return false;
+    if (!fSubmissionFaulted) { fRecoverTries = 0; return true; }
+    if (!fKms || !fDev || !fSurf || !fModeSet || fHeadSlept || fConsoleAperture || !rmGpuReady()) return false;
+    NvBool pending = NV_TRUE;
+    if (fKms->getFlipPendingStatus(fDev, fHead, NVKMS_KAPI_LAYER_PRIMARY_IDX, &pending) && !pending) {
+        fSubmissionFaulted = false; fRecoverTries = 0;
+        FBLOG("head %u: the blocked flip landed after all -- presentation resumes", fHead);
+        return true;
+    }
+    struct NvKmsKapiRequestedModeSetConfig *cfg = (struct NvKmsKapiRequestedModeSetConfig *)IOMalloc(sizeof *cfg);
+    struct NvKmsKapiModeSetReplyConfig *rep = (struct NvKmsKapiModeSetReplyConfig *)IOMalloc(sizeof *rep);
+    if (!cfg || !rep) { if (cfg) IOFree(cfg, sizeof *cfg); if (rep) IOFree(rep, sizeof *rep); return false; }
+    nvu_zero(cfg, sizeof *cfg); nvu_zero(rep, sizeof *rep);
+    cfg->headsMask = 1u << fHead;
+    struct NvKmsKapiHeadRequestedConfig *hr = &cfg->headRequestedConfig[fHead];
+    nvrmHeadConfigBaseline(hr, fGammaOn && fGamma ? olutFromGamma() : NULL);
+    hr->modeSetConfig.bActive = NV_TRUE; hr->modeSetConfig.numDisplays = 1; hr->modeSetConfig.displays[0] = fDisplay; hr->modeSetConfig.mode = fMode;
+    hr->flags.activeChanged = hr->flags.displaysChanged = hr->flags.modeChanged = NV_TRUE;
+    struct NvKmsKapiLayerRequestedConfig *lr = &hr->layerRequestedConfig[NVKMS_KAPI_LAYER_PRIMARY_IDX];
+    lr->config.surface = fSurf; lr->config.srcWidth = (NvU16)fW; lr->config.srcHeight = (NvU16)fH;
+    lr->config.dstWidth = (NvU16)fRasterW; lr->config.dstHeight = (NvU16)fRasterH;
+    lr->config.compParams.compMode = NVKMS_COMPOSITION_BLENDING_MODE_OPAQUE; lr->config.minPresentInterval = 1;
+    lr->flags.surfaceChanged = lr->flags.srcXYChanged = lr->flags.srcWHChanged = lr->flags.dstXYChanged = lr->flags.dstWHChanged = NV_TRUE;
+    fSubmissionFaulted = false; fSubmissionSeen = false; fRecovering = true;
+    const NvBool ok = submitConfig(cfg, rep, NV_TRUE);
+    fRecovering = false;
+    IOFree(cfg, sizeof *cfg); IOFree(rep, sizeof *rep);
+    if (ok) {
+        FBLOG("head %u: lit again on its own surface after a blocked flip (try %u) -- presentation resumes", fHead, fRecoverTries + 1);
+        fFrontSurf = fSurf; fFrontL10r = false; fRecoverTries = 0;
+        return true;
+    }
+    fSubmissionFaulted = true;
+    FBLOG("head %u: lighting it again after a blocked flip failed (try %u)", fHead, fRecoverTries + 1);
+    return false;
+}
 NvBool NVRMNVDAFramebuffer::submitConfig(struct NvKmsKapiRequestedModeSetConfig *cfg,
                                             struct NvKmsKapiModeSetReplyConfig *rep, NvBool commit, bool bootstrap,
                                             bool cursorOnly, bool frame)
@@ -2498,8 +2568,7 @@ NvBool NVRMNVDAFramebuffer::submitConfig(struct NvKmsKapiRequestedModeSetConfig 
         int prior = priorFlipState();
         while (prior == kPriorLate && !frame) prior = priorFlipState();
         if (prior == kPriorStuck) {
-            flipFaultLog("prior completion unavailable");
-            fSubmissionFaulted = true; return NV_FALSE;
+            submissionFault("prior completion unavailable"); return NV_FALSE;
         }
         if (prior == kPriorLate) {
             OSIncrementAtomic((volatile SInt32 *)&gFlipLatchLate);
@@ -2590,8 +2659,7 @@ NvBool NVRMNVDAFramebuffer::submitConfig(struct NvKmsKapiRequestedModeSetConfig 
         uint64_t ns = 0; absolutetime_to_nanoseconds(mach_absolute_time() - submit0, &ns);
         if (ns / 1000 >= kFlipStuckUs) break;
     }
-    flipFaultLog("submitted completion unavailable");
-    fSubmissionFaulted = true; return NV_FALSE;
+    submissionFault("submitted completion unavailable"); return NV_FALSE;
 }
 
 void NVRMNVDAFramebuffer::sampleFire(thread_call_param_t p0, thread_call_param_t)
@@ -3513,6 +3581,7 @@ bool NVRMNVDAFramebuffer::start(IOService *provider)
     FBLOG("hw vblank on head %u: %s", fHead, !hwvblArg ? "OFF (boot-arg nvhwvbl=0) - the timer is the VBL"
                                        : fHwVblWanted ? "deferred until NVKMS latches a flip on this head" : "not available - the timer stays the VBL");
     fReflip = nvrmfbCall(reflipFire, this);
+    fRecover = nvrmfbCall(recoverFire, this);
     fGpuWake = nvrmfbCall(gpuWakeFire, this);
     FBLOG("reflip keep-alive NOT armed: enableController's modeset owns the head, no boot-time re-syncs");
     fBars = nvrmfbCall(barsFire, this);
@@ -3578,7 +3647,7 @@ void NVRMNVDAFramebuffer::stop(IOService *provider)
         if (sl) IORecursiveLockUnlock(sl);
         if (mine) release();
     }
-    thread_call_t *calls[] = {&fHwVblCall, &fReflip, &fGpuWake, &fBars, &fVblTimer, &fSampler, &fHeadProbe, &fCursorCall, &fConnectNotify, &fAudioCall};
+    thread_call_t *calls[] = {&fHwVblCall, &fReflip, &fRecover, &fGpuWake, &fBars, &fVblTimer, &fSampler, &fHeadProbe, &fCursorCall, &fConnectNotify, &fAudioCall};
     for (unsigned i = 0; i < sizeof calls / sizeof calls[0]; ++i) {
         thread_call_t call = *calls[i];
         if (!call) continue;
@@ -4992,7 +5061,7 @@ SYSCTL_QUAD(_debug, OID_AUTO, nvrmfb_flip_us_sum, CTLFLAG_RD | CTLFLAG_LOCKED, (
 SYSCTL_QUAD(_debug, OID_AUTO, nvrmfb_flip_n, CTLFLAG_RD | CTLFLAG_LOCKED, (SInt64 *)&gFlipN, "pure flips timed");
 SYSCTL_QUAD(_debug, OID_AUTO, nvrmfb_flip_us_max, CTLFLAG_RD | CTLFLAG_LOCKED, (SInt64 *)&gFlipUsMax, "the slowest pure flip, us");
 static bool gFbSysctl = false;
-void nvrmfbColorChanged(bool needsModeset);
+bool nvrmfbColorChanged(bool needsModeset);
 static int nvrmfbColorSysctl SYSCTL_HANDLER_ARGS
 {
     int v = *(int *)arg1;
@@ -5002,8 +5071,16 @@ static int nvrmfbColorSysctl SYSCTL_HANDLER_ARGS
     if ((which == 0 && !(v >= 0 && nvrmColorBpcValid((unsigned)v))) || (which == 1 && !(v >= 0 && nvrmColorFormatValid((unsigned)v))) ||
         (which == 2 && !(v >= 0 && nvrmColorRangeValid((unsigned)v))) || (which == 3 && (v < -100 || v > 100))) return EINVAL;
     if (v == *(int *)arg1) return 0;
+    const int was = *(int *)arg1;
     *(int *)arg1 = v;
-    nvrmfbColorChanged(which != 3);
+    if (!nvrmfbColorChanged(which != 3)) {
+        // NVKMS refused a lit head with the new setting (a colour format that needs another range, a depth the link cannot
+        // carry): the setting goes back and the head is lit again as it was, instead of staying on a refused request
+        *(int *)arg1 = was;
+        (void)nvrmfbColorChanged(which != 3);
+        IOLog("NVRM-fb: colour control %d: %d refused on a lit head, back to %d\n", which, v, was);
+        return EINVAL;
+    }
     return 0;
 }
 SYSCTL_PROC(_debug, OID_AUTO, nvrmfb_color_bpc, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, &gColorBpc, 0, nvrmfbColorSysctl, "I", "output bits per channel: 0 automatic, 6, 8, 10, 12");
@@ -5369,8 +5446,7 @@ bool NVRMNVDAFramebuffer::flipToMemory(struct NvKmsKapiMemory *mem, unsigned w, 
             const int prior = priorFlipState();
             if (prior != kPriorDone) {
                 if (prior == kPriorStuck) {
-                    flipFaultLog("prior completion unavailable (surface reuse)");
-                    fSubmissionFaulted = true;
+                    submissionFault("prior completion unavailable (surface reuse)");
                 }
                 if (prior == kPriorLate) OSIncrementAtomic((volatile SInt32 *)&gFlipLatchLate);
                 if (rcOut) *rcOut = prior == kPriorLate ? (int)NV_KMS_FLIP_RESULT_IN_PROGRESS : -1;
@@ -5602,14 +5678,18 @@ bool NVRMNVDAFramebuffer::applyVibrance()
     IOFree(cfg, sizeof *cfg); IOFree(rep, sizeof *rep);
     return ok;
 }
-void nvrmfbColorChanged(bool needsModeset)
+bool nvrmfbColorChanged(bool needsModeset)
 {
+    bool ok = true;
     for (unsigned i = 0; i < 16; i++) {
         NVRMNVDAFramebuffer *fb = gFBs[i];
         if (!fb) continue;
         // bpc, format and range need a mode set: the head is lit again with the new settings. Vibrance does not.
-        if (needsModeset) (void)fb->reflip(); else (void)fb->applyVibrance();
+        // Only a lit head's refusal counts: an output with nothing on it has no mode to set.
+        const bool lit = fb->fModeSet && fb->fSurf && !fb->fHeadSlept && !fb->fConsoleAperture;
+        if (needsModeset) { if (!fb->reflip() && lit) ok = false; } else (void)fb->applyVibrance();
     }
+    return ok;
 }
 IOReturn NVRMNVDAFramebuffer::getAttribute(IOSelect attribute, uintptr_t *value)
 {
