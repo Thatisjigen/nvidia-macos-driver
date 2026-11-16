@@ -216,6 +216,34 @@ in the plugin log. The plugin can offer a device or not; it cannot list a device
 process sent to the low-power GPU does not see the NVIDIA device in `MTLCopyAllDevices` either. That is why the default is
 `mode nvidia`. WindowServer is never offered the device when the NVIDIA GPU is headless (unchanged).
 
+### Without the switch, when the integrated GPU drives the panel itself
+
+When macOS drives the integrated GPU and its displays with a driver of its own (an Intel GPU through its framebuffer, the
+NVIDIA GPU on the HDMI port only), the plugin works as Apple's two-GPU Macs do: the integrated GPU is the default, the
+NVIDIA GPU is the high-performance one. It applies as soon as a display hangs off a framebuffer that is not NVIDIA's, with no
+boot-arg:
+
+- every app is offered the NVIDIA device, listed as not low-power, so an app that picks the more capable GPU or the GPU of
+  the display its window is on gets it; the default device stays the GPU of the main display;
+- the system services that work for the apps keep it too: WindowServer, WebKit's GPU process, the video decode and encode
+  services, the Aerial wallpaper and its preview in Settings > Displays;
+- the rest of macOS's own processes (Finder, the Dock, Spotlight, the login window...) are not offered it and draw on the
+  integrated GPU, instead of each holding a Vulkan device on the NVIDIA GPU;
+- macOS's per-app choice (`GPUSelectionPolicy`) works for it as for an external GPU: in an app set to `preferRemovable` the
+  plugin reports the GPU as removable, so Metal makes it the app's default device; `avoidRemovable` keeps it from the app
+  altogether. Every other process sees a fixed GPU. That choice comes from the user's preferences, by bundle identifier (an
+  app's helper processes take their app's), from the app's Info.plist, or from Finder's "Prefer External GPU":
+
+      defaults write com.apple.gpu gpu-policies -dict-add org.blenderfoundation.blender '{ GPUSelectionPolicy = preferRemovable; }'
+
+  It applies from the app's next launch. WindowServer and the eject menu are never told the GPU is removable;
+  `NVMTL_REMOVABLE=0` in `nvrm610.conf` keeps it fixed everywhere.
+
+The policy file still comes first: its per-process lines (a process name or a bundle identifier) beat the app's choice,
+`mode nvidia` offers the device to every process as before, `mode apple` applies Apple's rule above, `mode auto` is the
+default described here. Each process writes one line to the system log, `NullMoth: gpu: <process> gets the NVIDIA GPU
+(<reason>)` or `does not get`.
+
 Apple's System Settings "automatic graphics switching" checkbox and the Activity Monitor GPU column come from Apple's
 graphics-control kexts, which a PC laptop does not have, so they do not appear; the policy file is the replacement. A
 per-process GPU-time figure is not published by the accelerator and is an open feature item.
