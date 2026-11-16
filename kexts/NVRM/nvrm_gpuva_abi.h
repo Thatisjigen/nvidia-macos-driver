@@ -27,6 +27,10 @@ struct NVRMDisplayPointers {
 #define NVRM_FLIP_ABI_VERSION 2u
 
 #define NVRM_FLIP_FN  "nvFlipToSurface"
+// NVRMFlipRequest.flags: 0x1 back to the framebuffer's own surface (nvFlipToSurfacePure); 0x2 the surface is l10r (10-bit,
+// red in the high bits), sent only to a framebuffer whose "NVRMFBFlipL10R" property is true.
+#define NVRM_FLIP_FLAG_HOME 0x1u
+#define NVRM_FLIP_FLAG_L10R 0x2u
 
 struct NVRMFlipRequest {
     unsigned int version;

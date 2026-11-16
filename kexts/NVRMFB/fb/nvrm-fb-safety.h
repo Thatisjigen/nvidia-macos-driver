@@ -226,6 +226,15 @@ enum { kNvrmDepth8 = 0x2, kNvrmDepth10 = 0x4, kNvrmDepth12 = 0x8 };
 // an HDR10 mode has a 30-bit scanout here, so an SDR timing above 8 bits is refused and macOS installs the 8-bit one, as
 // it did while the range listed 8 bits alone.
 static inline bool nvrmTimingDepthOk(unsigned depth, bool hdr10) { return hdr10 || depth <= kNvrmDepth8; }
+// ---- 30-bit scan-out of l10r ----
+// macOS's 10-bit surfaces (l10r, Metal BGR10A2) hold red in bits 20-29 and blue in bits 0-9; NVKMS's 10-bit layouts
+// (X2B10G10R10) read red from bits 0-9. The layer's FMT matrix, S15.16 rows in R, G, B order applied to what the window read,
+// puts each channel back: red from what was read as blue, blue from what was read as red.
+static inline void nvrmL10rSwapMatrix(int m[3][4])
+{
+    for (int r = 0; r < 3; r++) for (int c = 0; c < 4; c++) m[r][c] = 0;
+    m[0][2] = 0x10000; m[1][1] = 0x10000; m[2][0] = 0x10000;
+}
 // IOGraphics' HDR10 bit, the same value in a timing range (kIORangeDynamicRangeHDR10) and in a detailed timing
 // (kIODynamicRangeHDR10).
 enum { kNvrmDynamicRangeHDR10 = 0x2 };

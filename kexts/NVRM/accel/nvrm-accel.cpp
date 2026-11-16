@@ -1760,6 +1760,12 @@ static int    gIopFlip = 0;
 static SInt64 gCntIopFlip, gCntIopFlipHome, gCntIopFlipNo[8];
 SYSCTL_INT(_debug, OID_AUTO, nvaccel_iop_flip, CTLFLAG_RW | CTLFLAG_LOCKED | CTLFLAG_KERN, &gIopFlip, 0, "1 = scan the composited IOSurface out of its own VRAM (no copy)");
 NVACCEL_CNT(nvaccel_iop_flips,        gCntIopFlip,        "frames scanned out of the surface's own VRAM (zero copy)");
+// 10-bit surfaces (l10r) go to the same direct flip where the framebuffer says it can scan them out (NVRMFBFlipL10R);
+// 0 sends them back to the copy, which narrows or swaps them into the scan-out
+static int    gIopFlip30 = 1;
+static SInt64 gCntIopFlip30;
+SYSCTL_INT(_debug, OID_AUTO, nvaccel_iop_flip30, CTLFLAG_RW | CTLFLAG_LOCKED | CTLFLAG_KERN, &gIopFlip30, 0, "1 = scan 10-bit l10r surfaces out directly where the framebuffer can; 0 = copy them");
+NVACCEL_CNT(nvaccel_iop_flip30_frames, gCntIopFlip30,     "l10r frames sent to a direct flip");
 NVACCEL_CNT(nvaccel_iop_flip_home,    gCntIopFlipHome,    "flips back to the boot scanout before a copied frame");
 NVACCEL_CNT(nvaccel_iop_flip_lock,    gCntIopFlipNo[3],   "copied because the accelerator lock was busy");
 NVACCEL_CNT(nvaccel_iop_flip_novram,  gCntIopFlipNo[4],   "copied because the surface has no RM VRAM");
@@ -1955,6 +1961,7 @@ static void nvaccelInstallSysctl(void)
     sysctl_register_oid(&sysctl__debug_nvaccel_iop_src_res);    sysctl_register_oid(&sysctl__debug_nvaccel_iop_src_surf); sysctl_register_oid(&sysctl__debug_nvaccel_iop_l10r); sysctl_register_oid(&sysctl__debug_nvaccel_iop_30bit); sysctl_register_oid(&sysctl__debug_nvaccel_iop_half);
     sysctl_register_oid(&sysctl__debug_nvaccel_iop_blank);      sysctl_register_oid(&sysctl__debug_nvaccel_iop_copy_skip);
     sysctl_register_oid(&sysctl__debug_nvaccel_iop_flip);       sysctl_register_oid(&sysctl__debug_nvaccel_iop_flips);
+    sysctl_register_oid(&sysctl__debug_nvaccel_iop_flip30);     sysctl_register_oid(&sysctl__debug_nvaccel_iop_flip30_frames);
     sysctl_register_oid(&sysctl__debug_nvaccel_iop_flip_home);  sysctl_register_oid(&sysctl__debug_nvaccel_iop_flip_lock);
     sysctl_register_oid(&sysctl__debug_nvaccel_iop_flip_novram); sysctl_register_oid(&sysctl__debug_nvaccel_iop_flip_stale);
     sysctl_register_oid(&sysctl__debug_nvaccel_iop_flip_unwritten); sysctl_register_oid(&sysctl__debug_nvaccel_iop_copy_unwritten);
@@ -2698,7 +2705,10 @@ static bool nvAccelIopFlip(IOService *fb, unsigned head, IOSurface *s, void *pip
     if (!fb->metaCast("NVRMNVDAFramebuffer")) return false;
     NVAccel *a = NVAccel::forDisplay();
     if (!a) return nvAccelIopFlipNo(1);
-    if (s->getPixelFormat() != 0x42475241u) return nvAccelIopFlipNo(2);
+    const unsigned pixFmt = s->getPixelFormat();
+    const bool l10r = pixFmt == NV_IOP_FMT_L10R;
+    if (pixFmt != 0x42475241u && !(l10r && gIopFlip30 && fb->getProperty("NVRMFBFlipL10R") == kOSBooleanTrue))
+        return nvAccelIopFlipNo(2);
     NVResource *res = nullptr; NVVidMemory *vm = nullptr; void *kmem = nullptr; unsigned long long bytes = 0;
     if (nvAccelIopCacheGet(s, &res, &vm, &kmem, &bytes)) {
         OSAddAtomic64(1, &gCntIopFlipHit);
@@ -2732,6 +2742,7 @@ static bool nvAccelIopFlip(IOService *fb, unsigned head, IOSurface *s, void *pip
     if (!W || !H || P < 4 * W || H * P > bytes) return nvAccelIopFlipNo(6);
     struct NVRMFlipRequest f; nvSVZero(&f, sizeof f);
     f.version = NVRM_FLIP_ABI_VERSION; f.kapiMemory = kmem; f.allocationCookie = vm->fAllocationCookie; f.width = (unsigned)W; f.height = (unsigned)H; f.pitch = (unsigned)P;
+    if (l10r) { f.flags |= NVRM_FLIP_FLAG_L10R; OSAddAtomic64(1, &gCntIopFlip30); }
     if (gIopAsync && pipe) return nvAccelIopAsyncStart(pipe, fb, head, s, &f);
     nvSurfWaitReady(s->getSurfaceID());
     const OSSymbol *sym = OSSymbol::withCStringNoCopy("nvFlipToSurfacePure");

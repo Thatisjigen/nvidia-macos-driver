@@ -169,6 +169,15 @@ static inline bool fbVerbose(void)
 #define FBLOGV(fmt, ...) do { if (fbVerbose()) { IOLog("NVRM-fb: " fmt "\n", ##__VA_ARGS__); kprintf("NVRM-fb: " fmt "\n", ##__VA_ARGS__); } \
     { char _tb[220]; snprintf(_tb, sizeof _tb, fmt, ##__VA_ARGS__); FBTRACE(_tb); } } while (0)
 static const char kPixelFormats[] = IO32BitDirectPixels "\0";
+// 30-bit depth (boot-arg nvfb30=0 turns it off). With only 32-bit depth offered, WindowServer composed every display of this
+// framebuffer in 8-bit BGRA, HDR10 included, while Apple's own framebuffers get 10-bit planes. Depth 1 is 30-bit, red in the
+// high bits as IOGraphics' IO30BitDirectPixels says: WindowServer then composes in l10r (Metal BGR10A2), which flipToMemory
+// scans out directly (nvrmL10rSwapMatrix).
+#ifndef IO30BitDirectPixels   // IOGraphicsTypes.h of the kernel SDK leaves it out
+#define IO30BitDirectPixels "--RRRRRRRRRRGGGGGGGGGGBBBBBBBBBB"
+#endif
+static const char kPixelFormats30[] = IO32BitDirectPixels "\0" IO30BitDirectPixels "\0";
+static bool g30Bit = true;
 static const UInt32 kNVRMFBSetTransform = 0x00000400;   // kIOFBSetTransform
 static const IODisplayModeID kModeId = 1;
 static const unsigned kTraceMax = 900;
@@ -755,15 +764,18 @@ class NVRMNVDAFramebuffer : public IOFramebuffer {
     uint64_t vblPeriodAbs();
     thread_call_t fBars = nullptr;
     struct NVFlipEntry { struct NvKmsKapiMemory *mem; struct NvKmsKapiSurface *surf;
-                         unsigned w, h, pitch; UInt64 epoch, cookie; struct NvKmsKapiMemory *pin; };
+                         unsigned w, h, pitch; UInt64 epoch, cookie; struct NvKmsKapiMemory *pin; bool l10r; };
+    IOIndex fDepth = 0;   // the depth WindowServer set with the mode: 0 = 32-bit, 1 = 30-bit (g30Bit)
     NVFlipEntry fFlipCache[16] = {};
     IOSimpleLock *fFlipCacheLock = nullptr;
     unsigned    fFlipCacheN = 0, fFlipCount = 0, fFlipRejects = 0, fFlipEvict = 0;
     struct NvKmsKapiSurface *fFrontSurf = nullptr;
     NVRMHeadGateState fPrimaryGate;
     static inline volatile SInt32 sFlipLatched[8] = {};
-    bool flipToMemory(struct NvKmsKapiMemory *mem, unsigned w, unsigned h, unsigned pitch, int *rcOut, bool pure = false, UInt64 cookie = 0);
+    bool flipToMemory(struct NvKmsKapiMemory *mem, unsigned w, unsigned h, unsigned pitch, int *rcOut, bool pure = false, UInt64 cookie = 0,
+                      bool l10r = false);
     bool fSubmissionSeen = false, fSubmissionFaulted = false;
+    bool fFrontL10r = false;   // the surface on the head is an l10r flip (FB swap in the FMT matrix)
     // When the tracked flip was committed, so a flip still pending can be told late (another period will do) from
     // stuck (kFlipStuckUs since its submit, the head is faulted).
     uint64_t fFlipSubmitAbs = 0;
@@ -860,7 +872,7 @@ public:
     }
     void free() override;
     IOReturn enableController() override;
-    const char *getPixelFormats() override { return kPixelFormats; }
+    const char *getPixelFormats() override { return !fProxy && g30Bit ? kPixelFormats30 : kPixelFormats; }
     // macOS builds its mode list from getDisplayModes BEFORE it calls setDetailedTimings, and never re-reads it: a
     // mode added only in setDetailedTimings never reached WindowServer (36 added, 0 shown). So the
     // display's native-raster modes at every refresh rate NVKMS validated are offered from the first query on.
@@ -2620,6 +2632,13 @@ void NVRMNVDAFramebuffer::sampleFire(thread_call_param_t p0, thread_call_param_t
     me->fSamples++;
     uint64_t deadline; clock_interval_to_deadline(10, kSecondScale, &deadline); me->scheduleCall(me->fSampler, deadline);
 }
+// The FMT override of the primary layer, named in the request: swap on for an l10r surface (nvrmL10rSwapMatrix), off otherwise
+static void nvrmLayerL10rSwap(struct NvKmsKapiLayerRequestedConfig *lr, bool l10r)
+{
+    nvrmL10rSwapMatrix(lr->config.matrixOverrides.fmtCtm.m);
+    lr->config.matrixOverrides.enabled.fmtCtm = l10r ? NV_TRUE : NV_FALSE;
+    lr->flags.matrixOverridesChanged = NV_TRUE;
+}
 bool NVRMNVDAFramebuffer::reflip()
 {
     NVRMDisplayGate gate; if (!gate.valid()) return false;
@@ -2643,6 +2662,7 @@ bool NVRMNVDAFramebuffer::reflip()
     hr->flags.activeChanged = hr->flags.displaysChanged = hr->flags.modeChanged = NV_TRUE;
     struct NvKmsKapiLayerRequestedConfig *lr = &hr->layerRequestedConfig[NVKMS_KAPI_LAYER_PRIMARY_IDX];
     lr->config.surface = front;
+    nvrmLayerL10rSwap(lr, front == fFrontSurf && fFrontL10r);   // a mode set takes the override from the request: keep the swap
     lr->config.srcWidth = (NvU16)fW; lr->config.srcHeight = (NvU16)fH;
     lr->config.dstWidth = (NvU16)fRasterW; lr->config.dstHeight = (NvU16)fRasterH;
     lr->config.compParams.compMode = NVKMS_COMPOSITION_BLENDING_MODE_OPAQUE;
@@ -3442,11 +3462,13 @@ bool NVRMNVDAFramebuffer::start(IOService *provider)
             gHdrOn = PE_parse_boot_argn("nvfbhdr", &v, sizeof v) && v;
             gRotScale = PE_parse_boot_argn("nvfbrotscale", &v, sizeof v) && v;
             gTenBit = PE_parse_boot_argn("nvfb10bit", &v, sizeof v) && v;
+            if (PE_parse_boot_argn("nvfb30", &v, sizeof v) && !v) { g30Bit = false; FBLOG("30-bit depth not offered (nvfb30=0): WindowServer composes in 8 bits"); }
             if (gHdrOn || gTenBit) FBLOG("%s%s", gTenBit ? "10-bit scanout on mode changes (nvfb10bit=1) " : "", gHdrOn ? "HDR10 advertised for PQ displays (nvfbhdr=1)" : "");
             if (gColorBpc || gColorFormat != 3 || gColorRange || gVibrance)
                 FBLOG("colour controls: bpc %d format %d range %d vibrance %d", gColorBpc, gColorFormat, gColorRange, gVibrance); } }
     bool kapiOk = kapiInit();
     if (!kapiOk && fOwnsHead) { gHeadsTaken &= ~(1u << fHead); fOwnsHead = false; }
+    if (kapiOk) setProperty("NVRMFBFlipL10R", g30Bit && !fProxy ? kOSBooleanTrue : kOSBooleanFalse);   // NVAccel flips l10r here
     IORecursiveLockUnlock(sl);
     if (!kapiOk) {
         // nvfbheads=4 starts four framebuffer instances; the ones past the connected displays have nothing to drive and
@@ -3752,7 +3774,7 @@ IOReturn NVRMNVDAFramebuffer::setDisplayMode(IODisplayModeID mode, IOIndex depth
         return kIOReturnTimeout;
     }
     fNewIdOnce = 0;
-    if (depth != 0) return kIOReturnUnsupportedMode;
+    if (depth < 0 || depth > (g30Bit && !fProxy ? 1 : 0)) return kIOReturnUnsupportedMode;
     IOReturn result;
     if ((mode >> 16) == 4 && fSurN) {
         result = dtIndex(mode) >= 0 ? switchSurround(mode) : kIOReturnUnsupportedMode;
@@ -3798,7 +3820,7 @@ IOReturn NVRMNVDAFramebuffer::setDisplayMode(IODisplayModeID mode, IOIndex depth
             }
         }
     }
-    if (result == kIOReturnSuccess) refreshDisplayAudioProperties();
+    if (result == kIOReturnSuccess) { fDepth = depth; refreshDisplayAudioProperties(); }
     return result;
 }
 // The timing on the head, as the AGDC object reads it to answer macOS's link questions (NVRMAGDC, "NVRMTiming")
@@ -3824,7 +3846,7 @@ IOReturn NVRMNVDAFramebuffer::getCurrentDisplayMode(IODisplayModeID *mode, IOInd
     const UInt32 once = fNewIdOnce;
     if (once && OSCompareAndSwap(once, 0, &fNewIdOnce)) id = (IODisplayModeID)once;
     if (mode) *mode = id;
-    if (depth) *depth = 0;
+    if (depth) *depth = fDepth;
     return kIOReturnSuccess;
 }
 void NVRMNVDAFramebuffer::publishRotatedSizes(bool force)
@@ -4188,6 +4210,7 @@ IOReturn NVRMNVDAFramebuffer::switchMode(IODisplayModeID id, const struct NvKmsK
         hr->flags.activeChanged = hr->flags.displaysChanged = hr->flags.modeChanged = NV_TRUE;
         struct NvKmsKapiLayerRequestedConfig *lr = &hr->layerRequestedConfig[NVKMS_KAPI_LAYER_PRIMARY_IDX];
         lr->config.surface = shown; lr->config.srcWidth = (NvU16)w; lr->config.srcHeight = (NvU16)h;
+        nvrmLayerL10rSwap(lr, keepFront && fFrontL10r);
         lr->config.dstWidth = (NvU16)m.timings.hVisible; lr->config.dstHeight = (NvU16)m.timings.vVisible;
         lr->config.compParams.compMode = NVKMS_COMPOSITION_BLENDING_MODE_OPAQUE; lr->config.minPresentInterval = 1;
         lr->flags.surfaceChanged = lr->flags.srcXYChanged = lr->flags.srcWHChanged = lr->flags.dstXYChanged = lr->flags.dstWHChanged = NV_TRUE;
@@ -4211,6 +4234,7 @@ IOReturn NVRMNVDAFramebuffer::switchMode(IODisplayModeID id, const struct NvKmsK
     }
     struct NvKmsKapiSurface *old = fSurf;
     fScan30 = ten;
+    fFrontL10r = keepFront && fFrontL10r;
     fSurf = ns; fFrontSurf = shown; fMode = m; fW = w; fH = h; fPitch = pitch;
     fRasterW = m.timings.hVisible; fRasterH = m.timings.vVisible; fCurId = id; fModeSet = true; fModeSwitches++;
     // ANV15-52: the committed mode lit the head. A flag left set (the wake failed, then
@@ -4284,7 +4308,7 @@ IOReturn NVRMNVDAFramebuffer::validateDetailedTiming(void *description, IOByteCo
         IODisplayModeInformation *info = &((IOFBDisplayModeDescription *)description)->info;
         const bool scaled = d->horizontalScaled && d->verticalScaled;
         const UInt64 tot = (UInt64)(d->horizontalActive + d->horizontalBlanking) * (d->verticalActive + d->verticalBlanking);
-        info->maxDepthIndex = 0;
+        info->maxDepthIndex = g30Bit ? 1 : 0;   // 30-bit as depth 1 (kPixelFormats30)
         info->nominalWidth = scaled ? d->horizontalScaled : d->horizontalActive;
         info->nominalHeight = scaled ? d->verticalScaled : d->verticalActive;
         info->refreshRate = tot ? (UInt32)((d->pixelClock << 16) / tot) : 0;
@@ -4480,7 +4504,7 @@ IOReturn NVRMNVDAFramebuffer::switchSurround(IODisplayModeID id)
     IOFree(cfg, sizeof *cfg); IOFree(rep, sizeof *rep);
     if (!ok) { if (!fSubmissionFaulted) fKms->destroySurface(fDev, ns); return kIOReturnUnsupportedMode; }
     struct NvKmsKapiSurface *old = fSurf;
-    fSurf = ns; fFrontSurf = ns; fSurActive = true; fMode = fSur[0].mode; fW = w; fH = h; fPitch = pitch;
+    fSurf = ns; fFrontSurf = ns; fFrontL10r = false; fSurActive = true; fMode = fSur[0].mode; fW = w; fH = h; fPitch = pitch;
     fRasterW = w; fRasterH = h; fCurId = id; fModeSet = true; fModeSwitches++; fCurShownKnown = false;
     publishFlipWait(); fHwVblTries = 0; fCurTransform = 0;
     if (old && old != ns) fKms->destroySurface(fDev, old);
@@ -4733,7 +4757,7 @@ IOReturn NVRMNVDAFramebuffer::getInformationForDisplayMode(IODisplayModeID mode,
         NvU32 rw = 0, rh = 0; dtRasterTurned(&d, &rw, &rh);
         const bool scaled = d.horizontalScaled && d.verticalScaled && !(d.horizontalScaled == rw && d.verticalScaled == rh);
         info->refreshRate = tot ? (UInt32)((d.pixelClock << 16) / tot) : (60u << 16);
-        info->maxDepthIndex = 0;
+        info->maxDepthIndex = g30Bit ? 1 : 0;
         // without ValidForHiRes, scaled modes stay out of the public mode list and HiDPI "looks like" sizes never show (#354)
         info->flags = kDisplayModeValidFlag | kDisplayModeSafeFlag | kDisplayModeAcceleratorBackedFlag
             | (scaled ? kDisplayModeNotPresetFlag | kDisplayModeValidForHiResFlag : 0);
@@ -4743,7 +4767,7 @@ IOReturn NVRMNVDAFramebuffer::getInformationForDisplayMode(IODisplayModeID mode,
         return kIOReturnSuccess;
     }
     nvu_zero(info, sizeof *info);
-    info->nominalWidth = fBootW ? fBootW : fW; info->nominalHeight = fBootH ? fBootH : fH; info->maxDepthIndex = 0;
+    info->nominalWidth = fBootW ? fBootW : fW; info->nominalHeight = fBootH ? fBootH : fH; info->maxDepthIndex = g30Bit ? 1 : 0;
     const NvU32 rr = fBootW ? fBootMode.timings.refreshRate : fMode.timings.refreshRate;
     info->refreshRate = rr ? (UInt32)(((UInt64)rr << 16) / 1000) : (60u << 16);
     info->flags = kDisplayModeValidFlag | kDisplayModeSafeFlag | kDisplayModeDefaultFlag | kDisplayModeAcceleratorBackedFlag;
@@ -4798,7 +4822,7 @@ IOReturn NVRMNVDAFramebuffer::getTimingInfoForDisplayMode(IODisplayModeID mode, 
 }
 IOReturn NVRMNVDAFramebuffer::getPixelInformation(IODisplayModeID mode, IOIndex depth, IOPixelAperture aperture, IOPixelInformation *pi)
 {
-    if (depth != 0 || aperture != kIOFBSystemAperture || !pi) return kIOReturnUnsupportedMode;
+    if (depth < 0 || depth > (g30Bit && !fProxy ? 1 : 0) || aperture != kIOFBSystemAperture || !pi) return kIOReturnUnsupportedMode;
     if (fProxy) {
         if (mode != kModeId) return kIOReturnUnsupportedMode;
         nvu_zero(pi, sizeof *pi);
@@ -4820,6 +4844,11 @@ IOReturn NVRMNVDAFramebuffer::getPixelInformation(IODisplayModeID mode, IOIndex 
     pi->bitsPerPixel = 32; pi->pixelType = kIORGBDirectPixels; pi->componentCount = 3; pi->bitsPerComponent = 8;
     pi->componentMasks[0] = 0x00ff0000; pi->componentMasks[1] = 0x0000ff00; pi->componentMasks[2] = 0x000000ff;
     strlcpy(pi->pixelFormat, IO32BitDirectPixels, sizeof pi->pixelFormat);
+    if (depth == 1) {   // 30-bit: --RRRRRRRRRRGGGGGGGGGGBBBBBBBBBB, the layout of l10r
+        pi->bitsPerComponent = 10;
+        pi->componentMasks[0] = 0x3ff00000; pi->componentMasks[1] = 0x000ffc00; pi->componentMasks[2] = 0x000003ff;
+        strlcpy(pi->pixelFormat, IO30BitDirectPixels, sizeof pi->pixelFormat);
+    }
     pi->flags = 0;
     FBLOGV("getPixelInformation 0x%x ap %d -> %ux%u bytesPerRow %u", (unsigned)mode, (int)aperture, pw, ph, pp);
     return kIOReturnSuccess;
@@ -5257,7 +5286,8 @@ IOReturn NVRMNVDAFramebuffer::callPlatformFunction(const OSSymbol *functionName,
         const bool pureHome = home && fModeSet;
         if (pureHome) { fHomePure++; if (fHomePure <= 4) FBLOG("home flip #%u: pure (head %u already lit, no modeset)", fHomePure, fHead); }
         bool ok = flipToMemory(home ? nullptr : (struct NvKmsKapiMemory *)f->kapiMemory,
-                               f->width, f->height, f->pitch, &rc, !home || pureHome, f->allocationCookie);
+                               f->width, f->height, f->pitch, &rc, !home || pureHome, f->allocationCookie,
+                               !home && (f->flags & NVRM_FLIP_FLAG_L10R) != 0);
         f->flipResult = rc;
         // Busy: the previous flip is still on its way to the panel; the caller keeps its frame and presents the next.
         return ok ? kIOReturnSuccess : rc == (int)NV_KMS_FLIP_RESULT_IN_PROGRESS ? kIOReturnBusy : (fHeadSlept || !rmGpuReady()) ? kIOReturnNotReady : kIOReturnIOError;
@@ -5267,7 +5297,7 @@ IOReturn NVRMNVDAFramebuffer::callPlatformFunction(const OSSymbol *functionName,
         if (!f || f->version != NVRM_FLIP_ABI_VERSION) return kIOReturnBadArgument;
         int rc = -1;
         bool ok = flipToMemory((struct NvKmsKapiMemory *)f->kapiMemory,
-                               f->width, f->height, f->pitch, &rc, false, f->allocationCookie);
+                               f->width, f->height, f->pitch, &rc, false, f->allocationCookie, (f->flags & NVRM_FLIP_FLAG_L10R) != 0);
         f->flipResult = rc;
         return ok ? kIOReturnSuccess : rc == (int)NV_KMS_FLIP_RESULT_IN_PROGRESS ? kIOReturnBusy : (fHeadSlept || !rmGpuReady()) ? kIOReturnNotReady : kIOReturnIOError;
     }
@@ -5287,8 +5317,9 @@ IOReturn NVRMNVDAFramebuffer::callPlatformFunction(const OSSymbol *functionName,
 }
 
 bool NVRMNVDAFramebuffer::flipToMemory(struct NvKmsKapiMemory *mem, unsigned w, unsigned h,
-                                   unsigned pitch, int *rcOut, bool pure, UInt64 cookie)
+                                   unsigned pitch, int *rcOut, bool pure, UInt64 cookie, bool l10r)
 {
+    if (!mem || !g30Bit) l10r = false;
     NVRMDisplayGate gate; if (!gate.valid() || fSubmissionFaulted) return false;
     retain();
     NVRMCallReference callReference(this);
@@ -5320,7 +5351,8 @@ bool NVRMNVDAFramebuffer::flipToMemory(struct NvKmsKapiMemory *mem, unsigned w, 
         // change. Requiring the current epoch makes a reused address always take a fresh surface.
         for (unsigned i = 0; i < fFlipCacheN; i++)
             if (fFlipCache[i].epoch == epoch && fFlipCache[i].cookie == cookie && fFlipCache[i].mem == mem &&
-                fFlipCache[i].pitch == pitch && fFlipCache[i].w == w && fFlipCache[i].h == h) { surf = fFlipCache[i].surf; break; }
+                fFlipCache[i].pitch == pitch && fFlipCache[i].w == w && fFlipCache[i].h == h && fFlipCache[i].l10r == l10r) {
+                surf = fFlipCache[i].surf; break; }
         IOSimpleLockUnlockEnableInterrupt(fFlipCacheLock, state);
     }
     if (!surf) {
@@ -5352,11 +5384,13 @@ bool NVRMNVDAFramebuffer::flipToMemory(struct NvKmsKapiMemory *mem, unsigned w, 
         if (!pin) return false;
         struct NvKmsKapiCreateSurfaceParams sp = {};
         sp.planes[0].memory = pin; sp.planes[0].offset = 0; sp.planes[0].pitch = pitch;
-        sp.width = w; sp.height = h; sp.format = NvKmsSurfaceMemoryFormatX8R8G8B8;
+        // l10r holds red in the high bits; NVKMS's only 10-bit layouts hold it in the low bits: the layer's FMT matrix swaps
+        // red and blue back (nvrmL10rSwapMatrix, set below on every flip)
+        sp.width = w; sp.height = h; sp.format = l10r ? NvKmsSurfaceMemoryFormatX2B10G10R10 : NvKmsSurfaceMemoryFormatX8R8G8B8;
         surf = fKms->createSurface(fDev, &sp);
         if (!surf) { fKms->freeMemory(fDev, pin); return false; }
         entry.mem = mem; entry.surf = surf; entry.pin = pin; entry.cookie = cookie; entry.epoch = epoch;
-        entry.w = w; entry.h = h; entry.pitch = pitch;
+        entry.w = w; entry.h = h; entry.pitch = pitch; entry.l10r = l10r;
         if (slot >= fFlipCacheN) fFlipCacheN = slot + 1;
     }
     struct NvKmsKapiRequestedModeSetConfig *cfg =
@@ -5386,6 +5420,8 @@ bool NVRMNVDAFramebuffer::flipToMemory(struct NvKmsKapiMemory *mem, unsigned w, 
     lr->config.minPresentInterval = pure ? (NvU8)(gFlipInterval < 0 ? 0 : gFlipInterval > 4 ? 4 : gFlipInterval) : 0;
     lr->config.tearing = NV_FALSE;
     lr->flags.surfaceChanged = NV_TRUE;
+    // every flip says whether the FMT swap is on: KAPI keeps the last override until a flip names it again
+    nvrmLayerL10rSwap(lr, l10r);
     if (!lean)
         lr->flags.srcXYChanged = lr->flags.srcWHChanged = lr->flags.dstXYChanged = lr->flags.dstWHChanged = NV_TRUE;
     const uint64_t ft0 = mach_absolute_time();
@@ -5398,7 +5434,7 @@ bool NVRMNVDAFramebuffer::flipToMemory(struct NvKmsKapiMemory *mem, unsigned w, 
     IOFree(cfg, sizeof *cfg); IOFree(rep, sizeof *rep);
     if (rcOut) *rcOut = rc;
     const bool accepted = ok && rc == NV_KMS_FLIP_RESULT_SUCCESS;
-    if (accepted) fFrontSurf = surf;
+    if (accepted) { fFrontSurf = surf; fFrontL10r = l10r; }
     fFlipCount++;
     if (fFlipCount <= 8 || (fFlipCount % 600) == 0)
         FBLOG("flipToMemory #%u -> ok %u rc %d (surface %s memory %s)",
