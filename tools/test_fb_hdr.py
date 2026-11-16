@@ -14,7 +14,7 @@ acc = (root / 'kexts/NVRM/accel/nvrm-accel.cpp').read_text()
 for need in ['r.supportedDynamicRangeModes |= kIORangeDynamicRangeHDR10', 'if (gHdrOn && fHdrCapable) {',
              '(d.dynamicRange == kIODynamicRangeHDR10) == fHdrActive', 'NvKmsSurfaceMemoryFormatX2B10G10R10',
              'r->flags = fScan30 ? NVRM_VRAM_SCANOUT_30BIT : 0;', 'mc.hdrInfoFrame.eotf = NVKMS_INFOFRAME_EOTF_ST2084',
-             'mc.colorimetry = NVKMS_OUTPUT_COLORIMETRY_BT2100', 'mc.olut.enabled = NV_FALSE',
+             'mc.colorimetry = gHdrBt2020 ? NVKMS_OUTPUT_COLORIMETRY_BT2100 : NVKMS_OUTPUT_COLORIMETRY_DEFAULT', 'mc.olut.enabled = NV_FALSE',
              'attribute == kIOFBHDRMetaDataAttribute', 'PE_parse_boot_argn("nvfbhdr"', 'PE_parse_boot_argn("nvfb10bit"']:
     assert need in fb, 'missing in NVRMFB: ' + need
 # NVKMS 620 refuses any request with colour passthrough unless the display HAL has supportsColorPassthrough, which only

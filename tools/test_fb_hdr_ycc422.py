@@ -20,7 +20,7 @@ assert 'if (fHdr422TmdsMHz) {' in hdr_range and 'r.supportedPixelEncoding |= kIO
 assert 'kIORangePixelEncodingYCbCr422' not in caps[:caps.index('if (gHdrOn && fHdrCapable) {')], '4:2:2 offered without HDR10'
 assert 'fHdr422TmdsMHz = nvrmEdidHdmi422TmdsMHz(fEdid, fEdidSize);' in body('void NVRMNVDAFramebuffer::takeEdid(')
 assert 'fYccWant = fHdrWant && nvrmHdr422Needed(dt.pixelClock, fHdr422TmdsMHz);' in fb
-assert 'if (fYccActive && (NvU32)gColorFormat == kNvrmColorFormatAuto) nvrmSetColorFormat(&mc, kNvrmColorFormatYCbCr422, 0);' in fb
+assert "if (fYccActive && !rgb8 && (NvU32)gColorFormat == kNvrmColorFormatAuto) nvrmSetColorFormat(&mc, kNvrmColorFormatYCbCr422, 0);" in fb   # RGB 8 first (nvrmHdrRgb8)
 switch = body('IOReturn NVRMNVDAFramebuffer::switchMode(')
 assert 'fHdrActive = fHdrWant; fYccActive = fYccWant;' in switch
 assert switch.count('fYccActive = yccBefore;') == 2, 'a failed mode set leaves the head marked 4:2:2'

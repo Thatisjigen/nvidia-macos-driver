@@ -253,11 +253,11 @@ enum { kNvrmDynamicRangeHDR10 = 0x2 };
 // (its AVI infoframe says BT.2020 YCC); 4:2:0 with BT.2100 it refuses (nvChooseCurrentColorFormatAndRangeEvo).
 // IOGraphics' encoding bits, the same values in a timing range and in a detailed timing.
 enum { kNvrmEncodingRGB444 = 0x1, kNvrmEncodingYCbCr422 = 0x4 };
-// The TMDS limit in MHz of an HDMI sink that takes YCbCr 4:2:2 at 10 bits, from its EDID, the way NVKMS reads it: the HDMI
-// Forum block's (or SCDB's) maximum TMDS character rate, at least 340 and at most HDMI 2.0's 600; 340 with only the HDMI 1.4
-// block. 0 when the sink is not HDMI, has no 10-bit deep colour, or does not list 4:2:2 (EDID 1.4: the feature byte and at
-// least 10 bits per component; earlier: the CTA extension's YCbCr 4:2:2 flag).
-static inline unsigned nvrmEdidHdmi422TmdsMHz(const unsigned char *e, unsigned n)
+// An HDMI sink's TMDS limit in MHz from its EDID, the way NVKMS reads it: the HDMI Forum block's (or SCDB's) maximum TMDS
+// character rate, at least 340 and at most HDMI 2.0's 600; 340 with only the HDMI 1.4 block; 0 when the sink is not HDMI.
+// With want422, also 0 unless the sink takes YCbCr 4:2:2 at 10 bits: 10-bit deep colour and 4:2:2 listed (EDID 1.4: the
+// feature byte and at least 10 bits per component; earlier: the CTA extension's YCbCr 4:2:2 flag).
+static inline unsigned nvrmEdidHdmiTmdsMHz(const unsigned char *e, unsigned n, bool want422)
 {
     if (!e || n < 256 || e[18] != 1) return 0;
     bool ycc422 = false, hdmi = false, dc30 = false; unsigned hfMHz = 0;
@@ -278,16 +278,31 @@ static inline unsigned nvrmEdidHdmi422TmdsMHz(const unsigned char *e, unsigned n
             i += 1 + len;
         }
     }
-    if (!hdmi || !dc30 || !ycc422) return 0;
+    if (!hdmi || (want422 && (!dc30 || !ycc422))) return 0;
     unsigned mhz = 340;
     if (hfMHz > mhz) mhz = hfMHz;
     return mhz > 600 ? 600 : mhz;
 }
+static inline unsigned nvrmEdidHdmi422TmdsMHz(const unsigned char *e, unsigned n) { return nvrmEdidHdmiTmdsMHz(e, n, true); }
 // An HDR10 timing goes out in 4:2:2 only when RGB at 10 bits does not fit the sink and 4:2:2 does; every other one stays RGB.
 static inline bool nvrmHdr422Needed(unsigned long long pixelClockHz, unsigned tmdsMHz)
 {
     const unsigned long long limit = (unsigned long long)tmdsMHz * 1000000ull;
     return tmdsMHz && pixelClockHz * 5 > limit * 4 && pixelClockHz <= limit;
+}
+// NVKMS sends RGB at 10 bits over HDMI only up to this pixel clock on every display class from Ampere on, Blackwell included
+// (hdmiTmds10BpcMaxPClkMHz in nvkms-hal.c), whatever the sink takes; above it, left to itself, it falls back to YCbCr 4:2:2.
+enum { kNvrmHdmi10BpcMaxPclkMHz = 324 };
+// An HDR10 timing goes out in RGB at 8 bits when RGB at 10 bits does not fit (the GPU's limit above, or 1.25 times the clock
+// over the sink's TMDS limit) and RGB at 8 bits does: sharp text with full chroma rather than NVKMS's 4:2:2, which looked
+// soft and dull on an HDMI monitor at 1080p 144 Hz (339.95 MHz). tmdsMHz is the HDMI sink's limit, 0 when not HDMI.
+static inline bool nvrmHdrRgb8(unsigned long long pixelClockHz, unsigned tmdsMHz)
+{
+    if (!tmdsMHz || !pixelClockHz) return false;
+    const unsigned long long sink = (unsigned long long)tmdsMHz * 1000000ull;
+    const unsigned long long gpu10 = (unsigned long long)kNvrmHdmi10BpcMaxPclkMHz * 1000000ull;
+    const unsigned long long rgb10 = gpu10 < sink * 4 / 5 ? gpu10 : sink * 4 / 5;
+    return pixelClockHz > rgb10 && pixelClockHz <= sink;
 }
 // What macOS's list says about one raster and refresh rate NVKMS validated, before the driver adds that rate itself: whether the
 // raster is listed (raster), whether the rate is listed unscaled (have), and which of macOS's timings the copy starts from

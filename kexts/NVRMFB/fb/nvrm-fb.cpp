@@ -592,6 +592,7 @@ class NVRMNVDAFramebuffer : public IOFramebuffer {
     // HDR10 in YCbCr 4:2:2 (nvrmHdr422Needed): the HDMI sink's TMDS limit when it takes 4:2:2 at 10 bits, 0 otherwise; the mode
     // being set (fYccWant) and the one on the head (fYccActive) go out in 4:2:2.
     unsigned fHdr422TmdsMHz = 0; bool fYccWant = false, fYccActive = false;
+    unsigned fHdmiTmdsMHz = 0;   // the HDMI sink's TMDS limit (nvrmEdidHdmiTmdsMHz), 0 when not HDMI: HDR10 in RGB 8 (nvrmHdrRgb8)
     struct NvKmsHDRStaticMetadata fHdrMeta = {};
     IOReturn setHdrMeta(const void *meta);
     static bool vrrAllowed();
@@ -1218,6 +1219,14 @@ static NvU32 gSurroundMask = 0, gSurroundMaskOrig = 0;   // boot-arg nvfbsurroun
 static bool gRotScale = false;                 // boot-arg nvfbrotscale
 static bool gHdrOn = false, gTenBit = false;   // boot-args nvfbhdr / nvfb10bit
 static int gColorBpc = 0, gColorFormat = (int)kNvrmColorFormatAuto, gColorRange = 0, gVibrance = 0;
+// HDR10's colorimetry on the link. WindowServer composes an HDR display in its own profile (the EDID's primaries) and encodes
+// PQ on the GPU; Apple's framebuffer sends that over DisplayPort with the HDR packet only, colorimetry left at the RGB
+// default. Declaring BT.2020 in the AVI infoframe made an HDMI monitor map those pixels from BT.2020 to its panel:
+// oversaturated next to the same desktop over Apple's driver. 0 (default) keeps the HDR packet and leaves colorimetry at
+// the default, as Apple does; 1 (sysctl debug.nvrmfb_hdr_bt2020 or boot-arg nvfbhdrbt2020=1) declares BT.2020 again.
+static int gHdrBt2020 = 0;
+// boot-arg nvfbhdr422=1: HDR10 above the 10-bit RGB limit goes out in YCbCr 4:2:2 at 10 bits as before (nvrmHdrRgb8 off)
+static bool gHdr422 = false;
 // The fallbacks below let this file compile against an NVKMS interface without the fields, and then the colour controls do
 // nothing at all: every build did exactly that while the archives came from a tree missing 620-color-range.patch. A build
 // of this kext must see the fields; build_rm620.sh makes the tree that has them.
@@ -1977,6 +1986,7 @@ void NVRMNVDAFramebuffer::takeEdid(const NvU8 *src, NvU32 size)
     if (!nvrmEdidVerticalRange(fEdid, fEdidSize, &fVrrMinHz, &fVrrMaxHz)) fVrrMinHz = fVrrMaxHz = 0;
     fHdrCapable = nvrmEdidHdrPq(fEdid, fEdidSize, &fHdrMaxLumCode);
     fHdr422TmdsMHz = nvrmEdidHdmi422TmdsMHz(fEdid, fEdidSize);
+    fHdmiTmdsMHz = nvrmEdidHdmiTmdsMHz(fEdid, fEdidSize, false);
     if (fEdidSize < 128) return;
     bool twin = false;
     for (int k = 0; k < gNDpy && !twin; k++) {
@@ -2534,11 +2544,17 @@ NvBool NVRMNVDAFramebuffer::submitConfig(struct NvKmsKapiRequestedModeSetConfig 
             if (fHdrActive) {
                 mc.hdrInfoFrame.enabled = NV_TRUE; mc.hdrInfoFrame.eotf = NVKMS_INFOFRAME_EOTF_ST2084;
                 mc.hdrInfoFrame.staticMetadata = fHdrMeta;
-                mc.colorimetry = NVKMS_OUTPUT_COLORIMETRY_BT2100;
-                if (!gColorBpc && mc.colorBpc == 0) mc.colorBpc = 10;
+                mc.colorimetry = gHdrBt2020 ? NVKMS_OUTPUT_COLORIMETRY_BT2100 : NVKMS_OUTPUT_COLORIMETRY_DEFAULT;
+                // Above the 10-bit RGB limit the head goes out in RGB at 8 bits (nvrmHdrRgb8), not 4:2:2; that needs the default
+                // colorimetry (BT.2100 asks NVKMS for at least 10 bits). nvfbhdr422=1, or a depth or format set by hand, keeps the rest.
+                const bool rgb8 = !gHdr422 && !gHdrBt2020 && nvrmHdrRgb8(mc.mode.timings.pixelClockHz, fHdmiTmdsMHz);
+                if (!gColorBpc && mc.colorBpc == 0) mc.colorBpc = rgb8 ? 8 : 10;
+                if (full && rgb8 && !gColorBpc)
+                    FBLOG("fb%u: HDR10 in RGB at 8 bits: pclk %u Hz is over the 10-bit HDMI limit (%u MHz, sink %u MHz)", fIndex,
+                          (unsigned)mc.mode.timings.pixelClockHz, (unsigned)kNvrmHdmi10BpcMaxPclkMHz, fHdmiTmdsMHz);
                 // A timing RGB at 10 bits does not fit (nvrmHdr422Needed): NVKMS is told 4:2:2, the encoding macOS was offered for
                 // it, rather than left to fall back from RGB on its own. A colour format set by boot-arg or sysctl comes first.
-                if (fYccActive && (NvU32)gColorFormat == kNvrmColorFormatAuto) nvrmSetColorFormat(&mc, kNvrmColorFormatYCbCr422, 0);
+                if (fYccActive && !rgb8 && (NvU32)gColorFormat == kNvrmColorFormatAuto) nvrmSetColorFormat(&mc, kNvrmColorFormatYCbCr422, 0);
                 mc.olut.enabled = NV_FALSE; mc.olut.lutSurface = NULL; mc.olut.lutEntries = 0;   // no gamma ramp on PQ content
             }
             if (full) {
@@ -3530,6 +3546,8 @@ bool NVRMNVDAFramebuffer::start(IOService *provider)
             gHdrOn = PE_parse_boot_argn("nvfbhdr", &v, sizeof v) && v;
             gRotScale = PE_parse_boot_argn("nvfbrotscale", &v, sizeof v) && v;
             gTenBit = PE_parse_boot_argn("nvfb10bit", &v, sizeof v) && v;
+            if (PE_parse_boot_argn("nvfbhdrbt2020", &v, sizeof v)) gHdrBt2020 = v ? 1 : 0;
+            gHdr422 = PE_parse_boot_argn("nvfbhdr422", &v, sizeof v) && v;
             if (PE_parse_boot_argn("nvfb30", &v, sizeof v) && !v) { g30Bit = false; FBLOG("30-bit depth not offered (nvfb30=0): WindowServer composes in 8 bits"); }
             if (gHdrOn || gTenBit) FBLOG("%s%s", gTenBit ? "10-bit scanout on mode changes (nvfb10bit=1) " : "", gHdrOn ? "HDR10 advertised for PQ displays (nvfbhdr=1)" : "");
             if (gColorBpc || gColorFormat != 3 || gColorRange || gVibrance)
@@ -5069,7 +5087,8 @@ static int nvrmfbColorSysctl SYSCTL_HANDLER_ARGS
     if (err || req->newptr == 0) return err;
     const int which = arg2;   // 0 bpc, 1 format, 2 range, 3 vibrance
     if ((which == 0 && !(v >= 0 && nvrmColorBpcValid((unsigned)v))) || (which == 1 && !(v >= 0 && nvrmColorFormatValid((unsigned)v))) ||
-        (which == 2 && !(v >= 0 && nvrmColorRangeValid((unsigned)v))) || (which == 3 && (v < -100 || v > 100))) return EINVAL;
+        (which == 2 && !(v >= 0 && nvrmColorRangeValid((unsigned)v))) || (which == 3 && (v < -100 || v > 100)) ||
+        (which == 4 && v != 0 && v != 1)) return EINVAL;
     if (v == *(int *)arg1) return 0;
     const int was = *(int *)arg1;
     *(int *)arg1 = v;
@@ -5087,6 +5106,7 @@ SYSCTL_PROC(_debug, OID_AUTO, nvrmfb_color_bpc, CTLTYPE_INT | CTLFLAG_RW | CTLFL
 SYSCTL_PROC(_debug, OID_AUTO, nvrmfb_color_format, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, &gColorFormat, 1, nvrmfbColorSysctl, "I", "output colour format: 0 RGB, 1 YCbCr 4:2:2, 2 YCbCr 4:4:4, 3 automatic");
 SYSCTL_PROC(_debug, OID_AUTO, nvrmfb_color_range, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, &gColorRange, 2, nvrmfbColorSysctl, "I", "output range: 0 automatic, 1 full, 2 limited");
 SYSCTL_PROC(_debug, OID_AUTO, nvrmfb_color_vibrance, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, &gVibrance, 3, nvrmfbColorSysctl, "I", "saturation gain in percent, -100 (grey) to 100 (double); 0 off");
+SYSCTL_PROC(_debug, OID_AUTO, nvrmfb_hdr_bt2020, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, &gHdrBt2020, 4, nvrmfbColorSysctl, "I", "HDR10 colorimetry: 0 the RGB default, as Apple's framebuffers; 1 BT.2020");
 static void nvrmfbInstallSysctl(void)
 {
     if (gFbSysctl) return; gFbSysctl = true;
@@ -5103,6 +5123,7 @@ static void nvrmfbInstallSysctl(void)
     sysctl_register_oid(&sysctl__debug_nvrmfb_flip_latch_late); sysctl_register_oid(&sysctl__debug_nvrmfb_flip_latch_deferred); sysctl_register_oid(&sysctl__debug_nvrmfb_flip_latch_auto);
     sysctl_register_oid(&sysctl__debug_nvrmfb_color_bpc); sysctl_register_oid(&sysctl__debug_nvrmfb_color_format);
     sysctl_register_oid(&sysctl__debug_nvrmfb_color_range); sysctl_register_oid(&sysctl__debug_nvrmfb_color_vibrance);
+    sysctl_register_oid(&sysctl__debug_nvrmfb_hdr_bt2020);
 }
 
 bool NVRMNVDAFramebuffer::vramGrant(struct NVRMVramRequest *r)
