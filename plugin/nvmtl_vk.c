@@ -1769,7 +1769,8 @@ static int nvmtl_vk_initialize(void)
     return 0;
 }
 static pthread_once_t g_vk_once = PTHREAD_ONCE_INIT;
-static void nvmtl_vk_initialize_once(void) { (void)nvmtl_vk_initialize(); }
+void nvmtl_boost_decide(void);   /* NVMTLDevice.m: NVRM_610_BOOST for this process, before NVK reads it */
+static void nvmtl_vk_initialize_once(void) { nvmtl_boost_decide(); (void)nvmtl_vk_initialize(); }
 /* 1 once the backend is down in this process: a failed submit or fence wait disabled it, or it never started. */
 int nvmtl_vk_lost(void) { return atomic_load(&g_state) == -1; }
 /* The device was up and then lost, as opposed to never starting. After a loss the Vulkan queue is dead for the rest of the
