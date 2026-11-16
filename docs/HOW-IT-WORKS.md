@@ -168,8 +168,12 @@ The NAK changes under `nvk/speed267` are already contained in `nvk-macos.patch`;
 
 The video codecs in `libnvencvt.dylib` are built from `vendor/nvenc` (mickys/nvenc, MIT) by `build/build_nvencvt.sh`. The
 package puts the library beside the plugin in `NVMTLDriver.bundle/Contents/MacOS/`; the plugin loads it only when it and
-its folder are root-owned. `NVMTL_NVENCVT` in `nvrm610.conf` decides where it registers: unset is automatic on Ada and
-Ampere, `0` is never, `1` is every process on any card the library accepts, and a list of process names limits it to those.
+its folder are root-owned. Its decoders register in every process that loads the plugin, WindowServer apart, as soon as
+VideoToolbox is in the process and whether or not the process gets the NVIDIA GPU as a Metal device: a video decodes on
+NVDEC in any app, and a process that plays no video does not load VideoToolbox for them.
+Apple's sandboxed apps get them through `VTDecoderXPCService`, Safari through its GPU process. `NVMTL_NVENCVT` in
+`nvrm610.conf` decides where its encoders register: unset is automatic on Ada and Ampere, `1` is every process on any card
+the library accepts, and a list of process names limits them to those; `0` keeps the whole library out, decoders included.
 The GPU's boost policy is `NVRM_610_BOOST`: unset is a short lease renewed while work is submitted, `hold` keeps one boost
 for the device's life, `0` never boosts.
 `NVRM_610_MAXPOWER_MW=<mW>` (off unless set) asks the GPU performance-scaling code for that maximum power through the public root-client GPS control and reads it back.
