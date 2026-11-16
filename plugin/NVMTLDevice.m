@@ -737,6 +737,30 @@ static void nvmtl_nvencvt_on_image(const struct mach_header *mh, intptr_t slide)
         nvmtl_nvencvt_register_decoders();
     });
 }
+// WindowServer draws on the NVIDIA GPU only for the displays wired to it, a little at a time, and every frame it sent renewed
+// NVK's per-burst boost: with a display on the HDMI port the GPU went from its idle state to full clocks every few seconds of a
+// still desktop (P8 at 180/405 MHz and 4.9 W, P4 at 1897/9001 MHz and 8.5 W, alternating). So WindowServer asks for no boost
+// (NVRM_610_BOOST=0 in that process alone) and the GPU follows its own power policy for composition; apps keep the boost per
+// burst of work. Set after nvrm610.conf is read, which would otherwise drop it; a BOOST line in the conf, or NVRM_610_BOOST
+// there, wins.
+// nvrm610.conf has a line of its own starting BOOST=, which NVK reads itself
+static bool nvmtl_conf_has_boost_line(void)
+{
+    char conf[8192] = {0};
+    FILE *f = fopen("/Library/GPUBundles/nvmtl/nvrm610.conf", "r");
+    if (f) { size_t n = fread(conf, 1, sizeof conf - 1, f); conf[n] = 0; fclose(f); }
+    const char *hit = strstr(conf, "BOOST=");
+    while (hit && hit != conf && hit[-1] != '\n') hit = strstr(hit + 1, "BOOST=");
+    return hit != NULL;
+}
+__attribute__((constructor)) static void nvmtl_windowserver_no_boost(void)
+{
+    const char *me = getprogname();
+    if (!me || strcmp(me, "WindowServer")) return;
+    nvmtl_conf_settle();
+    if (getenv("NVRM_610_BOOST") || nvmtl_conf_has_boost_line()) return;
+    setenv("NVRM_610_BOOST", "0", 1);
+}
 __attribute__((constructor)) static void nvmtl_nvencvt_in_every_process(void)
 {
     const char *me = getprogname();
@@ -987,6 +1011,32 @@ static bool nvmtl_gpu_policy_allows(const char *me)
     static int said;
     if (!said++) syslog(LOG_NOTICE, "NullMoth: gpu: %s %s the NVIDIA GPU (%s)", me, give ? "gets" : "does not get", why);
     return give != 0;
+}
+// The boost for every other process, decided when it brings NVK up (nvmtl_vk.c calls this first, once). NVK raises the NVIDIA
+// GPU to full clocks for every burst of work a process sends (NVRM_610_BOOST unset: per burst). Only work that needs the speed
+// keeps that: an app the user set to high performance (GPUSelectionPolicy preferRemovable, the Graphics choice of NitroSense), a
+// game (the games category or LSSupportsGameMode in its Info.plist, as macOS's Game Mode reads them) and an application with a
+// profile here. Everything else gets NVRM_610_BOOST=0 and the GPU follows its own power policy: a browser's GPU process playing
+// video (decoding is on NVDEC, and the untile takes a few milliseconds a picture), the wallpaper, the Displays pane,
+// VideoToolbox's services, editors and chat apps. With the boost, YouTube in Safari held the RTX 5050 at P4 and 2 GHz, 12 W,
+// for a few percent of use. A BOOST line in nvrm610.conf (BOOST=1: per burst everywhere, as before) or NVRM_610_BOOST there or
+// in the process's own environment wins.
+int nvmtl_process_is_game(void);
+void nvmtl_boost_decide(void)
+{
+    const char *me = getprogname();
+    if (!me) return;
+    nvmtl_conf_settle();
+    if (getenv("NVRM_610_BOOST") || nvmtl_conf_has_boost_line()) return;
+    const char *why = NULL;
+    if (strcmp(me, "WindowServer")) {
+        if (nvmtl_app_gpu_choice() == NMP_APP_PREFER) why = "set to high performance";
+        else if (nvmtl_process_is_game()) why = "a game";
+        else if (g_app_profile) why = "an application profile";
+    }
+    if (why) { nvlog("boost: per burst in %s (%s)", me, why); return; }
+    setenv("NVRM_610_BOOST", "0", 1);
+    nvlog("boost: none in %s (not set to high performance, not a game)", me);
 }
 static bool nvmtl_process_is_allowed(void)
 {
