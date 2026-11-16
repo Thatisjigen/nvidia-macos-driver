@@ -415,8 +415,10 @@ static void nvmtl_nvenc_register(void)
 // beside ours and lets VTRating decide which one an app gets. It is the only hardware encoder on Ada, which
 // nvmtl_nvenc_register above turns away, and the only VP9 and AV1 decoder on Ada and consumer Ampere. It reports H.264
 // encoding at about 5 ms where the library we ship takes about 12.
-// NVMTL_NVENCVT, from nvrm610.conf or the environment: unset = automatic on Ada and Ampere, 0 = never, 1 = every
-// process and any card the library accepts (GTX 16 included), a list of process names = only those.
+// Its decoders register in every process that loads this plugin, WindowServer apart: a video decodes on the NVIDIA GPU whatever
+// app plays it and whichever GPU draws the app, and the decoded pictures go to the GPU that composes them. NVMTL_NVENCVT=0 keeps
+// the library out altogether. Its encoders follow NVMTL_NVENCVT, from nvrm610.conf or the environment: unset = automatic on Ada
+// and Ampere, 1 = every process and any card the library accepts (GTX 16 included), a list of process names = only those.
 // This loads code into every app that encodes, so the library and the directory holding it must be
 // ours and nobody else's. The firmware taught this: it used to sit in /Users/Shared, which is mode
 // 1777, and the only permission step was a chmod that adds read bits and never takes write away, so
@@ -444,7 +446,6 @@ static bool nvmtl_nvencvt_selected(const char *sel, const char *me, const char *
     for (char *t = strtok(list, ", :"); t; t = strtok(NULL, ", :")) if (!strcmp(t, me)) return true;
     return false;
 }
-// decodersOnly is the decode service (VTDecoderXPCService): it decodes for the sandboxed Apple clients and never encodes.
 /* Hardware AV1 and VP9 decoding on AMD and Intel GPUs through Vulkan video decode (RADV, ANV): libnmxvt.dylib registers VideoToolbox
    decoders. Off unless NMXVT=1 in the environment or nmxvt=1 on the boot line, only for the AMD/Intel vendor, never in WindowServer,
    and only a root-owned library inside a root-owned directory is loaded. */
@@ -478,17 +479,38 @@ static void nvmtl_nmxvt_register(void)
         nvlog("nmxvt: AV1 and VP9 decoders %s in %s (%d)", st ? "NOT registered" : "REGISTERED", getprogname(), (int)st);
     });
 }
-static void nvmtl_nvencvt_register(bool decodersOnly)
+// WebKit's GPU process (Safari's com.apple.WebKit.GPU) plays video itself and picks the decoder from its own registry:
+// a decoder registered only in the decode service is not the one it asks for. So where that process can load
+// libnvencvt (its sandbox must be told to let the library be mapped) it gets the decoders, and never the encoders.
+static bool nvmtl_is_webkit_gpu(const char *me)
+{
+    return me && !strcmp(me, "com.apple.WebKit.GPU");
+}
+// That process asks VideoToolbox once whether VP9 has a hardware decoder and keeps the answer; on a laptop a "no" makes
+// it tell pages that VP9 is not supported at all. The first time it asks is also what makes Metal load this plugin, so
+// the decoders register while VideoToolbox is still answering, too late to count. WebCore::registerSupplementalVP9Decoder()
+// is what WebKit itself calls when the set of VP9 decoders may have changed: it forgets a kept "no", and the next
+// question reaches VideoToolbox again. It belongs to the main thread, and the lock around the kept answer is held while
+// the first question is out, so it is called from the main run loop's next turn. Looked up by name: a WebKit that
+// does not export it keeps the answer it has.
+static void nvmtl_webkit_ask_vp9_again(void)
+{
+    CFRunLoopPerformBlock(CFRunLoopGetMain(), kCFRunLoopCommonModes, ^{
+        void (*again)(void) = (void (*)(void))dlsym(RTLD_DEFAULT, "_ZN7WebCore30registerSupplementalVP9DecoderEv");
+        if (again) again();
+        nvlog("nvencvt: WebKit %s", again ? "asked to look for a VP9 hardware decoder again"
+                                          : "exports no registerSupplementalVP9Decoder - FAILED to refresh its VP9 answer");
+    });
+    CFRunLoopWakeUp(CFRunLoopGetMain());
+}
+// libnvencvt beside this plugin, opened once per process, and only when the library and its folder are root-owned.
+static void *nvmtl_nvencvt_open(void)
 {
     static dispatch_once_t once;
+    static void *h;
     dispatch_once(&once, ^{
-        const char *me = getprogname();
-        char gen[32] = "";
-        bool haveGen = nvmtl_gpu_profile_string(CFSTR("generation"), gen, sizeof gen);
-        if (!nvmtl_nvencvt_selected(getenv("NVMTL_NVENCVT"), me, haveGen ? gen : NULL)) return;
-        if (!strcmp(me, "WindowServer")) return;     // the codec registrars all stay out of it
         Dl_info di;
-        if (!dladdr((const void *)nvmtl_nvencvt_register, &di) || !di.dli_fname) { nvlog("nvencvt: dladdr failed - not registering"); return; }
+        if (!dladdr((const void *)nvmtl_nvencvt_open, &di) || !di.dli_fname) { nvlog("nvencvt: dladdr failed - not registering"); return; }
         char dir[1024], path[1200];
         strlcpy(dir, di.dli_fname, sizeof dir);
         snprintf(path, sizeof path, "%s/libnvencvt.dylib", dirname(dir));
@@ -496,18 +518,59 @@ static void nvmtl_nvencvt_register(bool decodersOnly)
             nvlog("nvencvt: %s is absent, or is not a root-owned file inside a root-owned directory - REFUSED", path);
             return;
         }
-        void *h = dlopen(path, RTLD_NOW | RTLD_LOCAL);
-        if (!h) { nvlog("nvencvt: dlopen %s FAILED: %s", path, dlerror()); return; }
+        h = dlopen(path, RTLD_NOW | RTLD_LOCAL);
+        if (!h) nvlog("nvencvt: dlopen %s FAILED: %s", path, dlerror());
+    });
+    return h;
+}
+static int nvmtl_nvencvt_rating(void)
+{
+    int rating = 1100;                               // above our own 1000, so the library's codec wins where both register
+    const char *rv = getenv("NVMTL_NVENCVT_RATING");
+    if (rv) { int v = atoi(rv); if (v > 0) rating = v; }
+    return rating;
+}
+// The decoders, in every process but WindowServer; NVMTL_NVENCVT=0 keeps them out. Once per process, whoever asks first, and
+// only once VideoToolbox is in the process: loading the library would load it, and a process that plays no video has no use
+// for it (one that loads it later registers then, nvmtl_nvencvt_on_image).
+static void nvmtl_nvencvt_register_decoders(void)
+{
+    if (!dlsym(RTLD_DEFAULT, "VTRegisterVideoDecoderWithInfo")) return;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        const char *me = getprogname(), *sel = getenv("NVMTL_NVENCVT");
+        if (!me || (sel && !strcmp(sel, "0"))) return;
+        if (!strcmp(me, "WindowServer")) return;     // the codec registrars all stay out of it
+        void *h = nvmtl_nvencvt_open();
+        if (!h) return;
         typedef int32_t (*RegFn)(int);
-        const char *entry = decodersOnly ? "NVEncVT_RegisterDecoders" : "NVEncVT_Register";
-        RegFn r = (RegFn)dlsym(h, entry);
-        if (!r) { nvlog("nvencvt: %s has no %s", path, entry); return; }
-        int rating = 1100;                           // above our own 1000, so the opt-in one wins where it is asked for
-        const char *rv = getenv("NVMTL_NVENCVT_RATING");
-        if (rv) { int v = atoi(rv); if (v > 0) rating = v; }
+        RegFn r = (RegFn)dlsym(h, "NVEncVT_RegisterDecoders");
+        if (!r) { nvlog("nvencvt: the library has no NVEncVT_RegisterDecoders"); return; }
+        const int rating = nvmtl_nvencvt_rating();
         int32_t st = r(rating);
-        nvlog("nvencvt: %s %s in %s (%s -> %d, rating %d, %s)", decodersOnly ? "decoders" : "codecs",
-              st ? "NOT registered" : "REGISTERED", me, entry, (int)st, rating, path);
+        nvlog("nvencvt: decoders %s in %s (NVEncVT_RegisterDecoders -> %d, rating %d)", st ? "NOT registered" : "REGISTERED",
+              me, (int)st, rating);
+        if (!st && nvmtl_is_webkit_gpu(me)) nvmtl_webkit_ask_vp9_again();
+    });
+}
+// The encoders as well, in the processes NVMTL_NVENCVT selects (the decoders come along; they register once either way).
+static void nvmtl_nvencvt_register_codecs(void)
+{
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        const char *me = getprogname();
+        char gen[32] = "";
+        bool haveGen = nvmtl_gpu_profile_string(CFSTR("generation"), gen, sizeof gen);
+        if (!me || !nvmtl_nvencvt_selected(getenv("NVMTL_NVENCVT"), me, haveGen ? gen : NULL)) return;
+        if (!strcmp(me, "WindowServer")) return;     // the codec registrars all stay out of it
+        void *h = nvmtl_nvencvt_open();
+        if (!h) return;
+        typedef int32_t (*RegFn)(int);
+        RegFn r = (RegFn)dlsym(h, "NVEncVT_Register");
+        if (!r) { nvlog("nvencvt: the library has no NVEncVT_Register"); return; }
+        const int rating = nvmtl_nvencvt_rating();
+        int32_t st = r(rating);
+        nvlog("nvencvt: codecs %s in %s (NVEncVT_Register -> %d, rating %d)", st ? "NOT registered" : "REGISTERED", me, (int)st, rating);
     });
 }
 static void nvmtl_nvdec_hevc_register(void)
@@ -583,8 +646,49 @@ __attribute__((constructor)) static void nvmtl_nvdec_in_decode_service(void)
         // Safari's GPU process, QuickTime and FaceTime decode here. Our own H.264 decoder hands out buffers with fixed
         // attributes, and in these clients the picture comes out green; libnvencvt reads the client's attributes. It is
         // rated above ours, so where it applies it is the one chosen.
-        nvmtl_nvencvt_register(true);
+        nvmtl_nvencvt_register_decoders();
     });
+}
+// Every other process that loads this plugin gets libnvencvt's decoders too, whether or not it is then given the NVIDIA GPU as a
+// Metal device: the decoders reach NVDEC through NVRM by themselves, so a video decodes on the NVIDIA GPU whichever GPU draws the
+// app that plays it. They register when VideoToolbox is in the process: at once if it is there already, else as soon as it is
+// loaded, so a player finds them for its first session and a process that never plays video does not load VideoToolbox for
+// them. The image is told apart by the install name in its own load commands (no call into dyld from its callback), and the
+// registration runs off that callback, on a queue that is not starved under load, as in the decode service. Not in
+// WindowServer; not in Apple's sandboxed apps, which decode in the decode service and cannot reach NVRM themselves (#349),
+// WebKit's GPU process apart.
+static bool nvmtl_image_is_videotoolbox(const struct mach_header *mh)
+{
+    if (!mh || mh->magic != MH_MAGIC_64) return false;
+    const struct load_command *lc = (const struct load_command *)((const char *)mh + sizeof(struct mach_header_64));
+    for (uint32_t i = 0; i < mh->ncmds; i++, lc = (const struct load_command *)((const char *)lc + lc->cmdsize)) {
+        if (lc->cmdsize < sizeof *lc) return false;
+        if (lc->cmd != LC_ID_DYLIB) continue;
+        const struct dylib_command *d = (const struct dylib_command *)lc;
+        if (d->dylib.name.offset >= lc->cmdsize) return false;
+        const char *name = (const char *)lc + d->dylib.name.offset;
+        static const char vt[] = "/System/Library/Frameworks/VideoToolbox.framework/";
+        return !strncmp(name, vt, sizeof vt - 1);
+    }
+    return false;
+}
+static void nvmtl_nvencvt_on_image(const struct mach_header *mh, intptr_t slide)
+{
+    (void)slide;
+    static _Atomic int queued;
+    if (atomic_load(&queued) || !nvmtl_image_is_videotoolbox(mh) || atomic_exchange(&queued, 1)) return;
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        const char *me = getprogname();
+        if (nvmtl_decode_is_delegated(me) && !nvmtl_is_webkit_gpu(me)) return;
+        nvmtl_nvencvt_register_decoders();
+    });
+}
+__attribute__((constructor)) static void nvmtl_nvencvt_in_every_process(void)
+{
+    const char *me = getprogname();
+    if (!me || !strcmp(me, "WindowServer") || nvmtl_is_decode_service(me)) return;
+    nvmtl_conf_settle();   // NVMTL_NVENCVT=0 in nvrm610.conf keeps the library out here as everywhere
+    _dyld_register_func_for_add_image(nvmtl_nvencvt_on_image);   // also called at once for the images already loaded
 }
 static void nvmtl_nvenc_hevc_register(void)
 {
@@ -996,7 +1100,10 @@ static id nvmtl_refuse_before_init(id obj)
         nvmtl_nvenc_register();
         nvmtl_nvdec_hevc_register();
         nvmtl_nvenc_hevc_register();
-        nvmtl_nvencvt_register(false);   // last, so the external codecs register above ours
+        // last, so the external codecs register above ours: the decoders in every process, the encoders where NVMTL_NVENCVT
+        // selects; WebKit's GPU process gets the decoders alone
+        nvmtl_nvencvt_register_decoders();
+        if (!nvmtl_is_webkit_gpu(getprogname())) nvmtl_nvencvt_register_codecs();
     }
     SEL il = sel_registerName("initLimits");
     if ([self respondsToSelector:il]) {
