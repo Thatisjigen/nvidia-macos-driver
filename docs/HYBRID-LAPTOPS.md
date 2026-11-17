@@ -250,7 +250,7 @@ per-process GPU-time figure is not published by the accelerator and is an open f
 
 ## Idle power-down
 
-The opt-in D3cold monitor (boot-args `nvrtd3=1` and `nvrtd3res=<ACPI path>`, `kexts/NVRM/nv_rtd3.cpp`) powers the GPU's
+The opt-in D3cold monitor (boot-arg `nvrtd3=1`, `nvrtd3res=<ACPI path>` optional, `kexts/NVRM/nv_rtd3.cpp`) powers the GPU's
 power resource off after 60 s with no lit head and no client. On a hybrid laptop it now counts the right things:
 
 - Clients include the user clients of the accelerator, where every Metal application attaches (before, only clients of the
@@ -260,8 +260,8 @@ power resource off after 60 s with no lit head and no client. On a hybrid laptop
 
 So the combinations are: `nmhybrid` off plus `nvrtd3=1`: the integrated GPU draws the desktop, the NVIDIA GPU powers off
 after 60 s without a Metal application and powers on when one starts. `nmhybrid` on: the GPU stays on, with or without
-`nvrtd3`. Not measured on hardware: the wake latency of the first Metal application, and whether the power resource path
-is right for a given laptop (the 1401 scan reports the candidates).
+`nvrtd3`. Without a power resource path, or where the ACPI family refuses it (macOS 26 evaluates no name of more than one
+segment), the GPU node's `_DSM` function 0x1A and `_PS3`/`_PS0` switch the power; the 1401 scan reports the candidate paths.
 
 ## Mux switching (Advanced Optimus)
 

@@ -58,7 +58,9 @@ struct nv_rtd3_ops {
     void (*suspend)(void *ctx);     /* the driver's system-sleep path: NVKMS, RM standby */
     void (*resume)(void *ctx);      /* the driver's wake path: RM resume, NVKMS */
     int  (*acpi_off)(void *ctx);    /* power resource _OFF, 1 on success */
-    int  (*acpi_on)(void *ctx);     /* power resource _ON, 1 on success */
+    int  (*acpi_on)(void *ctx);     /* power resource _ON, 1 once the GPU answers again; 0: not yet, asked again later */
+    /* Absent: the caller never looked for a way to the power, and nothing is switched. */
+    int  (*reach)(void *ctx);       /* find how the firmware's power methods are reached on this machine; changes nothing */
 };
 
 enum { NV_RTD3_TICK_NONE = 0, NV_RTD3_TICK_POWERED_OFF = 1, NV_RTD3_TICK_OFF_FAILED = -1, NV_RTD3_TICK_WOKE = 2, NV_RTD3_TICK_WAKE_FAILED = -2 };
