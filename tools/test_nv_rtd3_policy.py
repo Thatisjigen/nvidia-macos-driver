@@ -86,4 +86,79 @@ int main(void) {
             check('the next try that works resumes', o['G'] == '2 [acpi_on resume ] state 0')
             check('a failed _OFF resumes the driver at once and keeps the GPU on', o['H'].startswith('-1') and 'suspend acpi_off resume' in o['H'] and o['H'].endswith('state 0'))
             check('with the switch off nothing is ever called', o['I'] == '[]')
+# By activity: a desktop session keeps clients attached to a GPU none of them uses, so what counts is work since the
+# last poll, and what brings the GPU back is a request.
+if hdr.exists() and shutil.which('cc'):
+    act = r"""#include <stdio.h>
+#include <string.h>
+#include "nv_rtd3_policy.h"
+static char log[256]; static int heads, clients = 27, active, wanted;
+static void add(const char *w) { strcat(log, w); strcat(log, " "); }
+static int h(void *c) { (void)c; return heads; } static int cl(void *c) { (void)c; return clients; }
+static int ac(void *c) { (void)c; return active; } static int wa(void *c) { (void)c; return wanted; }
+static void su(void *c) { (void)c; add("suspend"); } static void re(void *c) { (void)c; add("resume"); }
+static int off(void *c) { (void)c; add("acpi_off"); return 1; } static int on(void *c) { (void)c; add("acpi_on"); return 1; }
+int main(void) {
+ struct nv_rtd3_ops o = { .ctx = 0, .heads_lit = h, .clients = cl, .suspend = su, .resume = re, .acpi_off = off, .acpi_on = on,
+                          .active = ac, .wanted = wa };
+ struct nv_rtd3 s = {NV_RTD3_BY_ACTIVITY, NV_RTD3_ON, 1}; unsigned idle = 0; int r = 0;
+ for (int i = 0; i < 60; i++) r = nv_rtd3_tick(&s, &o, &idle, 1);
+ printf("A %d [%s] state %d\n", r, log, s.state);
+ log[0] = 0; r = nv_rtd3_tick(&s, &o, &idle, 1); printf("B %d [%s] state %d\n", r, log, s.state);
+ wanted = 1; r = nv_rtd3_tick(&s, &o, &idle, 1); printf("C %d [%s] state %d\n", r, log, s.state);
+ wanted = 0; log[0] = 0; active = 1; for (int i = 0; i < 600; i++) nv_rtd3_tick(&s, &o, &idle, 1); printf("D [%s] state %d\n", log, s.state);
+ active = 0; for (int i = 0; i < 59; i++) nv_rtd3_tick(&s, &o, &idle, 1); active = 1; nv_rtd3_tick(&s, &o, &idle, 1); active = 0;
+ for (int i = 0; i < 59; i++) nv_rtd3_tick(&s, &o, &idle, 1); printf("E [%s] state %d\n", log, s.state);
+ heads = 1; for (int i = 0; i < 600; i++) nv_rtd3_tick(&s, &o, &idle, 1); printf("F [%s] state %d\n", log, s.state);
+ heads = 0; s.idle_need = 10; idle = 0; for (int i = 0; i < 10; i++) r = nv_rtd3_tick(&s, &o, &idle, 1); printf("G %d [%s] state %d\n", r, log, s.state);
+ struct nv_rtd3_ops old = { 0, h, cl, su, re, off, on };
+ struct nv_rtd3 t = {NV_RTD3_BY_ACTIVITY, NV_RTD3_ON, 1}; unsigned i2 = 0; log[0] = 0;
+ for (int i = 0; i < 600; i++) nv_rtd3_tick(&t, &old, &i2, 1); printf("H [%s] state %d\n", log, t.state);
+ return 0; }
+"""
+    with tempfile.TemporaryDirectory() as d:
+        pathlib.Path(d, 'a.c').write_text(act)
+        r = subprocess.run(['cc', '-I', str(hdr.parent), '-o', d + '/a', d + '/a.c'], capture_output=True, text=True)
+        check('the by-activity harness compiles', r.returncode == 0, r.stderr[-200:])
+        if r.returncode == 0:
+            o = {l[0]: l[2:] for l in subprocess.run([d + '/a'], capture_output=True, text=True).stdout.strip().split('\n')}
+            check('by activity: 27 clients attached and no work for 60 s powers off', o['A'] == '1 [suspend acpi_off ] state 1')
+            check('by activity: the attached clients do not bring the GPU back', o['B'] == '0 [] state 1')
+            check('by activity: a request switches the resource on first and resumes after it', o['C'] == '2 [acpi_on resume ] state 0')
+            check('by activity: a GPU that works never loses power', o['D'] == '[] state 0')
+            check('by activity: one piece of work starts the idle time again', o['E'] == '[] state 0')
+            check('by activity: a lit head still blocks it', o['F'] == '[] state 0')
+            check('the idle time can be set', o['G'] == '1 [suspend acpi_off ] state 1')
+            check('a caller without the two questions gets the no-client rule', o['H'] == '[] state 0')
+# Video memory: a GPU idle long enough but with much in use stays on, and its idle time starts again.
+if hdr.exists() and shutil.which('cc'):
+    hv = r"""#include <stdio.h>
+#include <string.h>
+#include "nv_rtd3_policy.h"
+static char log[256]; static int heavy = 1, asked;
+static void add(const char *w) { strcat(log, w); strcat(log, " "); }
+static int zero(void *c) { (void)c; return 0; } static int hv(void *c) { (void)c; asked++; return heavy; }
+static void su(void *c) { (void)c; add("suspend"); } static void re(void *c) { (void)c; add("resume"); }
+static int off(void *c) { (void)c; add("acpi_off"); return 1; } static int on(void *c) { (void)c; add("acpi_on"); return 1; }
+int main(void) {
+ struct nv_rtd3_ops o = { .heads_lit = zero, .clients = zero, .suspend = su, .resume = re, .acpi_off = off, .acpi_on = on,
+                          .active = zero, .wanted = zero, .heavy = hv };
+ struct nv_rtd3 s = {NV_RTD3_BY_ACTIVITY, NV_RTD3_ON, 1}; unsigned idle = 0; int r = 0, last = 0;
+ for (int i = 0; i < 59; i++) r |= nv_rtd3_tick(&s, &o, &idle, 1);
+ printf("A %d asked %d\n", r, asked);
+ last = nv_rtd3_tick(&s, &o, &idle, 1); printf("B %d [%s] state %d idle %u asked %d\n", last, log, s.state, idle, asked);
+ heavy = 0; for (int i = 0; i < 59; i++) r = nv_rtd3_tick(&s, &o, &idle, 1); printf("C %d [%s] asked %d\n", r, log, asked);
+ r = nv_rtd3_tick(&s, &o, &idle, 1); printf("D %d [%s] state %d\n", r, log, s.state);
+ return 0; }
+"""
+    with tempfile.TemporaryDirectory() as d:
+        pathlib.Path(d, 'v.c').write_text(hv)
+        r = subprocess.run(['cc', '-I', str(hdr.parent), '-o', d + '/v', d + '/v.c'], capture_output=True, text=True)
+        check('the video-memory harness compiles', r.returncode == 0, r.stderr[-200:])
+        if r.returncode == 0:
+            o = {l[0]: l[2:] for l in subprocess.run([d + '/v'], capture_output=True, text=True).stdout.strip().split('\n')}
+            check('the video memory is not asked before the idle time is served', o['A'] == '0 asked 0')
+            check('much video memory in use keeps the GPU on and starts the idle time again', o['B'] == '3 [] state 0 idle 0 asked 1')
+            check('the next idle time is served again before asking', o['C'] == '0 [] asked 1')
+            check('little in use: the power goes', o['D'] == '1 [suspend acpi_off ] state 1')
 print(f'{fails} failed' if fails else 'all passed'); sys.exit(1 if fails else 0)

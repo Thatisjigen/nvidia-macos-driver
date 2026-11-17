@@ -15,10 +15,17 @@
 
 enum { NV_RTD3_ON = 0, NV_RTD3_OFF = 1 };
 
+/* What may take the power away (nv_rtd3.enabled). With no client: only a GPU nothing is attached to. By activity: a GPU
+ * that has done no work for the idle time, whoever is attached; it comes back when something asks for it. A desktop
+ * session keeps dozens of processes attached to a GPU that none of them draws with (the window server, the Dock, every
+ * application that made a Metal device), so on a hybrid laptop the first rule never lets the power go. */
+enum { NV_RTD3_NEVER = 0, NV_RTD3_NO_CLIENT = 1, NV_RTD3_BY_ACTIVITY = 2 };
+
 struct nv_rtd3 {
-    int enabled;          /* the nvrtd3 boot argument was given: off unless asked for */
+    int enabled;          /* NV_RTD3_NEVER unless asked for: the nvrtd3 boot argument, then the debug.nvrm_rtd3 sysctl */
     int state;            /* NV_RTD3_ON or NV_RTD3_OFF */
-    int have_resource;    /* a power resource path is known */
+    int have_resource;    /* a way to the power may be looked for */
+    unsigned idle_need;   /* idle seconds before the power goes; 0 means NV_RTD3_IDLE_SECONDS */
 };
 
 #define NV_RTD3_IDLE_SECONDS 60
@@ -27,7 +34,7 @@ struct nv_rtd3 {
 static inline int nv_rtd3_may_power_off(const struct nv_rtd3 *s, int rm_suspended, int heads_lit, int clients, unsigned idle_s)
 {
     return s->enabled && s->have_resource && s->state == NV_RTD3_ON && rm_suspended && heads_lit == 0 && clients == 0 &&
-           idle_s >= NV_RTD3_IDLE_SECONDS;
+           idle_s >= (s->idle_need ? s->idle_need : NV_RTD3_IDLE_SECONDS);
 }
 
 /* What counts as "a head is lit" and "a client is attached" on a laptop.
@@ -58,28 +65,42 @@ struct nv_rtd3_ops {
     void (*suspend)(void *ctx);     /* the driver's system-sleep path: NVKMS, RM standby */
     void (*resume)(void *ctx);      /* the driver's wake path: RM resume, NVKMS */
     int  (*acpi_off)(void *ctx);    /* power resource _OFF, 1 on success */
-    int  (*acpi_on)(void *ctx);     /* power resource _ON, 1 on success */
+    int  (*acpi_on)(void *ctx);     /* power resource _ON, 1 once the GPU answers again; 0: not yet, asked again later */
+    /* Absent: the caller never looked for a way to the power, and nothing is switched. */
+    int  (*reach)(void *ctx);       /* find how the firmware's power methods are reached on this machine; changes nothing */
+    /* By activity. Both absent (a caller that knows only the rule above): the no-client rule is applied. */
+    int  (*active)(void *ctx);      /* the GPU did work since the last poll: a call into the RM, an event wait, an interrupt */
+    int  (*wanted)(void *ctx);      /* with the GPU off: something asks for it (a call waits for it, a display was plugged in) */
+    /* Absent: no limit. */
+    int  (*heavy)(void *ctx);       /* idle, but so much video memory is in use that saving it would take too long */
 };
 
-enum { NV_RTD3_TICK_NONE = 0, NV_RTD3_TICK_POWERED_OFF = 1, NV_RTD3_TICK_OFF_FAILED = -1, NV_RTD3_TICK_WOKE = 2, NV_RTD3_TICK_WAKE_FAILED = -2 };
+enum { NV_RTD3_TICK_NONE = 0, NV_RTD3_TICK_POWERED_OFF = 1, NV_RTD3_TICK_OFF_FAILED = -1, NV_RTD3_TICK_WOKE = 2, NV_RTD3_TICK_WAKE_FAILED = -2,
+       NV_RTD3_TICK_HEAVY = 3 };
 
 /* One poll. `idle_s` is the seconds the GPU has been idle, kept by the caller; `period_s` is the seconds this tick stands for.
  * Idle long enough: suspend the driver, then switch the resource off; if that fails the driver is resumed at once and the
- * GPU stays on. Off and something wants the GPU: switch the resource on first, resume only after it. */
+ * GPU stays on. Off and something wants the GPU: switch the resource on first, resume only after it.
+ * Idle is no head lit and, with no client, nothing attached; by activity, no work since the last poll. */
 static inline int nv_rtd3_tick(struct nv_rtd3 *s, const struct nv_rtd3_ops *o, unsigned *idle_s, unsigned period_s)
 {
-    int busy = o->heads_lit(o->ctx) || o->clients(o->ctx);
+    const int by_activity = s->enabled == NV_RTD3_BY_ACTIVITY && o->active && o->wanted;
     if (s->state == NV_RTD3_ON) {
+        const int busy = o->heads_lit(o->ctx) || (by_activity ? o->active(o->ctx) : o->clients(o->ctx));
         if (busy) { *idle_s = 0; return NV_RTD3_TICK_NONE; }
         *idle_s += period_s;
         if (!nv_rtd3_may_power_off(s, 1, 0, 0, *idle_s)) return NV_RTD3_TICK_NONE;
+        /* Asked only once the idle time is served: it costs a call into the RM. Too much in use: the idle time starts again. */
+        if (o->heavy && o->heavy(o->ctx)) { *idle_s = 0; return NV_RTD3_TICK_HEAVY; }
         o->suspend(o->ctx);
         int ok = o->acpi_off(o->ctx);
         nv_rtd3_off_done(s, ok);
         if (!ok) { o->resume(o->ctx); *idle_s = 0; return NV_RTD3_TICK_OFF_FAILED; }
         return NV_RTD3_TICK_POWERED_OFF;
     }
-    if (!busy) return NV_RTD3_TICK_NONE;
+    /* Off. By activity only a request brings the GPU back: its framebuffers cannot report anything without power, and
+     * the clients attached to it were there when it went off. */
+    if (!(by_activity ? o->wanted(o->ctx) : (o->heads_lit(o->ctx) || o->clients(o->ctx)))) return NV_RTD3_TICK_NONE;
     int ok = o->acpi_on(o->ctx);
     nv_rtd3_on_done(s, ok);
     if (!ok) return NV_RTD3_TICK_WAKE_FAILED;

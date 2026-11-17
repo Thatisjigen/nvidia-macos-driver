@@ -71,7 +71,10 @@ OBJS+=("$OUT/nvrm_pmgr.o")
 # nvrm_physctl.c (the entry points and offsets SMCNvidiaGPU asks for, and the root-only RM control) needs the GPU object as well
 OGKM="$OGKM" python3 -B "$HERE/../kexts/NVRM/rmcc.py" "$SRC/nvrm_physctl.c" "$OUT/nvrm_physctl.o" 2>"$OUT/physctl.err" || { echo "STOP: nvrm_physctl.c did not compile"; tail "$OUT/physctl.err"; exit 1; }
 OBJS+=("$OUT/nvrm_physctl.o")
-bash "$HERE/warn_ceiling.sh" nvrm "$(cat "$OUT"/*.o.err "$OUT/kapi.err" "$OUT/pageoff.err" "$OUT/pmgr.err" "$OUT/physctl.err" | grep -c ': warning:')" || exit 4
+# nvrm_rtd3_rm.c (ring every channel's doorbell after a power cut at run time) walks RM's channels
+OGKM="$OGKM" python3 -B "$HERE/../kexts/NVRM/rmcc.py" "$SRC/nvrm_rtd3_rm.c" "$OUT/nvrm_rtd3_rm.o" 2>"$OUT/rtd3rm.err" || { echo "STOP: nvrm_rtd3_rm.c did not compile"; tail "$OUT/rtd3rm.err"; exit 1; }
+OBJS+=("$OUT/nvrm_rtd3_rm.o")
+bash "$HERE/warn_ceiling.sh" nvrm "$(cat "$OUT"/*.o.err "$OUT/kapi.err" "$OUT/pageoff.err" "$OUT/pmgr.err" "$OUT/physctl.err" "$OUT/rtd3rm.err" | grep -c ': warning:')" || exit 4
 xcrun clang++ -arch x86_64 -mmacosx-version-min=15.0 -fapple-kext -nostdlib -Xlinker -kext -lkmodc++ -lkmod -lcc_kext "${OBJS[@]}" \
   "$NV/_out/Darwin_x86_64/libnvkernel.a" "$KMSLIB" -o "$OUT/NVRM.kext/Contents/MacOS/NVRM" 2>"$OUT/link.err" || { echo "STOP: link failed"; grep -v "built for newer" "$OUT/link.err" | head; exit 1; }
 bash "$HERE/warn_ceiling.sh" nvrm-link "$(grep -c 'warning' "$OUT/link.err")" "$OUT/link.err" || exit 4

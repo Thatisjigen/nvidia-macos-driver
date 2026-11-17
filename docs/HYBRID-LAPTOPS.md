@@ -252,7 +252,7 @@ per-process GPU-time figure is not published by the accelerator and is an open f
 
 ## Idle power-down
 
-The opt-in D3cold monitor (boot-args `nvrtd3=1` and `nvrtd3res=<ACPI path>`, `kexts/NVRM/nv_rtd3.cpp`) powers the GPU's
+The opt-in D3cold monitor (boot-arg `nvrtd3=1`, `nvrtd3res=<ACPI path>` optional, `kexts/NVRM/nv_rtd3.cpp`) powers the GPU's
 power resource off after 60 s with no lit head and no client. On a hybrid laptop it now counts the right things:
 
 - Clients include the user clients of the accelerator, where every Metal application attaches (before, only clients of the
@@ -262,8 +262,18 @@ power resource off after 60 s with no lit head and no client. On a hybrid laptop
 
 So the combinations are: `nmhybrid` off plus `nvrtd3=1`: the integrated GPU draws the desktop, the NVIDIA GPU powers off
 after 60 s without a Metal application and powers on when one starts. `nmhybrid` on: the GPU stays on, with or without
-`nvrtd3`. Not measured on hardware: the wake latency of the first Metal application, and whether the power resource path
-is right for a given laptop (the 1401 scan reports the candidates).
+`nvrtd3`. Without a power resource path, or where the ACPI family refuses it (macOS 26 evaluates no name of more than one
+segment), the GPU node's `_DSM` function 0x1A and `_PS3`/`_PS0` switch the power; the 1401 scan reports the candidate paths.
+
+`nvrtd3=2` goes by activity. A desktop session keeps dozens of processes attached to the GPU (the window server, the Dock,
+every app that made a Metal device), so with the integrated GPU drawing the desktop the first rule never powers it off. By
+activity it powers off after 60 s with no lit head, no call into the RM, no event wait and no interrupt, and comes back for a
+call into the RM, a client that waits for an event, or the firmware's notification 0x81 that a display was plugged into one
+of its outputs, which then lights as after any wake. Sensor readers neither keep it on nor bring it back: SMCNvidiaGPU's readings are not
+counted and are skipped while it is off, and a program that samples the shared data page can open its control client with
+`0x100` added to the type (`0x4E560100` through NVAccel's bridge): its calls are not counted, and while the GPU is off they
+fail at once. With more than 256 MB of video memory in use (`nvrtd3vram`, `debug.nvrm_rtd3_vram`) the GPU stays on: there is
+no GC6 here, and saving that much to system memory would hold every call that arrives meanwhile.
 
 ## Mux switching (Advanced Optimus)
 

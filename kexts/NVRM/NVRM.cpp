@@ -88,14 +88,22 @@ static bool nvrmMultiGpu(void)
 }
 #include "nv_rtd3_policy.h"
 extern "C" void nv_rtd3_arm(const struct nv_rtd3_ops *ops);
+extern "C" int  nv_rtd3_asked(void);
+extern "C" void nv_rtd3_want(const char *why);
+extern "C" int  nv_rtd3_reachable(void);
+extern "C" void nv_rtd3_acpi_notification(unsigned value);
 extern "C" void nvrm_power_start(nv_state_t *nv);   // nvrm_power.cpp
 extern "C" void nvrm_power_stop(void);
 extern "C" void nvrm_power_suspend(void);
 extern "C" void nvrm_power_resume(void);
 extern "C" int  nv_rtd3_before_system_resume(void);
-extern "C" int  nv_rtd3_armed(void);
-extern "C" int  nv_rtd3_power_off(IOACPIPlatformDevice *acpi);
-extern "C" int  nv_rtd3_power_on(IOACPIPlatformDevice *acpi);
+extern "C" void nv_rtd3_before_system_sleep(void);
+extern "C" void nv_rtd3_after_system_wake(void);
+extern "C" int  nv_rtd3_power_off(IOACPIPlatformDevice *const *nodes);
+extern "C" int  nv_rtd3_power_on(IOACPIPlatformDevice *const *nodes, int quiet);
+extern "C" int  nv_rtd3_reach(IOACPIPlatformDevice *const *nodes);
+extern "C" NV_STATUS rm_xnu_ring_channels(nv_state_t *nv, NvU32 *pRung, NvU32 *pChannels);   // nvrm_rtd3_rm.c
+extern "C" NV_STATUS rm_xnu_used_fb(nv_state_t *nv, NvU64 *pUsed);                             // nvrm_rtd3_rm.c
 extern "C" nv_state_t *nv_xnu_gpu_state(void);
 extern "C" nv_state_t *nv_xnu_gpu_state_at(unsigned index);
 extern "C" void *nv_xnu_gpu_os_device_at(unsigned index);
@@ -204,6 +212,13 @@ private:
     bool resumeOnOwnThread();   // system wake: gpuResume on a thread of its own, see setPowerState
     static void resumeMain(void *p0, wait_result_t w);
     void rtd3Arm();   // opt-in D3cold (nvrtd3=1): kexts/NVRM/nv_rtd3.cpp
+    void rtd3Suspend();
+    void rtd3Resume();
+    void rtd3Nodes(IOACPIPlatformDevice *nodes[3]);   // the root port's ACPI node, the GPU's, the host bridge's
+    UInt32 rtd3BusRead32(unsigned function, UInt8 offset);
+    int  rtd3PowerOn();
+    int  rtd3Heavy();
+    static IOReturn rtd3AcpiMessage(void *target, void *ref, UInt32 type, IOService *provider, void *arg, vm_size_t size);
     void pciSaveForSleep();
     bool pciRestoreAfterWake();
     bool gpuAnswers();
@@ -250,6 +265,13 @@ private:
     thread_call_t fHdaGuardCall = nullptr;
     volatile bool fHdaGuardRun = false;
     UInt32 fHdaGuardTicks = 0;
+    // Runtime D3, at the end of the class like the members above
+    bool fRtd3Saved = false, fRtd3SavedHda = false;   // the bus driver keeps a copy of the configuration space
+    IONotifier *fRtd3Acpi = nullptr;                  // interest in the GPU's ACPI node, for the firmware's notifications
+    UInt32 fRtd3Id = 0, fRtd3HdaId = 0, fRtd3Subsys = 0;   // what the two functions answered on the bus before the power went
+    unsigned fRtd3OnTries = 0;
+    uint64_t fRtd3OnSince = 0;
+    bool fRtd3GaveUp = false;
 };
 extern "C" { extern volatile int nv_xnu_in_isr; extern volatile thread_t nv_xnu_isr_thread; void nv_xnu_dump_live_allocs(void); }
 static volatile unsigned long gNvIsrCount = 0, gNvIsrHandled = 0;
@@ -271,15 +293,31 @@ static bool     gNvPmClosed;
 static thread_t gNvPmOwner;
 static SInt64   gNvPmWaited;
 SYSCTL_QUAD(_debug, OID_AUTO, nvrm_pm_waited, CTLFLAG_RD, &gNvPmWaited, "RM calls that waited for a GPU resume");
+// Runtime D3 (nv_rtd3.cpp) closes the same gate for as long as the GPU has no power. A call that arrives then is what
+// brings the GPU back: it is counted in gNvPmSleepers, which the monitor polls, and the monitor is told at once.
+// gNvPmEntered counts the calls let in: "none since the last poll" is part of what idle means for the by-activity rule.
+static bool     gNvPmRuntime;   // closed by runtime D3, not by system sleep
+static int      gNvPmSleepers;
+static SInt64   gNvPmEntered;
+SYSCTL_QUAD(_debug, OID_AUTO, nvrm_pm_entered, CTLFLAG_RD, &gNvPmEntered, "RM calls let through the power gate");
 extern "C" int nv_xnu_pm_enter(void)
 {
     if (!gNvPmGate || current_thread() == gNvPmOwner) return 0;
     IOLockLock(gNvPmGate);
     if (gNvPmClosed) {
         OSIncrementAtomic64(&gNvPmWaited);
+        gNvPmSleepers++;
+        if (gNvPmRuntime) {
+            char why[48] = "a call into the RM from ";
+            const size_t at = strlen(why);
+            proc_selfname(why + at, (int)(sizeof why - at));
+            nv_rtd3_want(why);   // does nothing until the power is really off; gNvPmSleepers covers the time before
+        }
         while (gNvPmClosed) IOLockSleep(gNvPmGate, &gNvPmClosed, THREAD_UNINT);
+        gNvPmSleepers--;
     }
     gNvPmUsers++;
+    gNvPmEntered++;
     IOLockUnlock(gNvPmGate);
     return 1;
 }
@@ -289,6 +327,49 @@ extern "C" void nv_xnu_pm_exit(int counted)
     IOLockLock(gNvPmGate);
     if (--gNvPmUsers == 0 && gNvPmClosed) IOLockWakeup(gNvPmGate, &gNvPmUsers, false);
     IOLockUnlock(gNvPmGate);
+}
+// A sensor reader's admission: the readings are not use of the GPU, so they are not counted as work, and while runtime D3
+// has the GPU off (or is switching it off) they are refused at once instead of bringing it back. Across a system sleep
+// they wait like any other call.
+static bool nv_xnu_pm_reader_enter(int *counted)
+{
+    *counted = 0;
+    if (!gNvPmGate || current_thread() == gNvPmOwner) return true;
+    IOLockLock(gNvPmGate);
+    while (gNvPmClosed) {
+        if (gNvPmRuntime) { IOLockUnlock(gNvPmGate); return false; }
+        IOLockSleep(gNvPmGate, &gNvPmClosed, THREAD_UNINT);
+    }
+    gNvPmUsers++; *counted = 1;
+    IOLockUnlock(gNvPmGate);
+    return true;
+}
+struct NvXnuPmReaderUse {
+    int counted = 0; bool in = true;
+    explicit NvXnuPmReaderUse(bool use) { if (use) in = nv_xnu_pm_reader_enter(&counted); }
+    ~NvXnuPmReaderUse() { nv_xnu_pm_exit(counted); }
+};
+// What SMCNvidiaGPU is handed in place of nv_xnu_pm_enter, nv_xnu_pm_exit and rmGpuLocksAcquire when runtime D3 is asked
+// for. Its timer reads the sensors through RM a few times a second, and it would have brought back a GPU runtime D3 had
+// switched off at once, or parked its work loop for as long as the GPU is off. Refused, its admission returns uncounted
+// and the GPU lock is refused, so it skips its RM operation (it takes a refused lock as a failed reading).
+static thread_t gNvSmcSkipping;
+static void    *gNvSmcGpuLock;   // rmGpuLocksAcquire, as rm_nvgfx_smc_api reported it
+static int nv_xnu_smc_pm_enter(void)
+{
+    int counted = 0;
+    if (!nv_xnu_pm_reader_enter(&counted)) gNvSmcSkipping = current_thread();
+    return counted;
+}
+static void nv_xnu_smc_pm_exit(int counted)
+{
+    if (gNvSmcSkipping == current_thread()) gNvSmcSkipping = NULL;
+    nv_xnu_pm_exit(counted);
+}
+static NV_STATUS nv_xnu_smc_gpu_lock(NvU32 flags, NvU32 module)
+{
+    if (gNvSmcSkipping == current_thread() || !nv_rtd3_reachable() || !gNvSmcGpuLock) return NV_ERR_GPU_NOT_FULL_POWER;
+    return ((NV_STATUS (*)(NvU32, NvU32))gNvSmcGpuLock)(flags, module);
 }
 // Telemetry is optional: skip a suspended GPU instead of parking its polling
 // thread until wake. Admission and the users count share the PM gate lock, so
@@ -333,6 +414,23 @@ static void nv_xnu_pm_open(void)
     gNvPmClosed = false;
     gNvPmOwner = NULL;
     IOLockWakeup(gNvPmGate, &gNvPmClosed, false);
+    IOLockUnlock(gNvPmGate);
+}
+// Runtime D3 keeps the gate closed for as long as the GPU is off, and the thread that closed it goes back to the
+// thread-call pool: it must not keep the right to pass, or the next timer of this driver that happens to run on it
+// would reach a GPU without power. The resume takes the gate again (nv_xnu_pm_take).
+static void nv_xnu_pm_runtime(bool on)
+{
+    if (!gNvPmGate) return;
+    IOLockLock(gNvPmGate);
+    gNvPmRuntime = on;
+    IOLockUnlock(gNvPmGate);
+}
+static void nv_xnu_pm_disown(void)
+{
+    if (!gNvPmGate) return;
+    IOLockLock(gNvPmGate);
+    gNvPmOwner = NULL;
     IOLockUnlock(gNvPmGate);
 }
 
@@ -398,6 +496,9 @@ extern "C" int nv_xnu_pmap_owner(uint64_t pm, char *name, size_t cap, uint64_t *
     return pid;
 }
 
+// What a sensor reader adds to the control type (0) when it opens NVRM through NVAccel's bridge (0x4E560100); see
+// NVRMUserClient::initWithTask.
+enum : UInt32 { kNvClientReader = 0x100 };
 class NVRMUserClient : public IOUserClient {
     OSDeclareDefaultStructors(NVRMUserClient)
     uint64_t fPm;
@@ -443,6 +544,8 @@ private:
     unsigned fNTok = 0;
     unsigned fTokCap = 0;                // entries fTok has room for (nvrm_tok_table.h)
     bool fIsCtl = true;
+    bool fReader = false;     // opened as a sensor reader (kNvClientReader): see initWithTask
+    bool fRmTouched = false;  // an escape got through the power gate: the RM may hold state for this client
     int  fFd = -1;
     int  fPid = 0;
     bool fEverBound = false;
@@ -2194,14 +2297,18 @@ static const IOReturn kResumeAckWaitUs = 120 * 1000 * 1000;
 IOReturn NVRM::setPowerState(unsigned long ordinal, IOService *device)
 {
     nv_xnu_power_refresh();        // a wake can be a change of power source; this runs before the firmware asks
+    // A GPU that runtime D3 switched off gets its power back first and sleeps like any other: the bus driver saves and
+    // restores its configuration space around the sleep only if it finds the device there.
+    if (ordinal == 0) nv_rtd3_before_system_sleep();
     const SInt32 pm = OSAddAtomic(0, &fGpuPm);
     if (ordinal == 0 && pm == kGpuPmRunning && fAdapter) gpuSuspend();
     else if (ordinal != 0 && pm == kGpuPmSuspended) {
-        if (resumeOnOwnThread()) return kResumeAckWaitUs;
+        if (resumeOnOwnThread()) return kResumeAckWaitUs;   // resumeMain tells runtime D3 when the wake is over
         nv_rtd3_before_system_resume(); gpuResume();
     }
     else LOG("power: setPowerState %lu (gpu %s, adapter %s) - nothing to do", ordinal,
              pm == kGpuPmRunning ? "running" : pm == kGpuPmSuspended ? "suspended" : "lost", fAdapter ? "up" : "down");
+    if (ordinal != 0) nv_rtd3_after_system_wake();
     return kIOPMAckImplied;
 }
 
@@ -2211,13 +2318,13 @@ IOReturn NVRM::setPowerState(unsigned long ordinal, IOService *device)
 // power changes queued in the meantime waited until it returned - among them those of the USB ports and of the devices
 // they enumerate after a wake, which came back that much later (a USB disk whose port gives it back late is dropped by
 // its driver). The resume therefore runs on a thread of its own and IOPM waits for acknowledgeSetPowerState(). The power
-// children (the framebuffers) are still powered on only after it. The opt-in runtime D3 poll keeps the resume on the
-// power-management thread: it can suspend the GPU from its own thread call and does not expect a resume running beside
-// it. -nvrmsyncwake keeps it there too.
+// children (the framebuffers) are still powered on only after it. The opt-in runtime D3 poll stands still from the
+// system's sleep until this resume is over (nv_rtd3_after_system_wake), so it cannot suspend the GPU beside it.
+// -nvrmsyncwake keeps the resume on the power-management thread.
 bool NVRM::resumeOnOwnThread()
 {
     char nb[8] = { 0 };
-    if (nv_rtd3_armed() || PE_parse_boot_argn("-nvrmsyncwake", nb, sizeof nb)) return false;
+    if (PE_parse_boot_argn("-nvrmsyncwake", nb, sizeof nb)) return false;
     LOG("wake #%u: resuming on a thread of its own; power management waits for it", fPmCycles);
     thread_t th = THREAD_NULL;
     retain();   // released by the thread
@@ -2235,6 +2342,7 @@ void NVRM::resumeMain(void *p0, wait_result_t)
     NVRM *s = (NVRM *)p0;
     nv_rtd3_before_system_resume();
     s->gpuResume();
+    nv_rtd3_after_system_wake();
     s->acknowledgeSetPowerState();   // may come before setPowerState has returned: IOPM takes it then too
     s->release();   // the retain taken before the thread started
     thread_terminate(current_thread());
@@ -2309,15 +2417,32 @@ void NVRM::gpuResume()
     notifyFramebuffers(ok ? 1 : 2);
 }
 
-// Opt-in D3cold. The driver's own system-sleep and wake paths do the suspend and resume; nv_rtd3.cpp decides when.
+// Opt-in D3cold. The driver's own system-sleep and wake paths do the suspend and resume, with what a power cut at run time
+// erases put back around them; nv_rtd3.cpp decides when.
 static IOACPIPlatformDevice *rtd3Acpi(NVRM *n)
 {
     IOService *s = n; IOACPIPlatformDevice *a = NULL;
     for (int i = 0; s && i < 16 && !a; i++) { s = s->getProvider(); a = OSDynamicCast(IOACPIPlatformDevice, s); }
     return a;
 }
+// A framebuffer drives a display when its display-connect nub has one attached. NVRMFB keeps the instance of a
+// connector whose cable was pulled, for the next cable, with nothing under the nub: that is not a lit head.
+static bool rtd3HasDisplay(IOService *fb)
+{
+    bool has = false;
+    OSIterator *it = fb->getChildIterator(gIOServicePlane);
+    while (it && !has) {
+        OSObject *o = it->getNextObject();
+        if (!o) break;
+        IOService *c = OSDynamicCast(IOService, o);
+        if (!c || !c->metaCast("IODisplayConnect")) continue;
+        if (OSIterator *d = c->getChildIterator(gIOServicePlane)) { has = d->getNextObject() != nullptr; d->release(); }
+    }
+    OSSafeReleaseNULL(it);
+    return has;
+}
 static int rtd3Heads(void *) {
-    // Every framebuffer: this GPU's own heads, and (hybrid switch on) another GPU's panel published as a head of ours.
+    // Every framebuffer with a display: this GPU's own heads, and (hybrid switch on) another GPU's panel published as a head of ours.
     int hy = 0; { int lv = 0; const int present = PE_parse_boot_argn("nmhybrid", &lv, sizeof(lv)); hy = present && lv >= 1 && lv <= 4; }
     OSDictionary *m = IOService::serviceMatching("IOFramebuffer"); if (!m) return 1;   // cannot look: treat as lit
     OSIterator *it = IOService::getMatchingServices(m); m->release();
@@ -2325,7 +2450,7 @@ static int rtd3Heads(void *) {
     if (it) {
         while (OSObject *o = it->getNextObject()) {
             IOService *s = OSDynamicCast(IOService, o); if (!s) continue;
-            if (s->metaCast("NVRMNVDAFramebuffer")) own++;
+            if (s->metaCast("NVRMNVDAFramebuffer")) { if (rtd3HasDisplay(s)) own++; }
             else if (OSNumber *id = OSDynamicCast(OSNumber, s->getProperty("IOFBDependentID"))) { if (id->unsigned64BitValue() == 0x4E56524D00000001ull) foreign++; }
         }
         it->release();
@@ -2349,16 +2474,210 @@ static int rtd3Clients(void *ctx) {
     }
     return nv_rtd3_clients_total(rm, accel);
 }
+// The by-activity rule's two questions. Work since the last poll is any of (debug.nvrm_rtd3_watch, a mask): 1 a call
+// into the RM, 2 an event the GPU posted to a client, 4 a client that went to wait for one, 8 a GPU interrupt. The GPU
+// is wanted when a call waits at the gate runtime D3 closed.
+static int gRtd3Watch = 1 | 4 | 8;
+SYSCTL_INT(_debug, OID_AUTO, nvrm_rtd3_watch, CTLFLAG_RW | CTLFLAG_LOCKED, &gRtd3Watch, 0,
+           "what counts as GPU work for runtime D3: 1 RM calls, 2 events posted, 4 event waits, 8 interrupts");
+static void rtd3Counters(SInt64 now[4])
+{
+    now[0] = gNvPmEntered; now[1] = gNvEvtPosts; now[2] = gNvEvtWaits; now[3] = (SInt64)gNvIsrCount;
+}
+static int rtd3Active(void *)
+{
+    static SInt64 seen[4];
+    SInt64 now[4]; rtd3Counters(now);
+    int busy = 0;
+    for (int i = 0; i < 4; i++) { if (now[i] != seen[i] && (gRtd3Watch & (1 << i))) busy = 1; seen[i] = now[i]; }
+    return busy;
+}
+static int rtd3Wanted(void *) { return gNvPmSleepers > 0; }
+// Saving what is in video memory is most of a runtime power cut's time, and every call that arrives meanwhile waits for
+// it: four to six seconds with a quiet desktop, thirteen to twenty-two with browsers holding the GPU's memory. Above
+// debug.nvrm_rtd3_vram MB in use (boot argument nvrtd3vram, 0: no limit) the GPU is left on and its idle time starts
+// again. NVIDIA's own driver copies at most 200 MB this way; above that it keeps video memory in self-refresh (GC6),
+// which this port does not have.
+static int gRtd3VramMb = 256;
+SYSCTL_INT(_debug, OID_AUTO, nvrm_rtd3_vram, CTLFLAG_RW | CTLFLAG_LOCKED, &gRtd3VramMb, 0,
+           "runtime D3: no power cut with more video memory in use than this, MB (0: no limit)");
+// The four counters over the time since the last read: what an idle desktop really does to the GPU. sysctl(8) asks
+// twice, first for the length with no buffer and then for the text: only a read that took the text starts a new count.
+static uint64_t gRtd3BusyAt;   // ns, when the count started
+static int rtd3BusySysctl SYSCTL_HANDLER_ARGS
+{
+    static SInt64 seen[4];
+    SInt64 now[4]; rtd3Counters(now);
+    uint64_t ns = 0; absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
+    char b[200];
+    snprintf(b, sizeof b, "in %llu s: %lld RM call(s), %lld event(s) posted, %lld event wait(s), %lld interrupt(s); watching %d",
+             gRtd3BusyAt && ns > gRtd3BusyAt ? (ns - gRtd3BusyAt) / NSEC_PER_SEC : 0ULL, now[0] - seen[0], now[1] - seen[1],
+             now[2] - seen[2], now[3] - seen[3], gRtd3Watch);
+    const int e = SYSCTL_OUT(req, b, strlen(b) + 1);
+    if (!e && req->oldptr != USER_ADDR_NULL) { for (int i = 0; i < 4; i++) seen[i] = now[i]; gRtd3BusyAt = ns; }
+    return e;
+}
+SYSCTL_PROC(_debug, OID_AUTO, nvrm_rtd3_busy, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED, 0, 0, rtd3BusySysctl, "A",
+            "GPU work since this was last read");
+// A power cut at run time. The system-sleep path leaves the GPU suspended behind the closed gate; on top of it, nothing
+// puts the configuration space back when the power returns (the bus driver does that only around a system sleep), so
+// it is asked to keep a copy now and to write it back before the resume.
+void NVRM::rtd3Suspend()
+{
+    fRtd3Id = rtd3BusRead32(0, 0x00); fRtd3Subsys = rtd3BusRead32(0, 0x2c);
+    fRtd3HdaId = rtd3BusRead32(1, 0x00);
+    if (fRtd3HdaId == 0xffffffffU) fRtd3HdaId = 0;
+    fRtd3GaveUp = false; fRtd3OnTries = 0;
+    nv_xnu_pm_runtime(true);
+    gpuSuspend();
+    nv_xnu_pm_disown();
+    fRtd3Saved = fPCI->saveDeviceState() == kIOReturnSuccess;
+    fRtd3SavedHda = false;
+    if (IOPCIDevice *h = hdaFunction()) { fRtd3SavedHda = h->saveDeviceState() == kIOReturnSuccess; h->release(); }
+    LOG("runtime D3: GPU suspended, configuration space %s, audio function %s", fRtd3Saved ? "saved" : "NOT saved",
+        fRtd3SavedHda ? "saved" : "not saved");
+}
+void NVRM::rtd3Resume()
+{
+    // A GPU that lost its power comes back without what the firmware writes into it at boot: its subsystem ID (0x40 is
+    // the register that sets it), and its audio function, hidden until bit 25 of 0x488 is set (Linux does the same when
+    // it resumes one: quirk_nvidia_hda).
+    // A GPU given up as lost has nothing to restore: the resume below finds it gone, marks it lost and opens the gate.
+    if (fRtd3GaveUp) fRtd3Saved = fRtd3SavedHda = false;
+    const UInt32 subsys = rtd3BusRead32(0, 0x2c);
+    if (!fRtd3GaveUp && fRtd3Subsys && subsys != 0xffffffffU && subsys != fRtd3Subsys) {
+        fPCI->configWrite32(0x40, fRtd3Subsys);
+        LOG("runtime D3: the subsystem ID came back as 0x%08x, written again -> 0x%08x", subsys, rtd3BusRead32(0, 0x2c));
+    }
+    if (fRtd3Saved) {
+        const IOReturn r = fPCI->restoreDeviceState();
+        LOG("runtime D3: configuration space restored -> 0x%x, vendor 0x%04x, command 0x%04x", r, fPCI->configRead16(0x00), fPCI->configRead16(0x04));
+        fRtd3Saved = false;
+    }
+    if (fRtd3SavedHda) {
+        UInt32 hid = rtd3BusRead32(1, 0x00);
+        if (fRtd3HdaId && hid != fRtd3HdaId) {
+            const UInt32 v = fPCI->extendedConfigRead32(0x488);
+            fPCI->extendedConfigWrite32(0x488, v | (1U << 25));
+            for (int i = 0; i < 40 && (hid = rtd3BusRead32(1, 0x00)) != fRtd3HdaId; i++) IOSleep(5);
+            LOG("runtime D3: the audio function was hidden after the power cut (0x488 was 0x%08x): enabled, it answers 0x%08x", v, hid);
+        }
+        // the bus driver gives up for good a device that does not answer when it restores it
+        if (!fRtd3HdaId || hid == fRtd3HdaId) { if (IOPCIDevice *h = hdaFunction()) { h->restoreDeviceState(); h->release(); } }
+        else LOG("runtime D3: the audio function does not answer (0x%08x): its configuration space is NOT restored", hid);
+        fRtd3SavedHda = false;
+    }
+    gpuResume();
+    nv_xnu_pm_runtime(false);
+    if (OSAddAtomic(0, &fGpuPm) != kGpuPmRunning) return;
+    // A client submits by writing its put pointer in USERD and then its token in the usermode doorbell, with no system
+    // call; with the power off the second write reached nothing (nvrm_rtd3_rm.c rings every channel once).
+    NvXnuPmUse pmUse;
+    NvU32 rung = 0, channels = 0;
+    const NV_STATUS st = rm_xnu_ring_channels(&fNv, &rung, &channels);
+    LOG("runtime D3: rang the doorbell of %u of %u channel(s) -> 0x%x", rung, channels, (unsigned)st);
+}
+// Asked by the monitor, with the GPU on and the idle time served. A reading that fails does not keep the GPU on.
+int NVRM::rtd3Heavy()
+{
+    static unsigned kept;
+    NvU64 used = 0;
+    const NV_STATUS st = rm_xnu_used_fb(&fNv, &used);
+    const unsigned long long mb = used >> 20;
+    const bool heavy = st == NV_OK && gRtd3VramMb > 0 && mb > (unsigned long long)gRtd3VramMb;
+    if (!heavy) kept = 0;
+    if (st != NV_OK) LOG("runtime D3: the video memory in use could not be read (0x%x): the power is cut anyway", (unsigned)st);
+    else if (!heavy) LOG("runtime D3: idle, %llu MB of video memory in use to save (limit %d MB)", mb, gRtd3VramMb);
+    else if (kept++ < 5 || kept % 30 == 0) LOG("runtime D3: idle, but %llu MB of video memory in use (limit %d MB): left on (%u)", mb, gRtd3VramMb, kept);
+    return heavy;
+}
+// Where the firmware's power methods can be asked from. A power resource is declared beside the GPU, under its root port.
+void NVRM::rtd3Nodes(IOACPIPlatformDevice *nodes[3])
+{
+    IOService *pp = fPCI->getProvider();
+    IOService *rp = pp ? pp->getProvider() : NULL;
+    nodes[0] = (rp && rp->metaCast("IOPCIDevice")) ? OSDynamicCast(IOACPIPlatformDevice, rp->getProperty("acpi-device")) : NULL;
+    nodes[1] = OSDynamicCast(IOACPIPlatformDevice, fPCI->getProperty("acpi-device"));
+    nodes[2] = rtd3Acpi(this);
+}
+// What a function of the GPU answers on the bus, asked through the bridge above it and not through the device's own
+// accessors: all-ones when nothing answers.
+UInt32 NVRM::rtd3BusRead32(unsigned function, UInt8 offset)
+{
+    IOPCIAddressSpace sp = fPCI->space;
+    sp.s.functionNum = function;
+    return fPCI->configRead32(sp, offset);
+}
+// The firmware's word that the power is back is not the GPU's. Nothing may write to the GPU before it answers on the bus,
+// the bus driver included: it waits two seconds for a device it restores and then gives it up for good
+// (IOPCIDeviceDeadOnRestore), and the GPU is lost until the restart.
+int NVRM::rtd3PowerOn()
+{
+    IOACPIPlatformDevice *nd[3]; rtd3Nodes(nd);
+    const unsigned tries = ++fRtd3OnTries;
+    if (tries == 1) fRtd3OnSince = mach_absolute_time();
+    if (tries > 5 && tries % 20) return 0;   // a GPU that did not come back is asked for again every five seconds
+    const bool loud = tries <= 3 || tries % 240 == 0;
+    if (!nv_rtd3_power_on(nd, !loud)) return 0;
+    const uint64_t t0 = mach_absolute_time();
+    UInt32 id = rtd3BusRead32(0, 0x00);
+    for (int i = 0; i < 400 && id != fRtd3Id; i++) { IOSleep(5); id = rtd3BusRead32(0, 0x00); }
+    uint64_t ns = 0; absolutetime_to_nanoseconds(mach_absolute_time() - t0, &ns);
+    const bool back = id == fRtd3Id;
+    if (loud || back)
+        LOG("runtime D3: the GPU answers 0x%08x on the bus %llu ms after the power-on request: %s", id, ns / 1000000ULL,
+            back ? "it is back" : "NOT back, it stays suspended and is asked for again");
+    if (back) { fRtd3OnTries = 0; return 1; }
+    // Calls into the RM wait at the gate for as long as the GPU is suspended. One that never comes back must not hold
+    // them for ever: after twenty seconds it is given up as lost, and they get an error instead.
+    uint64_t waited = 0; absolutetime_to_nanoseconds(mach_absolute_time() - fRtd3OnSince, &waited);
+    if (waited < 20ULL * NSEC_PER_SEC) return 0;
+    LOG("runtime D3: the GPU did not come back in %llu s: given up as lost, so that the calls waiting for it get an answer", waited / NSEC_PER_SEC);
+    fRtd3GaveUp = true; fRtd3OnTries = 0;
+    return 1;
+}
+IOReturn NVRM::rtd3AcpiMessage(void *, void *, UInt32 type, IOService *, void *arg, vm_size_t)
+{
+    if (type == kIOACPIMessageDeviceNotification && arg) nv_rtd3_acpi_notification(*(UInt32 *)arg);
+    return kIOReturnSuccess;
+}
 void NVRM::rtd3Arm()
 {
     const struct nv_rtd3_ops ops = {
-        this, rtd3Heads, rtd3Clients,
-        [](void *c) { ((NVRM *)c)->gpuSuspend(); },
-        [](void *c) { ((NVRM *)c)->gpuResume(); },
-        [](void *c) { return nv_rtd3_power_off(rtd3Acpi((NVRM *)c)); },
-        [](void *c) { return nv_rtd3_power_on(rtd3Acpi((NVRM *)c)); },
+        this,
+        // a GPU the driver lost is never switched: nothing would bring it back
+        [](void *c) { return OSAddAtomic(0, &((NVRM *)c)->fGpuPm) == kGpuPmLost ? 1 : rtd3Heads(c); },
+        rtd3Clients,
+        [](void *c) { ((NVRM *)c)->rtd3Suspend(); },
+        [](void *c) { ((NVRM *)c)->rtd3Resume(); },
+        [](void *c) { IOACPIPlatformDevice *nd[3]; ((NVRM *)c)->rtd3Nodes(nd);
+                      const int ok = nv_rtd3_power_off(nd);
+                      if (ok) ((NVRM *)c)->setProperty("nvrm-pm", "off (runtime D3)");
+                      return ok; },
+        [](void *c) { return ((NVRM *)c)->rtd3PowerOn(); },
+        [](void *c) { IOACPIPlatformDevice *nd[3]; ((NVRM *)c)->rtd3Nodes(nd); return nv_rtd3_reach(nd); },
+        rtd3Active, rtd3Wanted,
+        [](void *c) { return ((NVRM *)c)->rtd3Heavy(); },
     };
     nv_rtd3_arm(&ops);
+    if (!nv_rtd3_asked() || fRtd3Acpi) return;   // without the boot argument nothing more is registered
+    static bool sysctlsUp;   // once, and never taken away: NVRM is not unloaded
+    if (!sysctlsUp) {
+        sysctlsUp = true;
+        sysctl_register_oid(&sysctl__debug_nvrm_rtd3_watch); sysctl_register_oid(&sysctl__debug_nvrm_rtd3_busy);
+        sysctl_register_oid(&sysctl__debug_nvrm_pm_entered); sysctl_register_oid(&sysctl__debug_nvrm_rtd3_vram);
+        uint32_t mb = 0;
+        if (PE_parse_boot_argn("nvrtd3vram", &mb, sizeof mb) && mb <= 65536) gRtd3VramMb = (int)mb;
+        absolutetime_to_nanoseconds(mach_absolute_time(), &gRtd3BusyAt);
+    }
+    // The firmware tells the GPU's own ACPI node what happens on its outputs while the GPU cannot: a cable plugged in
+    // with the power off arrives as a notification there (nv_rtd3_acpi_notification).
+    if (IOService *node = OSDynamicCast(IOService, fPCI->getProperty("acpi-device")))
+        if (const OSSymbol *interest = OSSymbol::withCString(kIOGeneralInterest)) {
+            fRtd3Acpi = node->registerInterest(interest, &NVRM::rtd3AcpiMessage, this);
+            interest->release();
+        }
+    LOG("runtime D3: %s the GPU's ACPI node for notifications", fRtd3Acpi ? "listening to" : "could not reach");
 }
 
 void NVRM::pciSaveForSleep()
@@ -2707,8 +3026,15 @@ IOReturn NVRM::callPlatformFunction(const OSSymbol *fn, bool wait, void *p1, voi
         const unsigned int room = api->size ? api->size : NVRM_SMC_API_SIZE_V1;
         if (room < NVRM_SMC_API_SIZE_V1) return kIOReturnBadArgument;
         rm_nvgfx_smc_api(api);
-        api->pmEnter = (void *)nv_xnu_pm_enter;
-        api->pmExit = (void *)nv_xnu_pm_exit;
+        if (nv_rtd3_asked()) {
+            gNvSmcGpuLock = api->gpuLock;
+            api->gpuLock = (void *)nv_xnu_smc_gpu_lock;
+            api->pmEnter = (void *)nv_xnu_smc_pm_enter;
+            api->pmExit = (void *)nv_xnu_smc_pm_exit;
+        } else {
+            api->pmEnter = (void *)nv_xnu_pm_enter;
+            api->pmExit = (void *)nv_xnu_pm_exit;
+        }
         api->size = NVRM_SMC_API_SIZE_V1;
         if (room >= sizeof(*api)) {
             nvrm_smc_api_range(api);
@@ -2832,6 +3158,13 @@ bool NVRMUserClient::initWithTask(task_t owningTask, void *securityID, UInt32 ty
     // device client. The ctl client stays open to unprivileged callers on purpose -- the Vulkan
     // userland opens it as the logged-in user -- and the escalated operations behind it are gated
     // by the real-privilege check in _os_is_administrator and the root requirement on first init.
+    // With runtime D3 asked for, a sensor reader (a RUSD sample) may add kNvClientReader to the type: its calls are not
+    // counted as work and, while the GPU is off, they are refused at once instead of bringing it back. Without runtime
+    // D3 the bit is refused like any unknown type, and a reader opens the plain type instead.
+    if (type & kNvClientReader) {
+        if (!nv_rtd3_asked()) return false;
+        fReader = true; type &= ~kNvClientReader;
+    }
     if (type > 1) return false;
     fIsCtl = (type == 0);
     fGate = IOLockAlloc();
@@ -2887,7 +3220,14 @@ IOReturn NVRMUserClient::clientClose(void)
     if (OSCompareAndSwap(0, 1, &fCleaned)) {
         Gate g(fGate);
         if (gNvClientsLock && fFd >= 0) { IOLockLock(gNvClientsLock); gNvClients[fFd] = NULL; nv_pm_close(fPm); IOLockUnlock(gNvClientsLock); }
-        if (fOwner) { NvXnuPmUse pmUse; rm_cleanup_file_private(NULL, nvState(), &fNvfp); }
+        // A sensor reader whose every call was refused (the GPU was off) has nothing in the RM to clean up, and does not
+        // bring the GPU back for it. Its teardown is not counted as work either; only if the GPU went off since its last
+        // call does it wait for the GPU, like any call.
+        if (fOwner && (!fReader || fRmTouched)) {
+            NvXnuPmReaderUse readerUse(fReader);
+            NvXnuPmUse pmUse(!fReader || !readerUse.in);
+            rm_cleanup_file_private(NULL, nvState(), &fNvfp);
+        }
         // The ranges are NOT freed here. clientClose can run while another thread is inside
         // clientMemoryForType, which reads this array and hands its entries to
         // IOMemoryDescriptor::withPhysicalAddress - so freeing it here let a process map whatever
@@ -3156,6 +3496,9 @@ IOReturn NVRMUserClient::sWaitEvent(OSObject *target, void *reference, IOExterna
     const UInt32 seen = (UInt32)args->scalarInput[0];
     uint64_t us = args->scalarInput[1]; if (us > 100000) us = 100000;
     OSIncrementAtomic64(&gNvEvtWaits);
+    // A client that goes to wait while runtime D3 has the GPU off queued its work without a system call, and the doorbell
+    // it rang reached nothing. Bring the GPU back: the resume rings every channel again.
+    if ((gRtd3Watch & 4) && !nv_rtd3_reachable()) nv_rtd3_want("a client waiting for an event");
     if (us && me->fEvtSeq == seen) {
         // OSIncrementAtomic returns the value before the increment.
         if (OSIncrementAtomic(&gNvEvtSleepers) >= kNvEvtMaxSleepers) {
@@ -3240,7 +3583,10 @@ IOReturn NVRMUserClient::esc(uint32_t cmd, void *data, uint32_t size)
     NvMapPendingScope pendingScope;   // a mapping-length slot never outlives this escape
     if (!fOwner || fOwner->fPassDone < 2) { static bool once; if (!once) { once = true; kprintf("NVRM-xnu: esc 0x%x refused: adapter not up (run nvrmctl go 2)\n", cmd); } return kIOReturnNotReady; }
     nv_state_t *nv = nvState();
-    NvXnuPmUse pmUse;
+    NvXnuPmUse pmUse(!fReader);
+    NvXnuPmReaderUse readerUse(fReader);
+    if (!readerUse.in) return kIOReturnOffline;   // a sensor reader does not bring back a GPU that runtime D3 switched off
+    fRmTouched = true;
     switch (cmd) {
     case NV_ESC_CARD_INFO: {
         if (!fIsCtl) return kIOReturnBadArgument;
