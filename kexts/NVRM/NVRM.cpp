@@ -103,6 +103,7 @@ extern "C" int  nv_rtd3_power_off(IOACPIPlatformDevice *const *nodes);
 extern "C" int  nv_rtd3_power_on(IOACPIPlatformDevice *const *nodes, int quiet);
 extern "C" int  nv_rtd3_reach(IOACPIPlatformDevice *const *nodes);
 extern "C" NV_STATUS rm_xnu_ring_channels(nv_state_t *nv, NvU32 *pRung, NvU32 *pChannels);   // nvrm_rtd3_rm.c
+extern "C" NV_STATUS rm_xnu_used_fb(nv_state_t *nv, NvU64 *pUsed);                             // nvrm_rtd3_rm.c
 extern "C" nv_state_t *nv_xnu_gpu_state(void);
 extern "C" nv_state_t *nv_xnu_gpu_state_at(unsigned index);
 extern "C" void *nv_xnu_gpu_os_device_at(unsigned index);
@@ -216,6 +217,7 @@ private:
     void rtd3Nodes(IOACPIPlatformDevice *nodes[3]);   // the root port's ACPI node, the GPU's, the host bridge's
     UInt32 rtd3BusRead32(unsigned function, UInt8 offset);
     int  rtd3PowerOn();
+    int  rtd3Heavy();
     static IOReturn rtd3AcpiMessage(void *target, void *ref, UInt32 type, IOService *provider, void *arg, vm_size_t size);
     void pciSaveForSleep();
     bool pciRestoreAfterWake();
@@ -2491,6 +2493,14 @@ static int rtd3Active(void *)
     return busy;
 }
 static int rtd3Wanted(void *) { return gNvPmSleepers > 0; }
+// Saving what is in video memory is most of a runtime power cut's time, and every call that arrives meanwhile waits for
+// it: four to six seconds with a quiet desktop, thirteen to twenty-two with browsers holding the GPU's memory. Above
+// debug.nvrm_rtd3_vram MB in use (boot argument nvrtd3vram, 0: no limit) the GPU is left on and its idle time starts
+// again. NVIDIA's own driver copies at most 200 MB this way; above that it keeps video memory in self-refresh (GC6),
+// which this port does not have.
+static int gRtd3VramMb = 256;
+SYSCTL_INT(_debug, OID_AUTO, nvrm_rtd3_vram, CTLFLAG_RW | CTLFLAG_LOCKED, &gRtd3VramMb, 0,
+           "runtime D3: no power cut with more video memory in use than this, MB (0: no limit)");
 // The four counters over the time since the last read: what an idle desktop really does to the GPU. sysctl(8) asks
 // twice, first for the length with no buffer and then for the text: only a read that took the text starts a new count.
 static uint64_t gRtd3BusyAt;   // ns, when the count started
@@ -2567,6 +2577,20 @@ void NVRM::rtd3Resume()
     const NV_STATUS st = rm_xnu_ring_channels(&fNv, &rung, &channels);
     LOG("runtime D3: rang the doorbell of %u of %u channel(s) -> 0x%x", rung, channels, (unsigned)st);
 }
+// Asked by the monitor, with the GPU on and the idle time served. A reading that fails does not keep the GPU on.
+int NVRM::rtd3Heavy()
+{
+    static unsigned kept;
+    NvU64 used = 0;
+    const NV_STATUS st = rm_xnu_used_fb(&fNv, &used);
+    const unsigned long long mb = used >> 20;
+    const bool heavy = st == NV_OK && gRtd3VramMb > 0 && mb > (unsigned long long)gRtd3VramMb;
+    if (!heavy) kept = 0;
+    if (st != NV_OK) LOG("runtime D3: the video memory in use could not be read (0x%x): the power is cut anyway", (unsigned)st);
+    else if (!heavy) LOG("runtime D3: idle, %llu MB of video memory in use to save (limit %d MB)", mb, gRtd3VramMb);
+    else if (kept++ < 5 || kept % 30 == 0) LOG("runtime D3: idle, but %llu MB of video memory in use (limit %d MB): left on (%u)", mb, gRtd3VramMb, kept);
+    return heavy;
+}
 // Where the firmware's power methods can be asked from. A power resource is declared beside the GPU, under its root port.
 void NVRM::rtd3Nodes(IOACPIPlatformDevice *nodes[3])
 {
@@ -2633,6 +2657,7 @@ void NVRM::rtd3Arm()
         [](void *c) { return ((NVRM *)c)->rtd3PowerOn(); },
         [](void *c) { IOACPIPlatformDevice *nd[3]; ((NVRM *)c)->rtd3Nodes(nd); return nv_rtd3_reach(nd); },
         rtd3Active, rtd3Wanted,
+        [](void *c) { return ((NVRM *)c)->rtd3Heavy(); },
     };
     nv_rtd3_arm(&ops);
     if (!nv_rtd3_asked() || fRtd3Acpi) return;   // without the boot argument nothing more is registered
@@ -2640,7 +2665,9 @@ void NVRM::rtd3Arm()
     if (!sysctlsUp) {
         sysctlsUp = true;
         sysctl_register_oid(&sysctl__debug_nvrm_rtd3_watch); sysctl_register_oid(&sysctl__debug_nvrm_rtd3_busy);
-        sysctl_register_oid(&sysctl__debug_nvrm_pm_entered);
+        sysctl_register_oid(&sysctl__debug_nvrm_pm_entered); sysctl_register_oid(&sysctl__debug_nvrm_rtd3_vram);
+        uint32_t mb = 0;
+        if (PE_parse_boot_argn("nvrtd3vram", &mb, sizeof mb) && mb <= 65536) gRtd3VramMb = (int)mb;
         absolutetime_to_nanoseconds(mach_absolute_time(), &gRtd3BusyAt);
     }
     // The firmware tells the GPU's own ACPI node what happens on its outputs while the GPU cannot: a cable plugged in

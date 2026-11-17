@@ -270,7 +270,8 @@ call into the RM, a client that waits for an event, or the firmware's notificati
 of its outputs, which then lights as after any wake. Sensor readers neither keep it on nor bring it back: SMCNvidiaGPU's readings are not
 counted and are skipped while it is off, and a program that samples the shared data page can open its control client with
 `0x100` added to the type (`0x4E560100` through NVAccel's bridge): its calls are not counted, and while the GPU is off they
-fail at once.
+fail at once. With more than 256 MB of video memory in use (`nvrtd3vram`, `debug.nvrm_rtd3_vram`) the GPU stays on: there is
+no GC6 here, and saving that much to system memory would hold every call that arrives meanwhile.
 
 ## Mux switching (Advanced Optimus)
 

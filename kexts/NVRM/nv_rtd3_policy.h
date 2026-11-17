@@ -71,9 +71,12 @@ struct nv_rtd3_ops {
     /* By activity. Both absent (a caller that knows only the rule above): the no-client rule is applied. */
     int  (*active)(void *ctx);      /* the GPU did work since the last poll: a call into the RM, an event wait, an interrupt */
     int  (*wanted)(void *ctx);      /* with the GPU off: something asks for it (a call waits for it, a display was plugged in) */
+    /* Absent: no limit. */
+    int  (*heavy)(void *ctx);       /* idle, but so much video memory is in use that saving it would take too long */
 };
 
-enum { NV_RTD3_TICK_NONE = 0, NV_RTD3_TICK_POWERED_OFF = 1, NV_RTD3_TICK_OFF_FAILED = -1, NV_RTD3_TICK_WOKE = 2, NV_RTD3_TICK_WAKE_FAILED = -2 };
+enum { NV_RTD3_TICK_NONE = 0, NV_RTD3_TICK_POWERED_OFF = 1, NV_RTD3_TICK_OFF_FAILED = -1, NV_RTD3_TICK_WOKE = 2, NV_RTD3_TICK_WAKE_FAILED = -2,
+       NV_RTD3_TICK_HEAVY = 3 };
 
 /* One poll. `idle_s` is the seconds the GPU has been idle, kept by the caller; `period_s` is the seconds this tick stands for.
  * Idle long enough: suspend the driver, then switch the resource off; if that fails the driver is resumed at once and the
@@ -87,6 +90,8 @@ static inline int nv_rtd3_tick(struct nv_rtd3 *s, const struct nv_rtd3_ops *o, u
         if (busy) { *idle_s = 0; return NV_RTD3_TICK_NONE; }
         *idle_s += period_s;
         if (!nv_rtd3_may_power_off(s, 1, 0, 0, *idle_s)) return NV_RTD3_TICK_NONE;
+        /* Asked only once the idle time is served: it costs a call into the RM. Too much in use: the idle time starts again. */
+        if (o->heavy && o->heavy(o->ctx)) { *idle_s = 0; return NV_RTD3_TICK_HEAVY; }
         o->suspend(o->ctx);
         int ok = o->acpi_off(o->ctx);
         nv_rtd3_off_done(s, ok);

@@ -244,7 +244,7 @@ static char g_why[48] = "-";          // what the last power-on was for
 static volatile SInt32 g_force;       // debug.nvrm_rtd3_now=1: the idle time counts as served, once
 static volatile SInt32 g_wake;        // the GPU was asked for while it is off
 static struct {
-    unsigned offs, backs, off_failed, on_waits, notifications, last_notification;
+    unsigned offs, backs, off_failed, on_waits, notifications, last_notification, heavy;
     uint64_t off_at, off_ms;
 } g_stat;
 
@@ -284,6 +284,7 @@ static void nv_rtd3_account(int r)
         // asked again at every poll until the GPU answers or is given up (NVRM::rtd3PowerOn): a few lines, then one a minute
         if (g_stat.on_waits++ < 3 || g_stat.on_waits % 240 == 0) RLOG("power-on asked for, the GPU does not answer yet (%u)", g_stat.on_waits);
     }
+    if (r == NV_RTD3_TICK_HEAVY) g_stat.heavy++;   // NVRM's question logs the figures
     if (r == NV_RTD3_TICK_WOKE || r == NV_RTD3_TICK_OFF_FAILED) OSCompareAndSwap(1, 0, &g_wake);
 }
 
@@ -421,10 +422,10 @@ static int nv_rtd3_sysctl_state SYSCTL_HANDLER_ARGS
                     : g_via == NV_RTD3_VIA_OPTIMUS ? "_DSM and _PS3 on the GPU node" : "nothing found";
     const uint64_t ms = g_stat.off_ms + (off ? now_ms() - g_stat.off_at : 0);
     snprintf(b, sizeof b, "%s, rule %d, resource %s, switched through %s, idle %u of %u s, %d head(s) lit, off %u time(s) for %llu s in all, "
-             "back %u time(s) (last for: %s), failed: off %u, ACPI notifications %u (last 0x%x)",
+             "back %u time(s) (last for: %s), kept on for its video memory %u time(s), failed: off %u, ACPI notifications %u (last 0x%x)",
              off ? "off" : "on", g_rtd3.enabled, g_res[0] ? g_res : "(none)", way, off ? 0 : g_idle,
              g_rtd3.idle_need ? g_rtd3.idle_need : NV_RTD3_IDLE_SECONDS, g_ops.heads_lit ? g_ops.heads_lit(g_ops.ctx) : -1,
-             g_stat.offs, ms / 1000ULL, g_stat.backs, g_why, g_stat.off_failed, g_stat.notifications, g_stat.last_notification);
+             g_stat.offs, ms / 1000ULL, g_stat.backs, g_why, g_stat.heavy, g_stat.off_failed, g_stat.notifications, g_stat.last_notification);
     return nv_rtd3_text_out(req, b);
 }
 SYSCTL_PROC(_debug, OID_AUTO, nvrm_rtd3, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, 0, 0, nv_rtd3_sysctl_level, "I",

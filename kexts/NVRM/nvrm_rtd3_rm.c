@@ -2,7 +2,8 @@
  * NullMoth NVIDIA driver for macOS
  * SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
  *
- * After a power cut at run time: tell the host about the work clients queued while the GPU had no power.
+ * Runtime D3's questions to RM. After a power cut: tell the host about the work clients queued while the GPU had no
+ * power. Before one: how much video memory the suspend would have to save.
  *
  * A client submits without a system call. It writes its channel's put pointer in USERD, which is system memory and
  * keeps the value, and then its work-submit token in the usermode doorbell, which is a register of the GPU: with the
@@ -25,6 +26,7 @@
 #include <core/locks.h>
 #include "kernel/gpu/fifo/kernel_fifo.h"
 #include "kernel/gpu/fifo/kernel_channel.h"
+#include <gpu/mem_mgr/mem_mgr.h>
 #pragma clang diagnostic pop
 
 NV_STATUS rm_xnu_ring_channels(nv_state_t *nv, NvU32 *pRung, NvU32 *pChannels);
@@ -72,5 +74,37 @@ NV_STATUS rm_xnu_ring_channels(nv_state_t *nv, NvU32 *pRung, NvU32 *pChannels)
     NV_EXIT_RM_RUNTIME(sp, fp);
     if (pRung) *pRung = rung;
     if (pChannels) *pChannels = channels;
+    return st;
+}
+
+/* What RM's own runtime power management weighs before it copies video memory out (dynamic-power.c,
+ * RmCanEnterGcxUnderGpuLock): the memory in use, without the GSP's regions, which it saves by itself. */
+NV_STATUS rm_xnu_used_fb(nv_state_t *nv, NvU64 *pUsed);
+
+NV_STATUS rm_xnu_used_fb(nv_state_t *nv, NvU64 *pUsed)
+{
+    THREAD_STATE_NODE threadState;
+    NV_STATUS st;
+    void *fp;
+    nvidia_stack_t *sp = NULL;
+    OBJGPU *pGpu = nv ? NV_GET_NV_PRIV_PGPU(nv) : NULL;
+
+    if (pUsed) *pUsed = 0;
+    if (pGpu == NULL || pUsed == NULL)
+        return NV_ERR_INVALID_ARGUMENT;
+
+    NV_ENTER_RM_RUNTIME(sp, fp);
+    threadStateInit(&threadState, THREAD_STATE_FLAGS_NONE);
+    if ((st = rmapiLockAcquire(API_LOCK_FLAGS_NONE, RM_LOCK_MODULES_MEM)) == NV_OK) {
+        if ((st = rmGpuLocksAcquire(GPUS_LOCK_FLAGS_NONE, RM_LOCK_MODULES_MEM)) == NV_OK) {
+            MemoryManager *pMemoryManager = GPU_GET_MEMORY_MANAGER(pGpu);
+            st = (pMemoryManager == NULL || !FULL_GPU_SANITY_CHECK(pGpu)) ? NV_ERR_GPU_NOT_FULL_POWER
+                                                                         : memmgrGetUsedRamSize(pGpu, pMemoryManager, pUsed);
+            rmGpuLocksRelease(GPUS_LOCK_FLAGS_NONE, NULL);
+        }
+        rmapiLockRelease();
+    }
+    threadStateFree(&threadState, THREAD_STATE_FLAGS_NONE);
+    NV_EXIT_RM_RUNTIME(sp, fp);
     return st;
 }
