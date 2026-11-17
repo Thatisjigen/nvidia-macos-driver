@@ -1,0 +1,101 @@
+The NVRM back end's table of CPU mappings under a lock. Taken from the NVRM fixes of TheFormidable's fork
+(nvk/nvk-nvrm-fixes.patch at fd04eaf3, https://github.com/TheFormidable/nvidia-macos-driver/commit/fd04eaf39af5a93578927ae122cdc96a53a30556):
+the lock only, not that patch's other changes (VK_EXT_map_memory_placed, the switches read once, osEvent).
+Each CPU map of a memory object adds its address to the device's table (dev->mappings) and each unmap looks it up and
+removes it. nvkmd.c serialises the maps of one memory object only (map_mutex), and client maps and the unmaps of
+nvkmd_mem_unref not at all, so two threads mapping or freeing two different memories changed the hash table at the same
+time and could corrupt the heap. Every insert, search and remove now holds a mutex of the device (mappings_mutex),
+created and destroyed with the table. It is held only around the table operation, never across an RM call and never
+while another lock is taken, so it cannot be part of a lock cycle. An unmap now removes its entry before the RM unmap
+instead of after it: once RM has unmapped, another thread can be given the same address and insert it, and the old
+order then removed that new mapping's entry.
+Applied after the 3.0 chain, with or without nvk-event-lazy (NVK_EXTRA_PATCHES="... nvk-mappings-lock").
+
+diff --git a/src/nouveau/vulkan/nvkmd/nvrm/nvkmd_nvrm.h b/src/nouveau/vulkan/nvkmd/nvrm/nvkmd_nvrm.h
+index cf35ebb..91f3369 100644
+--- a/src/nouveau/vulkan/nvkmd/nvrm/nvkmd_nvrm.h
++++ b/src/nouveau/vulkan/nvkmd/nvrm/nvkmd_nvrm.h
+@@ -72,7 +72,11 @@ VkResult nvkmd_nvrm_try_create_pdev(struct _drmDevice *drm_device,
+ 
+ struct nvkmd_nvrm_dev {
+    struct nvkmd_dev base;
++   /* CPU address -> NvRmApiMapping of every CPU map of this device's memory (nvkmd_nvrm_mem.c). Any thread can map or
++    * unmap a memory object, so every insert, search and remove holds mappings_mutex. It is a leaf lock: nothing else is
++    * taken while it is held, and it is never held across an RM call. */
+    struct hash_table *mappings;
++   simple_mtx_t mappings_mutex;
+    /* b73 ONE graphics non-stall event per device (patch_evdev.py): engine-wide in RM, so per-channel events only
+     * multiplied RM's per-interrupt list walk. Waits sleep on osEvent (kext selector 6). -1 / 0 = none. */
+    int osEvent;
+diff --git a/src/nouveau/vulkan/nvkmd/nvrm/nvkmd_nvrm_dev.c b/src/nouveau/vulkan/nvkmd/nvrm/nvkmd_nvrm_dev.c
+index 1e2d658..b0d6f2a 100644
+--- a/src/nouveau/vulkan/nvkmd/nvrm/nvkmd_nvrm_dev.c
++++ b/src/nouveau/vulkan/nvkmd/nvrm/nvkmd_nvrm_dev.c
+@@ -196,6 +196,7 @@ nvkmd_nvrm_create_dev(struct nvkmd_pdev *_pdev,
+    list_inithead(&dev->base.mems);
+    simple_mtx_init(&dev->base.mems_mutex, mtx_plain);
+ 
++   simple_mtx_init(&dev->mappings_mutex, mtx_plain);
+    dev->mappings = _mesa_hash_table_create(NULL, _mesa_hash_pointer, _mesa_key_pointer_equal);
+    if (dev->mappings == NULL) {
+    	  nvkmd_dev_destroy(&dev->base);
+@@ -224,6 +225,7 @@ nvkmd_nvrm_dev_destroy(struct nvkmd_dev *_dev)
+    struct nvkmd_nvrm_dev *dev = nvkmd_nvrm_dev(_dev);
+    struct nvkmd_nvrm_pdev *pdev = nvkmd_nvrm_pdev(dev->base.pdev);
+ 
++   simple_mtx_destroy(&dev->mappings_mutex);
+    if (dev->mappings != NULL)
+       _mesa_hash_table_destroy(dev->mappings, NULL);
+ 
+diff --git a/src/nouveau/vulkan/nvkmd/nvrm/nvkmd_nvrm_mem.c b/src/nouveau/vulkan/nvkmd/nvrm/nvkmd_nvrm_mem.c
+index 5c424c4..fcebcf1 100644
+--- a/src/nouveau/vulkan/nvkmd/nvrm/nvkmd_nvrm_mem.c
++++ b/src/nouveau/vulkan/nvkmd/nvrm/nvkmd_nvrm_mem.c
+@@ -450,7 +450,10 @@ nvkmd_nvrm_mem_map(struct nvkmd_mem *_mem,
+                        (unsigned long long)mem->base.size_B, mem->isSystemMem ? "system" : "vidmem", nvRes);
+    }
+ 
+-   if (_mesa_hash_table_insert(dev->mappings, mapping->address, mapping) == NULL) {
++   simple_mtx_lock(&dev->mappings_mutex);
++   struct hash_entry *added = _mesa_hash_table_insert(dev->mappings, mapping->address, mapping);
++   simple_mtx_unlock(&dev->mappings_mutex);
++   if (added == NULL) {
+    	nvRmApiUnmapMemory(&rm, pdev->hSubdevice, mem->hMemoryPhys, 0, mapping);
+       free(mapping);
+       return vk_error(log_obj, VK_ERROR_OUT_OF_HOST_MEMORY);
+@@ -475,23 +478,28 @@ nvkmd_nvrm_mem_unmap(struct nvkmd_mem *_mem,
+    if (mem->hostPtr)
+       return;   /* b72 host-pointer import: the caller's pages were never mapped by us */
+ 
++   /* Drop the table's reference before freeing: a later lookup of the same
++    * address would otherwise return this freed mapping and free it again,
++    * corrupting the heap when device creation fails and tears the mappings
++    * down (every process that enumerates Metal devices then aborts in malloc).
++    * The entry goes before the RM unmap, under the same lock as the search: once RM has unmapped, another thread
++    * can be given the same address and insert it, and a remove after that would take the new mapping's entry. */
++   simple_mtx_lock(&dev->mappings_mutex);
+    struct hash_entry *ent = _mesa_hash_table_search(dev->mappings, map);
+-   if (ent == NULL) {
++   NvRmApiMapping *mapping = ent != NULL ? ent->data : NULL;
++   if (ent != NULL)
++      _mesa_hash_table_remove(dev->mappings, ent);
++   simple_mtx_unlock(&dev->mappings_mutex);
++   if (mapping == NULL) {
+       fprintf(stderr, "[!] ent == NULL\n");
+       return;
+    }
+-   NvRmApiMapping *mapping = ent->data;
+ 
+    NV_STATUS nvRes = nvRmApiUnmapMemory(&rm, pdev->hSubdevice, mem->hMemoryPhys, 0, mapping);
+    if (nvRes != NV_OK) {
+       fprintf(stderr, "[!] nvRes: %#x\n", nvRes);
+    }
+ 
+-   /* Drop the table's reference before freeing: a later lookup of the same
+-    * address would otherwise return this freed mapping and free it again,
+-    * corrupting the heap when device creation fails and tears the mappings
+-    * down (every process that enumerates Metal devices then aborts in malloc). */
+-   _mesa_hash_table_remove(dev->mappings, ent);
+    free(mapping);
+ }
+ 
