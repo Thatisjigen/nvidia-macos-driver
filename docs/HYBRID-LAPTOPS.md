@@ -263,6 +263,12 @@ after 60 s without a Metal application and powers on when one starts. `nmhybrid`
 `nvrtd3`. Without a power resource path, or where the ACPI family refuses it (macOS 26 evaluates no name of more than one
 segment), the GPU node's `_DSM` function 0x1A and `_PS3`/`_PS0` switch the power; the 1401 scan reports the candidate paths.
 
+`nvrtd3=2` goes by activity. A desktop session keeps dozens of processes attached to the GPU (the window server, the Dock,
+every app that made a Metal device), so with the integrated GPU drawing the desktop the first rule never powers it off. By
+activity it powers off after 60 s with no lit head, no call into the RM, no event wait and no interrupt, and comes back for a
+call into the RM, a client that waits for an event, or the firmware's notification 0x81 that a display was plugged into one
+of its outputs, which then lights as after any wake.
+
 ## Mux switching (Advanced Optimus)
 
 Not built, for these reasons. (1) There is no common interface: each vendor exposes the display mux through its own ACPI,

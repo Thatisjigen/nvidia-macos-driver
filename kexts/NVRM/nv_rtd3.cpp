@@ -4,8 +4,9 @@
  * SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
  *
  * Opt-in D3cold for a discrete laptop GPU: the firmware's power methods switch it off when it is idle and on again when
- * it is wanted (nv_rtd3_policy.h has the rules). Nothing here runs unless the boot argument nvrtd3=1 is set: without it
- * no timer is armed, nothing is registered and no firmware method is called. The power resource's ACPI path may come from
+ * it is wanted (nv_rtd3_policy.h has the rules). Nothing here runs unless the boot argument nvrtd3 is set, to 1 (power off
+ * only a GPU nothing is attached to) or 2 (power off by activity): without it no timer is armed, no switch is registered
+ * and no firmware method is called. With it the rule and its times can be changed on a running system (debug.nvrm_rtd3*). The power resource's ACPI path may come from
  * the boot argument string nvrtd3res (for example \_SB.PCI0.PEG1.PG01), because the _PR3 package's references are not
  * readable through the registry on every machine; without it, or where the ACPI family refuses it, the GPU's own node is
  * asked the way its firmware provides for NVIDIA's driver.
@@ -18,6 +19,7 @@
 #include <IOKit/acpi/IOACPIPlatformDevice.h>
 #include <libkern/OSAtomic.h>
 #include <pexpert/pexpert.h>
+#include <sys/sysctl.h>
 #include <string.h>
 #include "nv_rtd3_policy.h"
 
@@ -35,7 +37,7 @@ static void nv_rtd3_init(void)
     if (g_init) return;
     g_init = 1;
     uint32_t v = 0;
-    if (PE_parse_boot_argn("nvrtd3", &v, sizeof v) && v == 1) g_rtd3.enabled = 1;
+    if (PE_parse_boot_argn("nvrtd3", &v, sizeof v) && (v == NV_RTD3_NO_CLIENT || v == NV_RTD3_BY_ACTIVITY)) g_rtd3.enabled = (int)v;
     if (!PE_parse_boot_argn("nvrtd3res", g_res, sizeof g_res) || g_res[0] != '\\') g_res[0] = 0;
     // Which way reaches the power is looked for once the adapter is up (nv_rtd3_reach): being asked for is enough here.
     g_rtd3.have_resource = g_rtd3.enabled;
@@ -237,9 +239,32 @@ static IOLock *g_lock;
 // still, so the resume may run on a thread of its own (NVRM::resumeOnOwnThread) without a poll suspending it meanwhile.
 static volatile SInt32 g_sys_sleep;
 static char g_why[48] = "-";          // what the last power-on was for
-static struct { unsigned offs, backs, off_failed, on_waits; uint64_t off_at, off_ms; } g_stat;
+static volatile SInt32 g_force;       // debug.nvrm_rtd3_now=1: the idle time counts as served, once
+static volatile SInt32 g_wake;        // the GPU was asked for while it is off
+static struct {
+    unsigned offs, backs, off_failed, on_waits, notifications, last_notification;
+    uint64_t off_at, off_ms;
+} g_stat;
 
 static void nv_rtd3_kick(void) { if (g_call && !g_stop) thread_call_enter(g_call); }
+
+/* Something needs a GPU that is off: a call that waits at the RM gate, a client that goes to wait for an event, a display
+ * plugged in, the sysctl. The monitor gives the power back at its next poll, which this starts at once. A request that
+ * comes while the monitor is still switching the GPU off is kept, and brings it back as soon as the power is off: a
+ * display plugged in during those seconds would otherwise stay dark. The monitor drops one it finds with the GPU on. */
+extern "C" void nv_rtd3_want(const char *why)
+{
+    if (OSCompareAndSwap(0, 1, &g_wake)) strlcpy(g_why, why ? why : "?", sizeof g_why);
+    if (g_rtd3.state == NV_RTD3_OFF) nv_rtd3_kick();
+}
+
+static int nv_rtd3_wanted(void *)
+{
+    if (g_wake) return 1;
+    if (g_ops.wanted && g_ops.wanted(g_ops.ctx)) { strlcpy(g_why, "a call into the RM", sizeof g_why); return 1; }
+    return 0;
+}
+static int nv_rtd3_none(void *) { return 0; }
 
 static void nv_rtd3_account(int r)
 {
@@ -257,6 +282,7 @@ static void nv_rtd3_account(int r)
         // asked again at every poll until the GPU answers or is given up (NVRM::rtd3PowerOn): a few lines, then one a minute
         if (g_stat.on_waits++ < 3 || g_stat.on_waits % 240 == 0) RLOG("power-on asked for, the GPU does not answer yet (%u)", g_stat.on_waits);
     }
+    if (r == NV_RTD3_TICK_WOKE || r == NV_RTD3_TICK_OFF_FAILED) OSCompareAndSwap(1, 0, &g_wake);
 }
 
 // Give the power back now, whatever the rule says, and wait until the GPU answers or is given up. Under g_lock.
@@ -282,21 +308,137 @@ static void nv_rtd3_poll(thread_call_param_t, thread_call_param_t)
     }
     int r = NV_RTD3_TICK_NONE;
     const bool sys = g_sys_sleep != 0;   // the system-sleep path owns the GPU: nothing until nv_rtd3_after_system_wake
-    if (!sys) {
+    if (sys) {
+    } else if (!g_rtd3.enabled || g_wake) {
+        // switched off while the GPU has no power, or asked for by name: the same way back for both rules
+        if (!g_rtd3.enabled && g_rtd3.state == NV_RTD3_OFF) strlcpy(g_why, "RTD3 switched off", sizeof g_why);
+        r = nv_rtd3_back_now();
+        if (g_rtd3.state == NV_RTD3_ON) OSCompareAndSwap(1, 0, &g_wake);   // also when it was on already
+    } else {
         struct nv_rtd3_ops o = g_ops;
+        o.wanted = g_ops.wanted ? nv_rtd3_wanted : nullptr;
         if (g_rtd3.state == NV_RTD3_ON && !g_looked && g_ops.reach) g_ops.reach(g_ops.ctx);
-        // no way to the power: the GPU is not suspended for nothing
-        if (g_rtd3.state == NV_RTD3_ON && g_via == NV_RTD3_VIA_NONE) o.heads_lit = [](void *) { return 1; };
-        if (g_rtd3.state == NV_RTD3_OFF) strlcpy(g_why, "a client or a display", sizeof g_why);
+        if (g_rtd3.state == NV_RTD3_ON && g_via == NV_RTD3_VIA_NONE) {
+            // no way to the power: the GPU is not suspended for nothing, and a request to switch it off now is dropped
+            OSCompareAndSwap(1, 0, &g_force);
+            o.heads_lit = [](void *) { return 1; };
+        }
+        if (g_rtd3.state == NV_RTD3_ON && OSCompareAndSwap(1, 0, &g_force)) {
+            // asked to power off now: clients and activity are not looked at this once, a lit head still is
+            o.clients = nv_rtd3_none; if (o.active) o.active = nv_rtd3_none;
+            g_idle = g_rtd3.idle_need ? g_rtd3.idle_need : NV_RTD3_IDLE_SECONDS;
+        }
+        if (g_rtd3.state == NV_RTD3_OFF && g_rtd3.enabled == NV_RTD3_NO_CLIENT) strlcpy(g_why, "a client or a display", sizeof g_why);
         r = nv_rtd3_tick(&g_rtd3, &o, &g_idle, 1);
     }
     nv_rtd3_account(r);
     const unsigned period_ms = g_rtd3.state == NV_RTD3_ON ? 1000 : 250;
-    const bool again = !g_stop && !sys;
+    const bool again = !g_stop && !sys && (g_rtd3.enabled || g_rtd3.state == NV_RTD3_OFF);
     IOLockUnlock(g_lock);
     uint64_t dl; clock_interval_to_deadline(period_ms, kMillisecondScale, &dl);
     if (again) thread_call_enter_delayed(g_call, dl);
 }
+
+/* ---- the switches, for a running system. They exist only when the boot argument asked for runtime D3:
+ *   debug.nvrm_rtd3        0 never, 1 only with no client attached, 2 by activity
+ *   debug.nvrm_rtd3_res    the power resource's ACPI path
+ *   debug.nvrm_rtd3_idle   idle seconds before the power goes
+ *   debug.nvrm_rtd3_now    write 1: power off at the next poll unless a display is lit; write 2: power on
+ *   debug.nvrm_rtd3_how    0 the power resource if it can be reached, else _DSM and _PS3 on the GPU node; 1, 2: only one of them
+ *   debug.nvrm_rtd3_state  read: where it stands and what it did
+ * Strings go out with SYSCTL_OUT and come in with SYSCTL_IN, as the driver's other string switches do. */
+static int nv_rtd3_text_out(struct sysctl_req *req, const char *text) { return SYSCTL_OUT(req, text, strlen(text) + 1); }
+static int nv_rtd3_text_in(struct sysctl_req *req, char *b, size_t size)
+{
+    if (req->newlen >= size) return EINVAL;
+    const int e = SYSCTL_IN(req, b, req->newlen);
+    b[e ? 0 : req->newlen] = 0;
+    return e;
+}
+static int nv_rtd3_sysctl_level SYSCTL_HANDLER_ARGS
+{
+    int v = g_rtd3.enabled;
+    const int e = sysctl_handle_int(oidp, &v, 0, req);
+    if (e || !req->newptr) return e;
+    if (v != NV_RTD3_NEVER && v != NV_RTD3_NO_CLIENT && v != NV_RTD3_BY_ACTIVITY) return EINVAL;
+    g_rtd3.enabled = v; g_idle = 0;
+    RLOG("rule set to %d (%s)", v, v == NV_RTD3_NEVER ? "never" : v == NV_RTD3_NO_CLIENT ? "with no client" : "by activity");
+    nv_rtd3_kick();
+    return 0;
+}
+static int nv_rtd3_sysctl_res SYSCTL_HANDLER_ARGS
+{
+    char b[sizeof g_res];
+    int e = nv_rtd3_text_out(req, g_res);
+    if (e || !req->newptr) return e;
+    if ((e = nv_rtd3_text_in(req, b, sizeof b))) return e;
+    if (b[0] && b[0] != '\\') return EINVAL;
+    if (!g_lock) return ENXIO;
+    IOLockLock(g_lock);
+    const bool on = g_rtd3.state == NV_RTD3_ON;   // the way that switched the power off must also switch it on
+    if (on) { strlcpy(g_res, b, sizeof g_res); g_looked = 0; }
+    IOLockUnlock(g_lock);
+    return on ? 0 : EBUSY;
+}
+static int nv_rtd3_sysctl_idle SYSCTL_HANDLER_ARGS
+{
+    int v = (int)(g_rtd3.idle_need ? g_rtd3.idle_need : NV_RTD3_IDLE_SECONDS);
+    const int e = sysctl_handle_int(oidp, &v, 0, req);
+    if (e || !req->newptr) return e;
+    if (v < 5 || v > 86400) return EINVAL;
+    g_rtd3.idle_need = (unsigned)v;
+    return 0;
+}
+static int nv_rtd3_sysctl_now SYSCTL_HANDLER_ARGS
+{
+    int v = 0;
+    const int e = sysctl_handle_int(oidp, &v, 0, req);
+    if (e || !req->newptr) return e;
+    if (v == 1) { if (!g_rtd3.enabled) return ENXIO; OSCompareAndSwap(0, 1, &g_force); }
+    else if (v == 2) nv_rtd3_want("the sysctl");
+    else return EINVAL;
+    nv_rtd3_kick();
+    return 0;
+}
+static int nv_rtd3_sysctl_how SYSCTL_HANDLER_ARGS
+{
+    int v = g_how;
+    const int e = sysctl_handle_int(oidp, &v, 0, req);
+    if (e || !req->newptr) return e;
+    if (v < 0 || v > 2) return EINVAL;
+    if (g_rtd3.state != NV_RTD3_ON) return EBUSY;   // the way that switched the power off must also switch it on
+    g_how = v; g_looked = 0;
+    nv_rtd3_kick();
+    return 0;
+}
+static int nv_rtd3_sysctl_state SYSCTL_HANDLER_ARGS
+{
+    char b[520];
+    const bool off = g_rtd3.state == NV_RTD3_OFF;
+    const char *way = !g_looked ? "not looked for yet" : g_via == NV_RTD3_VIA_RESOURCE ? "the power resource"
+                    : g_via == NV_RTD3_VIA_OPTIMUS ? "_DSM and _PS3 on the GPU node" : "nothing found";
+    const uint64_t ms = g_stat.off_ms + (off ? now_ms() - g_stat.off_at : 0);
+    snprintf(b, sizeof b, "%s, rule %d, resource %s, switched through %s, idle %u of %u s, %d head(s) lit, off %u time(s) for %llu s in all, "
+             "back %u time(s) (last for: %s), failed: off %u, ACPI notifications %u (last 0x%x)",
+             off ? "off" : "on", g_rtd3.enabled, g_res[0] ? g_res : "(none)", way, off ? 0 : g_idle,
+             g_rtd3.idle_need ? g_rtd3.idle_need : NV_RTD3_IDLE_SECONDS, g_ops.heads_lit ? g_ops.heads_lit(g_ops.ctx) : -1,
+             g_stat.offs, ms / 1000ULL, g_stat.backs, g_why, g_stat.off_failed, g_stat.notifications, g_stat.last_notification);
+    return nv_rtd3_text_out(req, b);
+}
+SYSCTL_PROC(_debug, OID_AUTO, nvrm_rtd3, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, 0, 0, nv_rtd3_sysctl_level, "I",
+            "GPU D3cold: 0 never, 1 with no client attached, 2 by activity");
+SYSCTL_PROC(_debug, OID_AUTO, nvrm_rtd3_res, CTLTYPE_STRING | CTLFLAG_RW | CTLFLAG_LOCKED, 0, 0, nv_rtd3_sysctl_res, "A",
+            "ACPI path of the GPU's power resource");
+SYSCTL_PROC(_debug, OID_AUTO, nvrm_rtd3_idle, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, 0, 0, nv_rtd3_sysctl_idle, "I",
+            "idle seconds before the GPU's power goes");
+SYSCTL_PROC(_debug, OID_AUTO, nvrm_rtd3_now, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, 0, 0, nv_rtd3_sysctl_now, "I",
+            "write 1: power the GPU off now unless a display is lit; 2: power it on");
+SYSCTL_PROC(_debug, OID_AUTO, nvrm_rtd3_how, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, 0, 0, nv_rtd3_sysctl_how, "I",
+            "how the firmware is asked: 0 the power resource, else _DSM and _PS3 on the GPU node; 1 the resource only; 2 the GPU node only");
+SYSCTL_PROC(_debug, OID_AUTO, nvrm_rtd3_state, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED, 0, 0, nv_rtd3_sysctl_state, "A",
+            "GPU D3cold: state and counters");
+
+extern "C" int nv_rtd3_asked(void) { return g_call != nullptr; }   // the boot argument asked for runtime D3: armed
 
 extern "C" void nv_rtd3_arm(const struct nv_rtd3_ops *ops)
 {
@@ -306,6 +448,10 @@ extern "C" void nv_rtd3_arm(const struct nv_rtd3_ops *ops)
     g_lock = IOLockAlloc();
     g_call = g_lock ? thread_call_allocate(nv_rtd3_poll, nullptr) : nullptr;
     if (!g_call) { if (g_lock) { IOLockFree(g_lock); g_lock = nullptr; } RLOG("not armed: no memory"); return; }
+    // Registered once and never taken away, like the driver's other switches: NVRM is not unloaded.
+    sysctl_register_oid(&sysctl__debug_nvrm_rtd3); sysctl_register_oid(&sysctl__debug_nvrm_rtd3_res);
+    sysctl_register_oid(&sysctl__debug_nvrm_rtd3_idle); sysctl_register_oid(&sysctl__debug_nvrm_rtd3_now);
+    sysctl_register_oid(&sysctl__debug_nvrm_rtd3_how); sysctl_register_oid(&sysctl__debug_nvrm_rtd3_state);
     uint64_t dl; clock_interval_to_deadline(1000, kMillisecondScale, &dl);
     thread_call_enter_delayed(g_call, dl);
     RLOG("armed (rule %d, idle %u s)", g_rtd3.enabled, NV_RTD3_IDLE_SECONDS);
@@ -353,4 +499,14 @@ extern "C" int nv_rtd3_before_system_resume(void)
     nv_rtd3_on_done(&g_rtd3, ok);
     g_idle = 0;
     return ok;
+}
+
+/* A notification the firmware sent to the GPU's ACPI node. 0x81 on a display adapter is "the state of an output device
+ * changed": on a laptop whose GPU can lose power it is how a cable plugged into one of its outputs is told, because the
+ * GPU's own hot-plug interrupt cannot fire without power. */
+extern "C" void nv_rtd3_acpi_notification(unsigned value)
+{
+    g_stat.notifications++; g_stat.last_notification = value;
+    if (g_stat.notifications <= 32) RLOG("ACPI notification 0x%x to the GPU while it is %s", value, g_rtd3.state == NV_RTD3_OFF ? "off" : "on");
+    if (value == 0x81) nv_rtd3_want("a display plugged in (ACPI 0x81)");
 }
