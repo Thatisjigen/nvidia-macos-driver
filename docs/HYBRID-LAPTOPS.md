@@ -267,7 +267,10 @@ segment), the GPU node's `_DSM` function 0x1A and `_PS3`/`_PS0` switch the power
 every app that made a Metal device), so with the integrated GPU drawing the desktop the first rule never powers it off. By
 activity it powers off after 60 s with no lit head, no call into the RM, no event wait and no interrupt, and comes back for a
 call into the RM, a client that waits for an event, or the firmware's notification 0x81 that a display was plugged into one
-of its outputs, which then lights as after any wake.
+of its outputs, which then lights as after any wake. Sensor readers neither keep it on nor bring it back: SMCNvidiaGPU's readings are not
+counted and are skipped while it is off, and a program that samples the shared data page can open its control client with
+`0x100` added to the type (`0x4E560100` through NVAccel's bridge): its calls are not counted, and while the GPU is off they
+fail at once.
 
 ## Mux switching (Advanced Optimus)
 

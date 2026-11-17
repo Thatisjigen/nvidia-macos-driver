@@ -326,6 +326,49 @@ extern "C" void nv_xnu_pm_exit(int counted)
     if (--gNvPmUsers == 0 && gNvPmClosed) IOLockWakeup(gNvPmGate, &gNvPmUsers, false);
     IOLockUnlock(gNvPmGate);
 }
+// A sensor reader's admission: the readings are not use of the GPU, so they are not counted as work, and while runtime D3
+// has the GPU off (or is switching it off) they are refused at once instead of bringing it back. Across a system sleep
+// they wait like any other call.
+static bool nv_xnu_pm_reader_enter(int *counted)
+{
+    *counted = 0;
+    if (!gNvPmGate || current_thread() == gNvPmOwner) return true;
+    IOLockLock(gNvPmGate);
+    while (gNvPmClosed) {
+        if (gNvPmRuntime) { IOLockUnlock(gNvPmGate); return false; }
+        IOLockSleep(gNvPmGate, &gNvPmClosed, THREAD_UNINT);
+    }
+    gNvPmUsers++; *counted = 1;
+    IOLockUnlock(gNvPmGate);
+    return true;
+}
+struct NvXnuPmReaderUse {
+    int counted = 0; bool in = true;
+    explicit NvXnuPmReaderUse(bool use) { if (use) in = nv_xnu_pm_reader_enter(&counted); }
+    ~NvXnuPmReaderUse() { nv_xnu_pm_exit(counted); }
+};
+// What SMCNvidiaGPU is handed in place of nv_xnu_pm_enter, nv_xnu_pm_exit and rmGpuLocksAcquire when runtime D3 is asked
+// for. Its timer reads the sensors through RM a few times a second, and it would have brought back a GPU runtime D3 had
+// switched off at once, or parked its work loop for as long as the GPU is off. Refused, its admission returns uncounted
+// and the GPU lock is refused, so it skips its RM operation (it takes a refused lock as a failed reading).
+static thread_t gNvSmcSkipping;
+static void    *gNvSmcGpuLock;   // rmGpuLocksAcquire, as rm_nvgfx_smc_api reported it
+static int nv_xnu_smc_pm_enter(void)
+{
+    int counted = 0;
+    if (!nv_xnu_pm_reader_enter(&counted)) gNvSmcSkipping = current_thread();
+    return counted;
+}
+static void nv_xnu_smc_pm_exit(int counted)
+{
+    if (gNvSmcSkipping == current_thread()) gNvSmcSkipping = NULL;
+    nv_xnu_pm_exit(counted);
+}
+static NV_STATUS nv_xnu_smc_gpu_lock(NvU32 flags, NvU32 module)
+{
+    if (gNvSmcSkipping == current_thread() || !nv_rtd3_reachable() || !gNvSmcGpuLock) return NV_ERR_GPU_NOT_FULL_POWER;
+    return ((NV_STATUS (*)(NvU32, NvU32))gNvSmcGpuLock)(flags, module);
+}
 // Telemetry is optional: skip a suspended GPU instead of parking its polling
 // thread until wake. Admission and the users count share the PM gate lock, so
 // suspend cannot pass its drain while a successful admission is still in RM.
@@ -451,6 +494,9 @@ extern "C" int nv_xnu_pmap_owner(uint64_t pm, char *name, size_t cap, uint64_t *
     return pid;
 }
 
+// What a sensor reader adds to the control type (0) when it opens NVRM through NVAccel's bridge (0x4E560100); see
+// NVRMUserClient::initWithTask.
+enum : UInt32 { kNvClientReader = 0x100 };
 class NVRMUserClient : public IOUserClient {
     OSDeclareDefaultStructors(NVRMUserClient)
     uint64_t fPm;
@@ -496,6 +542,8 @@ private:
     unsigned fNTok = 0;
     unsigned fTokCap = 0;                // entries fTok has room for (nvrm_tok_table.h)
     bool fIsCtl = true;
+    bool fReader = false;     // opened as a sensor reader (kNvClientReader): see initWithTask
+    bool fRmTouched = false;  // an escape got through the power gate: the RM may hold state for this client
     int  fFd = -1;
     int  fPid = 0;
     bool fEverBound = false;
@@ -2951,8 +2999,15 @@ IOReturn NVRM::callPlatformFunction(const OSSymbol *fn, bool wait, void *p1, voi
         const unsigned int room = api->size ? api->size : NVRM_SMC_API_SIZE_V1;
         if (room < NVRM_SMC_API_SIZE_V1) return kIOReturnBadArgument;
         rm_nvgfx_smc_api(api);
-        api->pmEnter = (void *)nv_xnu_pm_enter;
-        api->pmExit = (void *)nv_xnu_pm_exit;
+        if (nv_rtd3_asked()) {
+            gNvSmcGpuLock = api->gpuLock;
+            api->gpuLock = (void *)nv_xnu_smc_gpu_lock;
+            api->pmEnter = (void *)nv_xnu_smc_pm_enter;
+            api->pmExit = (void *)nv_xnu_smc_pm_exit;
+        } else {
+            api->pmEnter = (void *)nv_xnu_pm_enter;
+            api->pmExit = (void *)nv_xnu_pm_exit;
+        }
         api->size = NVRM_SMC_API_SIZE_V1;
         if (room >= sizeof(*api)) {
             nvrm_smc_api_range(api);
@@ -3076,6 +3131,13 @@ bool NVRMUserClient::initWithTask(task_t owningTask, void *securityID, UInt32 ty
     // device client. The ctl client stays open to unprivileged callers on purpose -- the Vulkan
     // userland opens it as the logged-in user -- and the escalated operations behind it are gated
     // by the real-privilege check in _os_is_administrator and the root requirement on first init.
+    // With runtime D3 asked for, a sensor reader (a RUSD sample) may add kNvClientReader to the type: its calls are not
+    // counted as work and, while the GPU is off, they are refused at once instead of bringing it back. Without runtime
+    // D3 the bit is refused like any unknown type, and a reader opens the plain type instead.
+    if (type & kNvClientReader) {
+        if (!nv_rtd3_asked()) return false;
+        fReader = true; type &= ~kNvClientReader;
+    }
     if (type > 1) return false;
     fIsCtl = (type == 0);
     fGate = IOLockAlloc();
@@ -3131,7 +3193,14 @@ IOReturn NVRMUserClient::clientClose(void)
     if (OSCompareAndSwap(0, 1, &fCleaned)) {
         Gate g(fGate);
         if (gNvClientsLock && fFd >= 0) { IOLockLock(gNvClientsLock); gNvClients[fFd] = NULL; nv_pm_close(fPm); IOLockUnlock(gNvClientsLock); }
-        if (fOwner) { NvXnuPmUse pmUse; rm_cleanup_file_private(NULL, nvState(), &fNvfp); }
+        // A sensor reader whose every call was refused (the GPU was off) has nothing in the RM to clean up, and does not
+        // bring the GPU back for it. Its teardown is not counted as work either; only if the GPU went off since its last
+        // call does it wait for the GPU, like any call.
+        if (fOwner && (!fReader || fRmTouched)) {
+            NvXnuPmReaderUse readerUse(fReader);
+            NvXnuPmUse pmUse(!fReader || !readerUse.in);
+            rm_cleanup_file_private(NULL, nvState(), &fNvfp);
+        }
         // The ranges are NOT freed here. clientClose can run while another thread is inside
         // clientMemoryForType, which reads this array and hands its entries to
         // IOMemoryDescriptor::withPhysicalAddress - so freeing it here let a process map whatever
@@ -3487,7 +3556,10 @@ IOReturn NVRMUserClient::esc(uint32_t cmd, void *data, uint32_t size)
     NvMapPendingScope pendingScope;   // a mapping-length slot never outlives this escape
     if (!fOwner || fOwner->fPassDone < 2) { static bool once; if (!once) { once = true; kprintf("NVRM-xnu: esc 0x%x refused: adapter not up (run nvrmctl go 2)\n", cmd); } return kIOReturnNotReady; }
     nv_state_t *nv = nvState();
-    NvXnuPmUse pmUse;
+    NvXnuPmUse pmUse(!fReader);
+    NvXnuPmReaderUse readerUse(fReader);
+    if (!readerUse.in) return kIOReturnOffline;   // a sensor reader does not bring back a GPU that runtime D3 switched off
+    fRmTouched = true;
     switch (cmd) {
     case NV_ESC_CARD_INFO: {
         if (!fIsCtl) return kIOReturnBadArgument;

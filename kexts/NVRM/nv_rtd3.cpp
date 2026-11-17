@@ -29,6 +29,7 @@
 static struct nv_rtd3 g_rtd3;
 static char g_res[96];
 static int g_init;
+static int g_asked;   // the boot argument asked for runtime D3: the rule may change later, this does not
 
 static uint64_t now_ms(void) { uint64_t ns = 0; absolutetime_to_nanoseconds(mach_absolute_time(), &ns); return ns / 1000000ULL; }
 
@@ -38,6 +39,7 @@ static void nv_rtd3_init(void)
     g_init = 1;
     uint32_t v = 0;
     if (PE_parse_boot_argn("nvrtd3", &v, sizeof v) && (v == NV_RTD3_NO_CLIENT || v == NV_RTD3_BY_ACTIVITY)) g_rtd3.enabled = (int)v;
+    g_asked = g_rtd3.enabled != NV_RTD3_NEVER;
     if (!PE_parse_boot_argn("nvrtd3res", g_res, sizeof g_res) || g_res[0] != '\\') g_res[0] = 0;
     // Which way reaches the power is looked for once the adapter is up (nv_rtd3_reach): being asked for is enough here.
     g_rtd3.have_resource = g_rtd3.enabled;
@@ -438,12 +440,14 @@ SYSCTL_PROC(_debug, OID_AUTO, nvrm_rtd3_how, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_
 SYSCTL_PROC(_debug, OID_AUTO, nvrm_rtd3_state, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED, 0, 0, nv_rtd3_sysctl_state, "A",
             "GPU D3cold: state and counters");
 
-extern "C" int nv_rtd3_asked(void) { return g_call != nullptr; }   // the boot argument asked for runtime D3: armed
+// Whether the boot argument asked for runtime D3. Known before the monitor is armed: SMCNvidiaGPU and the sensor readers
+// can come earlier than the adapter.
+extern "C" int nv_rtd3_asked(void) { nv_rtd3_init(); return g_asked; }
 
 extern "C" void nv_rtd3_arm(const struct nv_rtd3_ops *ops)
 {
     nv_rtd3_init();
-    if (!g_rtd3.enabled || g_call) return;   // not asked for: nothing is allocated, armed or registered
+    if (!g_asked || g_call) return;   // not asked for: nothing is allocated, armed or registered
     g_ops = *ops;
     g_lock = IOLockAlloc();
     g_call = g_lock ? thread_call_allocate(nv_rtd3_poll, nullptr) : nullptr;
