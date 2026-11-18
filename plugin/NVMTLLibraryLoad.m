@@ -61,6 +61,8 @@ typedef int (*nvmtl_lower_ex_fn)(const uint8_t *, size_t, uint32_t, uint8_t **, 
 static nvmtl_lower_ex_fn xlate_lower_ex;
 typedef int (*nvmtl_to_uniform_fn)(const uint8_t *, size_t, uint8_t **, size_t *, char *, size_t);
 static nvmtl_to_uniform_fn xlate_to_uniform;   /* the table of an unlowered module moved to a Uniform block */
+typedef int (*nvmtl_kept_mask_fn)(const uint8_t *, size_t, uint32_t *);
+static nvmtl_kept_mask_fn xlate_kept_mask;   /* bindings address lowering keeps on descriptors (translator LOWER_ALL = 16 lowers them too) */
 static nvmtl_translate_fn xlate;
 #include "nvmtl_spvcache_name.h"
 #include "nvmtl_translator_tag.h"
@@ -158,6 +160,7 @@ static int nvmtl_xlate_ready(void) {
         xlate_to_uniform = (nvmtl_to_uniform_fn)dlsym(h, "nvmtl_table_to_uniform");
         if (!xlate_to_uniform) nvlog("translate: no nvmtl_table_to_uniform in this translator - a module that address lowering refuses is refused outright while the table is Uniform");
         xlate_promote_uniform = (nvmtl_promote_uniform_fn)dlsym(h, "nvmtl_promote_gl_uniform");
+        xlate_kept_mask = (nvmtl_kept_mask_fn)dlsym(h, "nvmtl_kept_descriptor_mask");
         xlate_free = (nvmtl_free_fn)dlsym(h, "nvmtl_translate_free");
         xlate_sampler = (nvmtl_sampler_fn)dlsym(h, "nvmtl_translate_samplers");
         xlate_tglen = (nvmtl_tglen_fn)dlsym(h, "nvmtl_translate_set_threadgroup_lengths");
