@@ -102,7 +102,7 @@ void NVRMNVDAFramebuffer::audioFire(thread_call_param_t p0, thread_call_param_t)
         if (name) { service->callPlatformFunction(name, false, &generation, &data, nullptr, nullptr); name->release(); }
         service->release();
     }
-    bool notify = false;
+    bool notify = false, retry = false;
     {
         NVRMDisplayGate gate;
         if (OSAddAtomic(0, &me->fStopping) || me->fDpyLost || generation != me->fAudioGeneration ||
@@ -212,10 +212,21 @@ void NVRMNVDAFramebuffer::audioFire(thread_call_param_t p0, thread_call_param_t)
             me->fAudioAttempt++ < 6) {
             uint64_t deadline; clock_interval_to_deadline(300, kMillisecondScale, &deadline);
             me->scheduleCall(me->fAudioCall, deadline);
+            retry = true;
         }
         OSSafeReleaseNULL(legacy); OSSafeReleaseNULL(overrideObject);
     }
     OSSafeReleaseNULL(data);
+    // A display that came back holds its connect interrupt for this answer (notifyConnectionAfterAudio): it goes now, once,
+    // with the audio published, whether or not the pin changed. While the probe is still retrying, it keeps waiting for the
+    // next answer or its 1.5 s deadline, and an intermediate pin is not announced on its own.
+    if (OSAddAtomic(0, &me->fConnectAwaitsAudio)) {
+        if (retry) notify = false;
+        else if (OSCompareAndSwap(1, 0, &me->fConnectAwaitsAudio)) {
+            FBLOG("fb%u: the display-audio probe answered -- the held connect interrupt goes now", me->fIndex);
+            notify = true;
+        }
+    }
     if (notify) me->notifyConnectionChanged(0);
 }
 #pragma clang diagnostic pop

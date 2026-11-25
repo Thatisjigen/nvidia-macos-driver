@@ -32,7 +32,13 @@ assert 'if (!me->fKms->getDynamicDisplayInfo(me->fDev, dd) || dd->connected) con
 assert 'fb->fDpyLost = true;' in missing and 'fb->fEdidSize = 0;' in missing and 'fb->clearDisplayAudioProperties();' in missing
 assert hotplug.index('if (sl) IORecursiveLockUnlock(sl);') < hotplug.index('notify[f]->notifyConnectionChanged(500);')
 assert hotplug.index('if (sl) IORecursiveLockUnlock(sl);') < hotplug.index('fb->reflip()')
-assert 'fb->fDpyLost = false;' in hotplug and 'fb->notifyConnectionChanged(500);' in hotplug
+assert 'fb->fDpyLost = false;' in hotplug and 'fb->notifyConnectionAfterAudio(audio);' in hotplug
+# a display that comes back tells macOS once, when its display-audio probe has answered (1.5 s at most); without audio to
+# wait for, after 0.5 s as before; the probe's answer releases the held interrupt instead of sending one of its own
+held = extract(src, 'void NVRMNVDAFramebuffer::notifyConnectionAfterAudio(')
+assert 'notifyConnectionChanged(500); return;' in held and 'notifyConnectionChanged(1500);' in held
+assert 'OSCompareAndSwap(0, 1, &fConnectAwaitsAudio);' in held
+assert 'OSCompareAndSwap(1, 0, &me->fConnectAwaitsAudio);' in extract(src, 'void NVRMNVDAFramebuffer::connectNotifyFire(')
 assert 'fb->fSurf =' not in hotplug and 'fb->fSize =' not in hotplug
 fixture = r'''
 #include <cassert>
@@ -54,7 +60,7 @@ static void clock_interval_to_deadline(unsigned ms,int,std::uint64_t*d){*d=ms;} 
 struct OSObject{int refs=1;void retain(){++refs;}void release(){--refs;}};
 class Base{public:IOReturn getAttributeForConnection(IOIndex,IOSelect,std::uintptr_t*){return 77;}};
 struct NVRMNVDAFramebuffer:OSObject,Base{
-using super=Base; bool fDpyLost=false,fHidden=false,fInternal=false,fConnectFired=false; volatile int fConnectOwed=0; unsigned fEdidSize=0,fIndex=0; UInt8 fEdid[256]={};
+using super=Base; bool fDpyLost=false,fHidden=false,fInternal=false,fConnectFired=false; volatile int fConnectOwed=0,fConnectAwaitsAudio=0; unsigned fEdidSize=0,fIndex=0; UInt8 fEdid[256]={};
 volatile int fStopping=0; thread_call_t fConnectNotify=reinterpret_cast<void*>(1);
 struct{void(*proc)(void*,void*);void*target;void*ref;}fConnect{}; unsigned scheduled=0;std::uint64_t deadline=0;
 void scheduleCall(thread_call_t,std::uint64_t d){++scheduled;deadline=d;retain();}

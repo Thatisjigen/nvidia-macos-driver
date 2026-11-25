@@ -730,6 +730,8 @@ class NVRMNVDAFramebuffer : public IOFramebuffer {
     // The connect interrupt came due before the framework had registered its handler; registerForInterruptType fires
     // it as soon as the handler arrives (see connectNotifyFire).
     volatile SInt32 fConnectOwed = 0;
+    // A display that came back holds its connect interrupt until its display-audio probe answers (notifyConnectionAfterAudio).
+    volatile SInt32 fConnectAwaitsAudio = 0;
     bool fEdidSwapped = false;
     void adoptSwappedDisplay();
     void takeEdid(const NvU8 *src, NvU32 size);
@@ -747,6 +749,7 @@ class NVRMNVDAFramebuffer : public IOFramebuffer {
     uint8_t fAudioCodec[4] = {};
     thread_call_t fConnectNotify = nullptr;
     void notifyConnectionChanged(unsigned delayMs);
+    void notifyConnectionAfterAudio(bool audio);
     static void connectNotifyFire(thread_call_param_t p0, thread_call_param_t);
     volatile SInt32 fStopping = 0;
     void scheduleCall(thread_call_t call, uint64_t deadline);
@@ -1856,12 +1859,25 @@ void NVRMNVDAFramebuffer::notifyConnectionChanged(unsigned delayMs)
         scheduleCall(fConnectNotify, deadline);
     }
 }
+// A display that comes back is read by WindowServer once, with its display-audio properties already published: its
+// connect interrupt waits for the audio probe, which answers within about a second, and goes at 1.5 s at the latest.
+// Fired after 0.5 s, the interrupt came before the probe had found the pin, the probe's own notification followed, and
+// WindowServer read the display twice: each read installed every timing again and set the mode again, and every
+// screen went dark each time.
+void NVRMNVDAFramebuffer::notifyConnectionAfterAudio(bool audio)
+{
+    if (!audio || !fAudioCall || fInternal) { notifyConnectionChanged(500); return; }
+    OSCompareAndSwap(0, 1, &fConnectAwaitsAudio);
+    FBLOG("fb%u: connect interrupt held for the display-audio probe (1.5 s at most)", fIndex);
+    notifyConnectionChanged(1500);
+}
 void NVRMNVDAFramebuffer::connectNotifyFire(thread_call_param_t p0, thread_call_param_t)
 {
     NVRMNVDAFramebuffer *me = (NVRMNVDAFramebuffer *)p0;
     if (!me) return;
     NVRMCallReference callReference(me);
     if (OSAddAtomic(0, &me->fStopping)) return;
+    OSCompareAndSwap(1, 0, &me->fConnectAwaitsAudio);   // this interrupt is the one the probe was holding back
     if (!me->fConnect.proc) {
         // IOFramebuffer::open registers the connect handler after enableController, and on a display plugged in after
         // boot the open can take longer than the 1.5 s delay. Dropping the notification here left such a display dark
@@ -2250,14 +2266,16 @@ void NVRMNVDAFramebuffer::hotplugFire(thread_call_param_t, thread_call_param_t)
         if (!OSAddAtomic(0, &fb->fStopping) && !fb->fDpyLost) {
             const bool swapped = fb->fEdidSwapped;
             fb->fEdidSwapped = false;
+            bool audio = true;
             if (swapped) fb->adoptSwappedDisplay();
             else if (fb->fRelightAudioValid) fb->publishDisplayAudioProperties();
             else {
                 fb->clearDisplayAudioProperties();
                 FBLOG("fb%u: reconnect has no readable EDID -- display-audio properties stay cleared", fb->fIndex);
+                audio = false;
             }
             fb->fRelightAudioValid = false;
-            fb->notifyConnectionChanged(500);
+            fb->notifyConnectionAfterAudio(audio);
         }
         fb->release();
     }

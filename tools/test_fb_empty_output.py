@@ -43,7 +43,7 @@ hot = body('void NVRMNVDAFramebuffer::hotplugFire(')
 unlock = hot.index('if (sl) IORecursiveLockUnlock(sl);')
 assert hot.index('if (fb->fNoDisplayYet) { gDpy[kdpy].vrr = dd->vrrSupported; fb->takeFirstDisplay(); }') < unlock, \
     "the first monitor's mode is read outside the start lock"
-assert unlock < hot.index('ok = fb->applyMode();') < hot.index('fb->notifyConnectionChanged(500);\n        }\n        fb->release();'), \
+assert unlock < hot.index('ok = fb->applyMode();') < hot.index('fb->notifyConnectionAfterAudio(audio);\n        }\n        fb->release();'), \
     'the first mode set has to come with the start lock dropped, and before macOS is told of the connection'
 assert 'if (fb->fModeSet || !fb->fSurf) ok = fb->reflip();' in hot, 'a first mode set on an instance that has no surface'
 assert '!nvrmAnyDisplayConnected() && gBootRetry < kNvrmBootRetries' in hot, 'the scans stop while the output is still empty'
