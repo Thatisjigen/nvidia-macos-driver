@@ -820,11 +820,83 @@ static bool nvmtl_other_metal_gpu(void)
     IOObjectRelease(it);
     return found;
 }
-// Per-process GPU choice on a hybrid laptop (nvmtl_gpu_policy.h). Inactive unless the hybrid switch is on.
+// Another GPU drives a display of its own: a display connection under a framebuffer that is not ours (the Intel panel on a
+// laptop whose Intel GPU macOS drives). Read once per process, from the I/O registry.
+static bool nvmtl_other_gpu_drives_display(void)
+{
+    static int found = -1;
+    if (found >= 0) return found;
+    found = 0;
+    io_iterator_t it = 0;
+    if (IOServiceGetMatchingServices(NVMTL_IO_MAIN_PORT, IOServiceMatching("IODisplayConnect"), &it) != KERN_SUCCESS) return false;
+    io_service_t c;
+    while (!found && (c = IOIteratorNext(it))) {
+        io_registry_entry_t fb = IO_OBJECT_NULL, disp = IO_OBJECT_NULL;
+        if (IORegistryEntryGetParentEntry(c, kIOServicePlane, &fb) == KERN_SUCCESS) {
+            io_name_t cls = {0};
+            IOObjectGetClass(fb, cls);
+            if (strncmp(cls, "NV", 2) && IORegistryEntryGetChildEntry(c, kIOServicePlane, &disp) == KERN_SUCCESS) {
+                found = 1; IOObjectRelease(disp);
+            }
+            IOObjectRelease(fb);
+        }
+        IOObjectRelease(c);
+    }
+    IOObjectRelease(it);
+    return found;
+}
+// The app's own GPU choice as macOS hands it to Metal: GPUSelectionPolicy from IOSurfaceCopyGPUPolicies (the user's
+// com.apple.gpu preferences, the app's Info.plist, Finder's "Prefer External GPU"; an app's helpers take their app's).
+static int nvmtl_app_gpu_choice(void)
+{
+    CFDictionaryRef (*copy)(void) = (CFDictionaryRef (*)(void))dlsym(RTLD_DEFAULT, "IOSurfaceCopyGPUPolicies");
+    CFDictionaryRef d = copy ? copy() : NULL;
+    int r = NMP_APP_NONE;
+    if (d && CFGetTypeID(d) == CFDictionaryGetTypeID()) {
+        CFTypeRef v = CFDictionaryGetValue(d, CFSTR("GPUSelectionPolicy"));
+        if (v && CFGetTypeID(v) == CFStringGetTypeID()) {
+            if (CFEqual(v, CFSTR("preferRemovable"))) r = NMP_APP_PREFER;
+            else if (CFEqual(v, CFSTR("avoidRemovable"))) r = NMP_APP_AVOID;
+        }
+    }
+    if (d) CFRelease(d);
+    return r;
+}
+// A binary of macOS itself: its code signature carries a platform identifier. Not the kernel's platform flag, which a
+// relaxed AMFI (amfi_get_out_of_my_way, common on these machines) sets for every process, apps included. Security is looked
+// up at run time, so the build needs no new framework; read once per process.
+static bool nvmtl_is_platform_binary(void)
+{
+    static int r = -1;
+    if (r >= 0) return r;
+    r = 0;
+    void *sec = dlopen("/System/Library/Frameworks/Security.framework/Security", RTLD_NOW);
+    OSStatus (*copySelf)(uint32_t, CFTypeRef *) = sec ? (OSStatus (*)(uint32_t, CFTypeRef *))dlsym(sec, "SecCodeCopySelf") : NULL;
+    OSStatus (*copyStatic)(CFTypeRef, uint32_t, CFTypeRef *) =
+        sec ? (OSStatus (*)(CFTypeRef, uint32_t, CFTypeRef *))dlsym(sec, "SecCodeCopyStaticCode") : NULL;
+    OSStatus (*copyInfo)(CFTypeRef, uint32_t, CFDictionaryRef *) =
+        sec ? (OSStatus (*)(CFTypeRef, uint32_t, CFDictionaryRef *))dlsym(sec, "SecCodeCopySigningInformation") : NULL;
+    const CFStringRef *key = sec ? (const CFStringRef *)dlsym(sec, "kSecCodeInfoPlatformIdentifier") : NULL;
+    if (!copySelf || !copyStatic || !copyInfo || !key || !*key) return r;
+    CFTypeRef code = NULL, st = NULL; CFDictionaryRef info = NULL;
+    if (copySelf(0, &code) == 0 && copyStatic(code, 0, &st) == 0 && copyInfo(st, 0, &info) == 0 && info) {
+        CFTypeRef v = CFDictionaryGetValue(info, *key);
+        int n = 0;
+        if (v && CFGetTypeID(v) == CFNumberGetTypeID() && CFNumberGetValue((CFNumberRef)v, kCFNumberIntType, &n) && n > 0) r = 1;
+    }
+    if (info) CFRelease(info);
+    if (st) CFRelease(st);
+    if (code) CFRelease(code);
+    return r;
+}
+// Per-process GPU choice (nvmtl_gpu_policy.h): on a hybrid laptop with the hybrid switch on, nmp_decide; otherwise, when
+// another GPU drives a display of its own, nmp_decide_two_gpus. Each process says once in the system log which GPU it got and
+// why, outside the release failure filter, so the processes that hold the NVIDIA GPU can be told apart from the rest.
 static bool nvmtl_gpu_policy_allows(const char *me)
 {
     int lv = 0; size_t ln = sizeof lv;
-    if (sysctlbyname("debug.nmhybrid", &lv, &ln, NULL, 0) != 0 || lv <= 0) return true;
+    const bool hybrid = sysctlbyname("debug.nmhybrid", &lv, &ln, NULL, 0) == 0 && lv > 0;
+    if (!hybrid && !nvmtl_other_gpu_drives_display()) return true;
     char text[4096] = {0};
     // Read only a regular file owned by root and not writable by group or others, opened without following a link,
     // as the DLSS kernel cache is: the policy decides which processes get the GPU.
@@ -838,14 +910,28 @@ static bool nvmtl_gpu_policy_allows(const char *me)
     }
     int apple = 0;
     int pref = nmp_parse(text, me, &apple);
+    char bid[256] = "";   // a rule may name the app's bundle identifier instead of the process
+    { CFBundleRef mb = CFBundleGetMainBundle(); CFStringRef s = mb ? CFBundleGetIdentifier(mb) : NULL;
+      if (s && !CFStringGetCString(s, bid, sizeof bid, kCFStringEncodingUTF8)) bid[0] = 0; }
+    if (pref == NMP_PREF_AUTO && bid[0]) { int a2 = 0; pref = nmp_parse(text, bid, &a2); }
     int autosw = -1;
     @autoreleasepool {
         id v = [[NSBundle mainBundle] objectForInfoDictionaryKey:@"NSSupportsAutomaticGraphicsSwitching"];
         if ([v respondsToSelector:@selector(boolValue)]) autosw = [v boolValue] ? 1 : 0;
     }
     const char *why = "";
-    int give = nmp_decide(lv, apple, pref, autosw, nvmtl_other_metal_gpu(), &why);
+    int give;
+    if (hybrid) give = nmp_decide(lv, apple, pref, autosw, nvmtl_other_metal_gpu(), &why);
+    else {
+        // A system service keeps the GPU without the code-signature read; WindowServer, which no app choice names, skips
+        // the IOSurface question too: it makes its device while it starts.
+        const int service = nmp_is_service(me);
+        const int app = strcmp(me, "WindowServer") ? nvmtl_app_gpu_choice() : NMP_APP_NONE;
+        give = nmp_decide_two_gpus(nmp_parse_mode(text), pref, app, service ? 1 : nvmtl_is_platform_binary(), service, autosw, 1, &why);
+    }
     nvlog("  gpu policy for %s: %s (%s)", me, give ? "NVIDIA device" : "no NVIDIA device", why);
+    static int said;
+    if (!said++) syslog(LOG_NOTICE, "NullMoth: gpu: %s %s the NVIDIA GPU (%s)", me, give ? "gets" : "does not get", why);
     return give != 0;
 }
 static bool nvmtl_process_is_allowed(void)
@@ -921,7 +1007,7 @@ static uint64_t nvmtl_rt_gate_working_set(uint64_t ws)
     return (uint64_t)floor_mb << 20;
 }
 @implementation NVMTLDevice
-@dynamic depth24Stencil8PixelFormatSupported, headless, location, locationNumber, lowPower, maxArgumentBufferSamplerCount, maxTransferRate, peerCount, peerGroupID, peerIndex, registryID, removable, sparseTileSizeInBytes, supportsPlacementSparse;
+@dynamic depth24Stencil8PixelFormatSupported, headless, location, locationNumber, lowPower, maxArgumentBufferSamplerCount, maxTransferRate, peerCount, peerGroupID, peerIndex, registryID, sparseTileSizeInBytes, supportsPlacementSparse;
 + (void)load {
     char me[1200], ts[40] = "?"; time_t now = time(NULL); struct tm tm;
     if (localtime_r(&now, &tm)) strftime(ts, sizeof ts, "%Y-%m-%dT%H:%M:%S%z", &tm);
@@ -1143,6 +1229,23 @@ static id nvmtl_refuse_before_init(id obj)
     NSString *v = nvmtl_vk_vendor() == 0x1002 ? @"AMD" : nvmtl_vk_vendor() == 0x8086 ? @"Intel" : @"NVIDIA";
     @synchronized(seen) { NSString *k = @(who); if (![seen containsObject:k]) { [seen addObject:k]; nvlog("vendorName -> %s (asked by %s)", v.UTF8String, who); } }
     return v;
+}
+// Reported as removable, as an external GPU is, only in an app set to prefer it (GPUSelectionPolicy=preferRemovable: the user's
+// com.apple.gpu preferences, the app's Info.plist, Finder's "Prefer External GPU"), when another GPU drives a display of its
+// own: Metal then makes it that app's default device, as it does for an external GPU. Everywhere else it stays a fixed GPU, so
+// the frameworks that treat a removable GPU apart (AppKit, Core Animation, Core Image, WebKit's ANGLE...) see no change; an app
+// set to avoid it is not given the device at all (nvmtl_gpu_policy_allows). Never in WindowServer or the eject menu: this
+// GPU cannot be ejected. NVMTL_REMOVABLE=0 keeps it fixed in every process.
+- (BOOL)isRemovable {
+    static int r = -1;
+    if (r < 0) {
+        const char *me = getprogname(), *e = getenv("NVMTL_REMOVABLE");
+        int lv = 0; size_t ln = sizeof lv;
+        const bool hybrid = sysctlbyname("debug.nmhybrid", &lv, &ln, NULL, 0) == 0 && lv > 0;
+        r = !(e && !strcmp(e, "0")) && !hybrid && me && strcmp(me, "WindowServer") && strncmp(me, "SafeEjectGPU", 12)
+            && nvmtl_other_gpu_drives_display() && nvmtl_app_gpu_choice() == NMP_APP_PREFER;
+    }
+    return r == 1;
 }
 - (NSString *)name {
     static int vk = 0; if (!vk) { vk = 1; nvmtl_vk_init(); }
