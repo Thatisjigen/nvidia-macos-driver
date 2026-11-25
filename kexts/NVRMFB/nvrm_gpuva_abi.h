@@ -24,6 +24,13 @@ struct NVRMDisplayPointers {
     void        *physForVa;
 };
 
+// Asks NVRM what its NVKMS interface does beyond the stock one: NVRM_KAPI_CAP_* bits in *(unsigned int *)p1. An NVRM that
+// does not know the call answers kIOReturnUnsupported, and the display kext keeps to what every NVRM does.
+#define NVRM_KAPI_CAPS_FN "nvKapiCaps"
+// A request that changes the HDR infoframe (and the output LUT) and nothing else on a lit head is a flip, not a mode set,
+// also where the display hardware cannot tie infoframes to a flip (Blackwell GB20x)
+#define NVRM_KAPI_CAP_HDR_INFOFRAME_FLIP 0x1u
+
 #define NVRM_FLIP_ABI_VERSION 2u
 
 #define NVRM_FLIP_FN  "nvFlipToSurface"

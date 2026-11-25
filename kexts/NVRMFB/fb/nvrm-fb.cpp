@@ -589,6 +589,9 @@ class NVRMNVDAFramebuffer : public IOFramebuffer {
     bool trialScaledMode(const IODetailedTimingInformationV2 &d);
     void probeScalerLimit();
     bool fHdrCapable = false, fHdrActive = false, fScan30 = false, fHdrMetaSet = false; unsigned fHdrMaxLumCode = 0;
+    // NVRM's NVKMS sends a request that changes only the HDR infoframe as a flip (NVRM_KAPI_CAP_HDR_INFOFRAME_FLIP), asked once
+    // at start: an older NVRM makes it a mode set, and then HDR goes on and off with the full mode set as before.
+    bool fHdrFlip = false;
     // HDR10 in YCbCr 4:2:2 (nvrmHdr422Needed): the HDMI sink's TMDS limit when it takes 4:2:2 at 10 bits, 0 otherwise; the mode
     // being set (fYccWant) and the one on the head (fYccActive) go out in 4:2:2.
     unsigned fHdr422TmdsMHz = 0; bool fYccWant = false, fYccActive = false;
@@ -696,6 +699,8 @@ class NVRMNVDAFramebuffer : public IOFramebuffer {
     unsigned fEdidHits = 0;
     static void dtToKapi(const IODetailedTimingInformationV2 *d, struct NvKmsKapiDisplayMode *m);
     IOReturn switchMode(IODisplayModeID id, const struct NvKmsKapiDisplayMode &m, NvU32 w, NvU32 h, UInt32 transform);
+    bool hdrSwitchFits(const IODetailedTimingInformationV2 &d, const struct NvKmsKapiDisplayMode &m, NvU32 w, NvU32 h) const;
+    IOReturn switchHdr(IODisplayModeID id);
     void publishTimingCaps();
     unsigned fLastOk = 0; int fFlipResult = -99;
     unsigned fParkedCount = 0;
@@ -3498,6 +3503,16 @@ bool NVRMNVDAFramebuffer::start(IOService *provider)
         if (displayPtrsFn) { provider->callPlatformFunction(displayPtrsFn, false, &displayPtrs, NULL, NULL, NULL); displayPtrsFn->release(); }
     }
     fKms = (struct NvKmsKapiFunctionsTable *)displayPtrs.kapi;
+    {
+        unsigned int caps = 0;
+        const OSSymbol *capsFn = OSSymbol::withCString(NVRM_KAPI_CAPS_FN);
+        if (capsFn) {
+            if (provider->callPlatformFunction(capsFn, false, &caps, NULL, NULL, NULL) != kIOReturnSuccess) caps = 0;
+            capsFn->release();
+        }
+        fHdrFlip = (caps & NVRM_KAPI_CAP_HDR_INFOFRAME_FLIP) != 0;
+        setProperty("NVRMHdrFlip", fHdrFlip);
+    }
     fGpuId = (NvU32)propU64(provider, "gpu-id");
     fIndex = (unsigned)propU64(provider, "fb-index");
     fConnectNotify = nvrmfbCall(connectNotifyFire, this);
@@ -3911,7 +3926,9 @@ IOReturn NVRMNVDAFramebuffer::setDisplayMode(IODisplayModeID mode, IOIndex depth
                 fPendingScaled = dt.horizontalScaled && dt.verticalScaled;
                 fPendingLoad = nvrmScalerLoad(dt.horizontalActive, dt.verticalActive, dt.horizontalScaled, dt.verticalScaled, hz);
             }
-            result = switchMode(mode, m, w, h, dt.scalerFlags & kIOScaleRotateFlags);
+            // The SDR or HDR10 copy of the timing on the head: HDR on or off in a flip, else (or if NVKMS refuses it) a full mode set
+            result = hdrSwitchFits(dt, m, w, h) ? switchHdr(mode) : kIOReturnUnsupportedMode;
+            if (result != kIOReturnSuccess) result = switchMode(mode, m, w, h, dt.scalerFlags & kIOScaleRotateFlags);
             if (result == kIOReturnSuccess) {
                 fCurDT = dt;
                 // The cursor image on the plane was made for the desktop before: on a shrunk desktop, or coming out of one, it is
@@ -4353,6 +4370,66 @@ IOReturn NVRMNVDAFramebuffer::switchMode(IODisplayModeID id, const struct NvKmsK
     publishLinkTiming();
     setProperty("NVRMModeSwitches", (unsigned long long)fModeSwitches, 32);
     setProperty("NVRMRotation", (unsigned long long)transform, 32);
+    publishStartupTiming();
+    return kIOReturnSuccess;
+}
+static bool nvrmSameTimings(const struct NvKmsKapiDisplayModeTimings &a, const struct NvKmsKapiDisplayModeTimings &b)
+{
+    return a.pixelClockHz == b.pixelClockHz && a.refreshRate == b.refreshRate && a.hVisible == b.hVisible && a.hSyncStart == b.hSyncStart &&
+           a.hSyncEnd == b.hSyncEnd && a.hTotal == b.hTotal && a.hSkew == b.hSkew && a.vVisible == b.vVisible && a.vSyncStart == b.vSyncStart &&
+           a.vSyncEnd == b.vSyncEnd && a.vTotal == b.vTotal && a.flags.interlaced == b.flags.interlaced && a.flags.doubleScan == b.flags.doubleScan &&
+           a.flags.hSyncPos == b.flags.hSyncPos && a.flags.hSyncNeg == b.flags.hSyncNeg && a.flags.vSyncPos == b.flags.vSyncPos &&
+           a.flags.vSyncNeg == b.flags.vSyncNeg;
+}
+// macOS lists an SDR and an HDR10 copy of each timing (publishTimingCaps), and goes from one to the other several times while a
+// display comes up. Where the two go out the same way on the cable, only the HDR infoframe and the output LUT tell them apart,
+// and NVKMS changes those in a flip; a mode set takes the head down and brings it back, which an HDMI monitor shows as black.
+// The same way on the cable: the same timing, desktop and rotation, the same scanout format, and RGB at 8 bits with the default
+// colorimetry. That is an HDR10 timing above the 10-bit HDMI limit (nvrmHdrRgb8), where NVKMS cannot send the SDR copy at more
+// than 8 bits either; set by hand, a depth, format or BT.2020 may differ between the two, and they keep the full mode set.
+bool NVRMNVDAFramebuffer::hdrSwitchFits(const IODetailedTimingInformationV2 &d, const struct NvKmsKapiDisplayMode &m, NvU32 w, NvU32 h) const
+{
+    if (!fHdrFlip || !gHdrOn || !fHdrCapable || fHdrWant == fHdrActive) return false;
+    if (!fModeSet || !fSurf || fSurActive || fHeadSlept || fConsoleAperture || fSubmissionFaulted) return false;
+    if (w != fW || h != fH || (d.scalerFlags & kIOScaleRotateFlags) != fCurTransform || !nvrmSameTimings(m.timings, fMode.timings)) return false;
+    if ((fHdrWant || gTenBit) != fScan30 || fYccWant || fYccActive) return false;
+    if (gHdr422 || gHdrBt2020 || gColorBpc || gColorFormat != (int)kNvrmColorFormatAuto) return false;
+    return nvrmHdrRgb8(m.timings.pixelClockHz, fHdmiTmdsMHz);
+}
+// HDR on or off on the lit head without a mode set (hdrSwitchFits): a test, then a commit, of a request with the HDR infoframe
+// (submitConfig fills it in from fHdrActive and fHdrMeta) and the output LUT (macOS's gamma table in SDR; none on PQ content) and
+// nothing else. The primary layer is not named, so it goes as the gamma and metadata commits do, with no flip to wait for. Not
+// kIOReturnSuccess: nothing changed, and the caller does the full mode set.
+IOReturn NVRMNVDAFramebuffer::switchHdr(IODisplayModeID id)
+{
+    NVRMDisplayGate gate; if (!gate.valid()) return kIOReturnNoMemory;
+    NVRMHeadGate primary(startLock(), fPrimaryGate, true);
+    if (!primary.valid() || OSAddAtomic(0, &fStopping)) return kIOReturnNotReady;
+    if (fSubmissionFaulted || !fKms || !fDev || !fSurf || fHeadSlept || !rmGpuReady()) return kIOReturnNotReady;
+    struct NvKmsKapiRequestedModeSetConfig *cfg = (struct NvKmsKapiRequestedModeSetConfig *)IOMalloc(sizeof *cfg);
+    struct NvKmsKapiModeSetReplyConfig *rep = (struct NvKmsKapiModeSetReplyConfig *)IOMalloc(sizeof *rep);
+    if (!cfg || !rep) { if (cfg) IOFree(cfg, sizeof *cfg); if (rep) IOFree(rep, sizeof *rep); return kIOReturnNoMemory; }
+    const bool hdrBefore = fHdrActive;
+    fHdrActive = fHdrWant;
+    struct NvKmsKapiSurface *olut = !fHdrActive && fGammaOn && fGamma ? olutFromGamma() : NULL;
+    NvBool ok = NV_FALSE;
+    for (int commit = 0; commit < 2; commit++) {
+        nvu_zero(cfg, sizeof *cfg); nvu_zero(rep, sizeof *rep);
+        cfg->headsMask = 1u << fHead;
+        struct NvKmsKapiHeadRequestedConfig *hr = &cfg->headRequestedConfig[fHead];
+        hr->modeSetConfig.bActive = NV_TRUE; hr->modeSetConfig.numDisplays = 1; hr->modeSetConfig.displays[0] = fDisplay;
+        hr->modeSetConfig.mode = fMode;
+        hr->modeSetConfig.olutFpNormScale = NVKMS_OLUT_FP_NORM_SCALE_DEFAULT;
+        nvrmHeadOlut(hr, olut);
+        hr->flags.hdrInfoFrameChanged = NV_TRUE;
+        ok = submitConfig(cfg, rep, commit ? NV_TRUE : NV_FALSE, false, true);
+        FBLOG("fb%u: mode 0x%x: HDR %s in a flip, the timing stays: %s -> %u (flipResult %d)", fIndex, (unsigned)id,
+              fHdrActive ? "on" : "off", commit ? "commit" : "test", (unsigned)ok, (int)rep->flipResult);
+        if (!ok) break;
+    }
+    IOFree(cfg, sizeof *cfg); IOFree(rep, sizeof *rep);
+    if (!ok) { fHdrActive = hdrBefore; return kIOReturnUnsupportedMode; }
+    fCurId = id;
     publishStartupTiming();
     return kIOReturnSuccess;
 }

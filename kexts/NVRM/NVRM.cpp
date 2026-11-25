@@ -53,6 +53,7 @@ extern "C" int nvrm_gpuva_free(struct NVRMGpuVaRequest *);
 extern "C" bool nvrm_query_vram_kb(NvU32 gpuId, NvU32 *pRamKb, NvU32 *pTotalKb, NvU32 *pStatus);
 extern "C" bool nvrm_query_gpu_profile(NvU32 gpuId, NvU32 *pArch, NvU32 *pImpl, NvU32 *pCls3d, NvU32 *pClsCompute,
                                        NvU32 *pClsCopy, NvU32 *pClsEnc, NvU32 *pClsDec, NvU32 *pStatus);
+extern "C" NvBool nvKmsKapiHdrInfoFrameFlips(void);   // NVKMS built with 620-hdr-infoframe-flip.patch
 kern_return_t _start(kmod_info_t *ki, void *data);
 kern_return_t _stop(kmod_info_t *ki, void *data);
 KMOD_EXPLICIT_DECL(com.nullmoth.NVRM, "0.1", _start, _stop)
@@ -3139,6 +3140,11 @@ IOReturn NVRM::callPlatformFunction(const OSSymbol *fn, bool wait, void *p1, voi
         ptrs->kapi = nvkms_xnu_kapi_table();
         ptrs->physForVa = (void *)&nv_xnu_phys_for_kernel_va;
         return ptrs->kapi ? kIOReturnSuccess : kIOReturnNotReady;
+    }
+    if (fn && fn->isEqualTo(NVRM_KAPI_CAPS_FN)) {
+        if (!p1) return kIOReturnBadArgument;
+        *(unsigned int *)p1 = nvKmsKapiHdrInfoFrameFlips() ? NVRM_KAPI_CAP_HDR_INFOFRAME_FLIP : 0u;
+        return kIOReturnSuccess;
     }
     return IOService::callPlatformFunction(fn, wait, p1, p2, p3, p4);
 }

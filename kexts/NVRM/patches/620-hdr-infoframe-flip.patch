@@ -1,0 +1,40 @@
+--- a/kapi/src/nvkms-kapi.c
++++ b/kapi/src/nvkms-kapi.c
+@@ -3986,9 +3986,19 @@
+             headRequestedConfig->flags.colorBpcChanged     ||
+             headRequestedConfig->flags.colorRangeChanged;
+ 
++        /*
++         * The HDR infoframe goes in a flip on every display class. Where the
++         * hardware cannot tie infoframes to a flip (no SetCoreFid: Blackwell
++         * GB20x among others), NVKMS's flip path sends it at once
++         * (nvUpdateInfoFrames), a frame apart from the content at most. As a
++         * mode set, NVKMS took the head down and brought it back
++         * (ApplyProposedModeSetStateOneApiHeadShutDown), which an HDMI monitor
++         * shows as black, each time macOS turned HDR on or off on the same
++         * timing or sent new mastering metadata. The colorimetry still needs a
++         * mode set: BT.2100 asks for 10 bits, which only a mode set can change.
++         */
+         if (!device->caps.supportsFlipSynchronizedInfoframes) {
+             bRequiredModeset |=
+-                headRequestedConfig->flags.hdrInfoFrameChanged ||
+                 headRequestedConfig->flags.colorimetryChanged  ||
+                 headRequestedConfig->flags.hdmiVsifMetadataChanged ||
+                 headRequestedConfig->flags.allmModeChanged ||
+@@ -4334,6 +4344,16 @@
+     nvKmsKapiFree(pCallback);
+ }
+ 
++/*
++ * For the macOS driver, which asks before it sends a request that changes the
++ * HDR infoframe and nothing else on a lit head: such a request is a flip here
++ * (ApplyModeSetConfig). Linking against a library without it fails.
++ */
++NvBool nvKmsKapiHdrInfoFrameFlips(void);
++NvBool nvKmsKapiHdrInfoFrameFlips(void)
++{
++    return NV_TRUE;
++}
+ 
+ NvBool nvKmsKapiGetFunctionsTableInternal
+ (
